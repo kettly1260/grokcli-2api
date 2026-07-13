@@ -18,6 +18,24 @@ from config import (
 )
 
 
+# Always-exposed local catalog entries. Upstream /v1/models often only returns
+# grok-4.5, but cli-chat-proxy still accepts grok-build (and local aliases).
+_EXTRA_MODELS: list[dict[str, Any]] = [
+    {
+        "id": "grok-build",
+        "name": "Grok Build",
+        "description": "Grok coding / build model (cli-chat-proxy)",
+        "owned_by": "xai",
+    },
+    {
+        "id": "grok-search",
+        "name": "Grok Search",
+        "description": "Grok with web search enabled (local alias)",
+        "owned_by": "xai",
+    },
+]
+
+
 def resolve_model(model: str | None) -> str:
     if not model:
         return DEFAULT_MODEL
@@ -26,6 +44,63 @@ def resolve_model(model: str | None) -> str:
     if m.lower() in ("grok-search", "web-search"):
         return DEFAULT_MODEL
     return MODEL_ALIASES.get(m, MODEL_ALIASES.get(m.lower(), m))
+
+
+def _extra_model_entries(now: int | None = None) -> list[dict[str, Any]]:
+    ts = int(now if now is not None else time.time())
+    out: list[dict[str, Any]] = []
+    for item in _EXTRA_MODELS:
+        mid = str(item.get("id") or "").strip()
+        if not mid:
+            continue
+        entry = {
+            "id": mid,
+            "object": "model",
+            "created": ts,
+            "owned_by": item.get("owned_by") or "xai",
+        }
+        if item.get("name"):
+            entry["name"] = item["name"]
+        if item.get("description"):
+            entry["description"] = item["description"]
+        out.append(entry)
+    return out
+
+
+def _merge_extra_models(models: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Ensure built-in extras stay visible even after upstream sync."""
+    have = {
+        str(m.get("id") or "").strip().lower()
+        for m in models
+        if isinstance(m, dict) and m.get("id")
+    }
+    for extra in _extra_model_entries():
+        mid = str(extra.get("id") or "").strip().lower()
+        if mid and mid not in have:
+            models.append(extra)
+            have.add(mid)
+    return models
+
+
+def _inject_extra_models_into_bucket(bucket: dict[str, Any]) -> dict[str, Any]:
+    """Write synthetic models into models_cache.json structure."""
+    if not isinstance(bucket, dict):
+        bucket = {}
+    for item in _EXTRA_MODELS:
+        mid = str(item.get("id") or "").strip()
+        if not mid or mid in bucket:
+            continue
+        info = {
+            "id": mid,
+            "model": mid,
+            "name": item.get("name") or mid,
+            "description": item.get("description"),
+            "hidden": False,
+            "owned_by": item.get("owned_by") or "xai",
+            "synthetic": True,
+        }
+        bucket[mid] = {"info": info, "api_key": None, "env_key": None}
+    return bucket
 
 
 def load_models_from_cache(path: Path | None = None) -> list[dict[str, Any]]:
@@ -64,22 +139,18 @@ def load_models_from_cache(path: Path | None = None) -> list[dict[str, Any]]:
                 "created": int(time.time()),
                 "owned_by": "xai",
             },
-            {
-                "id": "grok-build",
-                "object": "model",
-                "created": int(time.time()),
-                "owned_by": "xai",
-            },
-            {
-                "id": "grok-search",
-                "object": "model",
-                "created": int(time.time()),
-                "owned_by": "xai",
-                "description": "Grok with web search enabled",
-            },
         ]
-    # stable order: default first
-    models.sort(key=lambda m: (0 if m.get("id") == DEFAULT_MODEL else 1, m.get("id") or ""))
+    models = _merge_extra_models(models)
+    # stable order: default first, then grok-build, then others
+    def _sort_key(m: dict[str, Any]) -> tuple:
+        mid = str(m.get("id") or "")
+        if mid == DEFAULT_MODEL:
+            return (0, mid)
+        if mid == "grok-build":
+            return (1, mid)
+        return (2, mid)
+
+    models.sort(key=_sort_key)
     return models
 
 
@@ -165,6 +236,9 @@ def sync_models_from_upstream(path: Path | None = None) -> dict[str, Any]:
 
     if not bucket:
         return {"ok": False, "error": "no models in upstream response"}
+
+    # Keep local extras (e.g. grok-build) even if upstream omits them.
+    bucket = _inject_extra_models_into_bucket(bucket)
 
     cache_obj = {
         "fetched_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),

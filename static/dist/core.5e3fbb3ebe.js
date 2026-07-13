@@ -312,7 +312,10 @@ async function softNavigate(name, opts) {
       if (typeof rebindPageControls === "function") rebindPageControls();
       try { if (window.G2A && G2A.bindThemeToggle) G2A.bindThemeToggle(document); } catch(_){}
       // Non-blocking data load so menu clicks feel instant.
-      if (typeof loadDashboard === "function") {
+      // Models page: load dedicated catalog first (do not rely on /dashboard).
+      if (page === "models" && typeof loadModels === "function") {
+        Promise.resolve(loadModels()).catch((e) => console.warn("soft nav loadModels", e));
+      } else if (typeof loadDashboard === "function") {
         Promise.resolve(loadDashboard()).catch((e) => console.warn("soft nav loadDashboard", e));
       }
     } catch (e) {
@@ -328,6 +331,11 @@ async function softNavigate(name, opts) {
     }
     if (page === "accounts") {
       try { await loadRegConfig(false); } catch (e) { console.warn("loadRegConfig", e); }
+      try {
+        await restoreActiveRegistration({ force: !hasTrackedRegTask(), toastIfEmpty: false });
+      } catch (e) {
+        console.warn("restoreActiveRegistration", e);
+      }
     }
     // Page-specific renders after content swap
     try {
@@ -335,7 +343,12 @@ async function softNavigate(name, opts) {
       if (page === "keys" && typeof renderKeys === "function") renderKeys();
       if (page === "logs" && typeof loadAdminLogs === "function") loadAdminLogs({ reset: false });
       if (page === "usage" && typeof loadUsage === "function") loadUsage();
-      if (page === "models" && typeof renderModels === "function") renderModels();
+      // models: already kicked off loadModels above; keep a second best-effort call
+      if (page === "models" && typeof loadModels === "function") {
+        Promise.resolve(loadModels()).catch(() => {});
+      } else if (page === "models" && typeof renderModels === "function") {
+        renderModels();
+      }
       if (page === "guide" && typeof renderGuide === "function") renderGuide();
       if (page === "overview" && typeof renderStats === "function") renderStats();
     } catch (e) {
@@ -405,11 +418,16 @@ function rebindPageControls() {
   try { bindUsageControls(); } catch (_) {}
   try { hideEmptyLogPanels(); } catch (_) {}
   // Soft-nav swaps DOM; re-show active registration card + keep polling if needed.
+  // Full page refresh loses in-memory ids — restore from backend when missing.
   try {
     const page = document.body.dataset.page || pageFromPath(location.pathname) || "";
-    if (page === "accounts" && (regBatchId || regSessionId || (regSessionIds && regSessionIds.length))) {
-      showPanel("reg-session-box");
-      if (!regFinishedNotified) startRegPolling({ immediate: true });
+    if (page === "accounts") {
+      if (hasTrackedRegTask()) {
+        showPanel("reg-session-box");
+        if (!regFinishedNotified) startRegPolling({ immediate: true });
+      } else {
+        restoreActiveRegistration({ force: true, toastIfEmpty: false }).catch(() => {});
+      }
     }
   } catch (_) {}
 
@@ -421,8 +439,14 @@ function rebindPageControls() {
     try {
       _statusFetchedAt = 0;
       statusCache = null;
-      await loadDashboard();
-      toast("已刷新");
+      const page = document.body.dataset.page || pageFromPath(location.pathname) || "";
+      if (page === "models" && typeof loadModels === "function") {
+        const list = await loadModels();
+        toast(`已刷新模型列表（${(list || []).length} 个）`);
+      } else {
+        await loadDashboard();
+        toast("已刷新");
+      }
     } catch (e) { toast(e.message, false); }
   });
   on("btn-logout", "onclick", async () => {
@@ -526,8 +550,9 @@ function rebindPageControls() {
   on("btn-sync-models", "onclick", async () => {
     try {
       const r = await api("/models/sync", { method: "POST" });
-      toast(`已同步 ${r.count || 0} 个模型`);
-      await loadDashboard();
+      // Always re-fetch catalog so local extras (grok-build) stay visible.
+      const list = await loadModels();
+      toast(`已同步 ${r.count || (list || []).length || 0} 个模型`);
     } catch (e) { toast(e.message, false); }
   });
   on("btn-save-mode", "onclick", async () => {
@@ -668,16 +693,13 @@ function rebindPageControls() {
   });
   if ($("btn-save-reg")) on("btn-save-reg", "onclick", () => { saveRegConfig().catch(() => {}); });
   if ($("btn-refresh-reg")) on("btn-refresh-reg", "onclick", () => {
-    if (regBatchId || regSessionId || (regSessionIds && regSessionIds.length)) {
-      showPanel("reg-session-box");
-      pollRegSession();
-    } else {
-      toast("当前没有进行中的注册", false);
-    }
+    refreshRegistrationProgress({ toastIfEmpty: true }).catch(() => {});
   });
   if ($("btn-stop-reg")) on("btn-stop-reg", "onclick", () => { stopRegistration().catch(() => {}); });
   if ($("btn-stop-reg-inline")) on("btn-stop-reg-inline", "onclick", () => { stopRegistration().catch(() => {}); });
-  if ($("btn-refresh-reg-inline")) on("btn-refresh-reg-inline", "onclick", () => pollRegSession());
+  if ($("btn-refresh-reg-inline")) on("btn-refresh-reg-inline", "onclick", () => {
+    refreshRegistrationProgress({ toastIfEmpty: true }).catch(() => {});
+  });
   if ($("btn-close-reg-inline")) on("btn-close-reg-inline", "onclick", () => {
     dismissRegProgressCard();
     toast("已关闭进度卡片（后台注册不受影响）");
@@ -882,13 +904,23 @@ async function bootstrap() {
       toast(e1.message || "加载失败", false);
       if (page === "accounts") renderAccounts();
       if (page === "keys") renderKeys();
-      if (page === "models") { try { renderModels(); } catch (_) {} }
+      if (page === "models") {
+        try {
+          if (typeof loadModels === "function") loadModels();
+          else renderModels();
+        } catch (_) {}
+      }
       if (page === "guide") { try { renderGuide(); } catch (_) {} }
       if (page === "overview") { try { renderStats(); } catch (_) {} }
     }
     try { rebindPageControls(); } catch(_){}
     if (page === "overview") startAutoUiRefresh();
-    if (page === "accounts") renderAccounts();
+    if (page === "accounts") {
+      renderAccounts();
+      try {
+        restoreActiveRegistration({ force: !hasTrackedRegTask(), toastIfEmpty: false }).catch(() => {});
+      } catch (_) {}
+    }
     if (page === "keys") renderKeys();
     on("btn-logout", "onclick", async () => {
       try { await api("/logout", { method: "POST", body: "{}" }); } catch (_) {}
@@ -900,8 +932,14 @@ async function bootstrap() {
       try {
         _statusFetchedAt = 0;
         statusCache = null;
-        await loadDashboard();
-        toast("已刷新");
+        const page = document.body.dataset.page || pageFromPath(location.pathname) || "";
+        if (page === "models" && typeof loadModels === "function") {
+          const list = await loadModels();
+          toast(`已刷新模型列表（${(list || []).length} 个）`);
+        } else {
+          await loadDashboard();
+          toast("已刷新");
+        }
       } catch (e) { toast(e.message, false); }
     });
   } catch (e) {
@@ -1002,7 +1040,9 @@ async function loadDashboard() {
   } else if (page === "logs") {
     try { await loadAdminLogs({ reset: false }); } catch (e) { console.warn(e); }
   } else if (page === "models") {
-    try { renderModels(); } catch (e) {}
+    // Models page intentionally skips /dashboard (large). Load the dedicated
+    // /models catalog so local extras like grok-build are visible.
+    try { await loadModels(); } catch (e) { console.warn(e); }
     try { renderModelHealthInfo(); } catch (e) {}
   } else if (page === "guide") {
     try { renderGuide(); } catch (e) {}
@@ -1825,18 +1865,48 @@ async function refreshAllQuota(force = true) {
 }
 
 
+async function loadModels() {
+  // Prefer lightweight admin catalog over stale/empty dashCache.models.
+  // /dashboard is skipped on the models page for performance with large pools.
+  let list = [];
+  try {
+    const r = await api("/models");
+    list = (r && (r.data || r.models)) || [];
+    if (!Array.isArray(list)) list = [];
+    dashCache = dashCache || {};
+    // Always replace — never keep a stale single-model dashboard snapshot.
+    dashCache.models = list.slice();
+    if (r && r.default_model) dashCache.default_model = r.default_model;
+  } catch (e) {
+    console.warn("loadModels failed", e);
+    try { toast((e && e.message) || "加载模型列表失败", false); } catch (_) {}
+  }
+  renderModels();
+  return (dashCache && dashCache.models) || list || [];
+}
+
 function renderModels() {
-  const models = (dashCache && dashCache.models) || [];
+  const models = (dashCache && Array.isArray(dashCache.models) ? dashCache.models : []) || [];
   const tbody = $("models-tbody");
   if (!tbody) return;
+  // Subtitle count if present
+  try {
+    const head = tbody.closest(".g2a-card");
+    const sub = head && head.querySelector(".g2a-card-head p");
+    if (sub) {
+      sub.textContent = models.length
+        ? `上游 + 本地模型缓存，共 ${models.length} 个。可同步并查看探测结果。`
+        : "上游模型缓存。可同步并查看探测结果。";
+    }
+  } catch (_) {}
   tbody.innerHTML = models.map(m => `
     <tr>
-      <td class="mono">${esc(m.id)}</td>
-      <td>${esc(m.name || "—")}</td>
-      <td class="g2a-muted">${m.context_window ? m.context_window.toLocaleString() : "—"}</td>
+      <td class="mono">${esc(m.id || "")}</td>
+      <td>${esc(m.name || m.id || "—")}</td>
+      <td class="g2a-muted">${m.context_window ? Number(m.context_window).toLocaleString() : "—"}</td>
       <td class="g2a-muted">${m.supports_reasoning_effort ? "是" : "—"}</td>
     </tr>
-  `).join("") || `<tr><td colspan="4" class="g2a-muted">无模型缓存，使用默认 grok-4.5</td></tr>`;
+  `).join("") || `<tr><td colspan="4" class="g2a-muted">暂无模型。请点「同步上游模型」或刷新；默认可用 grok-4.5 / grok-build</td></tr>`;
 }
 
 function renderModelHealthInfo() {
@@ -2873,6 +2943,180 @@ const REG_TERMINAL_BAD = new Set([
   "cancelled",
   "stopped",
 ]);
+
+function isRegTerminalStatus(status) {
+  const st = String(status || "").toLowerCase();
+  return REG_TERMINAL_OK.has(st) || REG_TERMINAL_BAD.has(st);
+}
+
+function hasTrackedRegTask() {
+  return !!(regBatchId || regSessionId || (regSessionIds && regSessionIds.length));
+}
+
+function adoptRegSessions(sessions, { batch = null, continuePolling = true } = {}) {
+  const list = Array.isArray(sessions) ? sessions.filter(Boolean) : [];
+  const batchObj = batch && typeof batch === "object" ? batch : null;
+  const batchId =
+    (batchObj && (batchObj.batch_id || batchObj.id)) ||
+    (list.find((s) => s && s.batch_id)?.batch_id) ||
+    null;
+  const ids = [];
+  for (const s of list) {
+    const id = regSessionKey(s);
+    if (id && !ids.includes(id)) ids.push(id);
+  }
+  if (batchObj && Array.isArray(batchObj.session_ids)) {
+    for (const id of batchObj.session_ids) {
+      if (id && !ids.includes(id)) ids.push(String(id));
+    }
+  }
+  if (!ids.length && !batchId) return false;
+
+  regBatchId = batchId || regBatchId || null;
+  regSessionIds = ids.length ? ids.slice() : (regSessionId ? [regSessionId] : []);
+  regSessionId = regSessionIds[0] || regSessionId || null;
+  regFinishedNotified = false;
+  regStopping = false;
+  regPollInFlight = false;
+  regLastLogText = "";
+  regLastStatusText = "";
+  regLastEmailText = "";
+
+  if (list.length <= 1 && !regBatchId) {
+    showRegSession(list[0] || batchObj || { id: regSessionId, status: "running" }, {
+      batch: batchObj,
+    });
+  } else {
+    showRegSessionGroup(
+      list.length
+        ? list
+        : regSessionIds.map((id) => ({ id, status: "running", batch_id: regBatchId })),
+      { batch: batchObj }
+    );
+  }
+
+  const batchStatus = String(
+    (batchObj && (batchObj.batch_status || batchObj.status)) || ""
+  ).toLowerCase();
+  const batchRunning = Number((batchObj && batchObj.running) || 0) > 0;
+  const batchDone =
+    !!batchObj &&
+    (batchStatus === "done" ||
+      batchStatus === "partial" ||
+      batchStatus === "error" ||
+      batchStatus === "cancelled" ||
+      batchStatus === "stopped" ||
+      (Number(batchObj.done || 0) > 0 &&
+        Number(batchObj.done || 0) >= Number(batchObj.total || batchObj.count || 0)));
+  const allTerminal =
+    list.length > 0 &&
+    list.every((s) => isRegTerminalStatus(regStatusOf(s)));
+  const finished = !!batchDone || (allTerminal && !batchRunning);
+
+  if (continuePolling && !finished) {
+    startRegPolling({ immediate: true, intervalMs: 2000 });
+  } else if (finished) {
+    // One more poll paints the final summary / stops the timer cleanly.
+    pollRegSession().catch(() => {});
+  } else {
+    startRegPolling({ immediate: true, intervalMs: 2000 });
+  }
+  return true;
+}
+
+async function restoreActiveRegistration({ force = false, toastIfEmpty = false } = {}) {
+  // Hard refresh / soft-nav re-entry loses in-memory session ids. Rebuild from backend.
+  if (!force && hasTrackedRegTask()) {
+    showPanel("reg-session-box");
+    if (!regFinishedNotified) startRegPolling({ immediate: true, intervalMs: 2000 });
+    else pollRegSession().catch(() => {});
+    return true;
+  }
+  try {
+    const all = await api("/accounts/register-email/sessions");
+    const sessions = Array.isArray(all && all.sessions) ? all.sessions : [];
+    const batches = Array.isArray(all && all.batches) ? all.batches : [];
+
+    const activeBatches = batches
+      .filter((b) => {
+        const st = String((b && (b.batch_status || b.status)) || "").toLowerCase();
+        const running = Number((b && b.running) || 0);
+        if (running > 0) return true;
+        if (!st || st === "running" || st === "starting" || st === "stopping" || st === "queued") {
+          return true;
+        }
+        return false;
+      })
+      .sort(
+        (a, b) =>
+          Number((b && (b.updated_at || b.created_at)) || 0) -
+          Number((a && (a.updated_at || a.created_at)) || 0)
+      );
+
+    if (activeBatches.length) {
+      const batch = activeBatches[0];
+      const bid = batch.batch_id || batch.id;
+      let full = batch;
+      if (bid) {
+        try {
+          full = await api("/accounts/register-email/batches/" + encodeURIComponent(bid));
+        } catch (_) {
+          full = batch;
+        }
+      }
+      const sess =
+        (full && Array.isArray(full.sessions) && full.sessions.length
+          ? full.sessions
+          : sessions.filter((s) => s && s.batch_id && s.batch_id === bid)) || [];
+      const ok = adoptRegSessions(sess, { batch: full || batch, continuePolling: true });
+      if (ok) return true;
+    }
+
+    const activeSessions = sessions
+      .filter((s) => !isRegTerminalStatus(regStatusOf(s)))
+      .sort(
+        (a, b) =>
+          Number((b && (b.updated_at || b.created_at)) || 0) -
+          Number((a && (a.updated_at || a.created_at)) || 0)
+      );
+    if (activeSessions.length) {
+      // Prefer the newest active batch cluster when sessions share batch_id.
+      const top = activeSessions[0];
+      const bid = top && top.batch_id;
+      if (bid) {
+        const cluster = activeSessions.filter((s) => s && s.batch_id === bid);
+        const batchMeta = batches.find((b) => (b.id || b.batch_id) === bid) || {
+          id: bid,
+          batch_id: bid,
+          session_ids: cluster.map(regSessionKey).filter(Boolean),
+          running: cluster.length,
+          status: "running",
+        };
+        const ok = adoptRegSessions(cluster, { batch: batchMeta, continuePolling: true });
+        if (ok) return true;
+      }
+      const ok = adoptRegSessions([top], { continuePolling: true });
+      if (ok) return true;
+    }
+
+    // No live task: if we were already tracking something, keep the last card.
+    // Otherwise leave the card hidden — user can start a new registration.
+    if (toastIfEmpty) toast("当前没有进行中的注册", false);
+    return false;
+  } catch (e) {
+    if (toastIfEmpty) toast((e && e.message) || "刷新注册进度失败", false);
+    return false;
+  }
+}
+
+async function refreshRegistrationProgress({ toastIfEmpty = true } = {}) {
+  if (hasTrackedRegTask()) {
+    showPanel("reg-session-box");
+    await pollRegSession();
+    return true;
+  }
+  return restoreActiveRegistration({ force: true, toastIfEmpty });
+}
 
 function regSessionKey(s) {
   return (s && (s.id || s.session_id)) || "";
@@ -4699,9 +4943,9 @@ on("btn-normalize-keys", "onclick", async () => {  try {
 if ($("btn-sync-models")) {
   on("btn-sync-models", "onclick", async () => {    try {
       const r = await api("/models/sync", { method: "POST" });
-      toast(`已同步 ${r.count || 0} 个模型`);
       statusCache = await api("/status");
-      await loadDashboard();
+      const list = await loadModels();
+      toast(`已同步 ${r.count || (list || []).length || 0} 个模型`);
     } catch (e) { toast(e.message, false); }
   });
 }
@@ -4791,12 +5035,7 @@ if ($("btn-save-reg") && !$("btn-save-reg").onclick) {
 }
 if ($("btn-refresh-reg") && !$("btn-refresh-reg").onclick) {
   on("btn-refresh-reg", "onclick", () => {
-    if (regBatchId || regSessionId || (regSessionIds && regSessionIds.length)) {
-      showPanel("reg-session-box");
-      pollRegSession();
-    } else {
-      toast("当前没有进行中的注册", false);
-    }
+    refreshRegistrationProgress({ toastIfEmpty: true }).catch(() => {});
   });
 }
 if ($("btn-stop-reg") && !$("btn-stop-reg").onclick) {
@@ -4806,7 +5045,9 @@ if ($("btn-stop-reg-inline") && !$("btn-stop-reg-inline").onclick) {
   on("btn-stop-reg-inline", "onclick", () => { stopRegistration().catch(() => {}); });
 }
 if ($("btn-refresh-reg-inline") && !$("btn-refresh-reg-inline").onclick) {
-  on("btn-refresh-reg-inline", "onclick", () => pollRegSession());
+  on("btn-refresh-reg-inline", "onclick", () => {
+    refreshRegistrationProgress({ toastIfEmpty: true }).catch(() => {});
+  });
 }
 if ($("btn-close-reg-inline") && !$("btn-close-reg-inline").onclick) {
   on("btn-close-reg-inline", "onclick", () => {
@@ -5122,6 +5363,9 @@ let logsPageSize = 50;
 let logsTotalPages = 1;
 let logsLoading = false;
 let logsLoadSeq = 0;
+// Keep selected row detail across soft-nav / refresh so "refresh" doesn't blank the panel.
+let logsSelectedId = null;
+let logsDetailCache = Object.create(null);
 
 function taskStatusTag(status, ok) {
   const st = String(status || "").toLowerCase();
@@ -5177,11 +5421,27 @@ function bindLogsControls() {
   if (tb && !tb._logsBound) {
     tb._logsBound = true;
     tb.addEventListener("click", (e) => {
-      const tr = e.target.closest("tr[data-log-detail]");
+      const tr = e.target.closest("tr[data-log-id], tr[data-log-detail]");
       if (!tr) return;
+      // Prefer in-memory cache (survives soft-nav/rebind). Attribute is fallback.
+      let detail = null;
+      const id = tr.getAttribute("data-log-id");
+      if (id && logsDetailCache && Object.prototype.hasOwnProperty.call(logsDetailCache, id)) {
+        detail = logsDetailCache[id];
+      } else {
+        try {
+          detail = JSON.parse(tr.getAttribute("data-log-detail") || "{}");
+        } catch (_) {
+          detail = { raw: tr.getAttribute("data-log-detail") || "" };
+        }
+      }
       try {
-        const detail = JSON.parse(tr.getAttribute("data-log-detail") || "{}");
-        setLogPanel("logs-detail", JSON.stringify(detail, null, 2), { forceShow: true });
+        setLogPanel("logs-detail", JSON.stringify(detail || {}, null, 2), { forceShow: true });
+        // Remember selected row so refresh can re-show the same detail.
+        logsSelectedId = id || null;
+        if (logsSelectedId) {
+          try { sessionStorage.setItem("g2a_logs_selected_id", String(logsSelectedId)); } catch (_) {}
+        }
       } catch (_) {}
     });
   }
@@ -5207,6 +5467,10 @@ async function loadAdminLogs({ reset = false } = {}) {
   bindLogsControls();
   await ensureLogActions();
   if (reset) logsPage = 1;
+  // Restore last selected row after hard refresh / soft-nav.
+  if (!logsSelectedId) {
+    try { logsSelectedId = sessionStorage.getItem("g2a_logs_selected_id") || null; } catch (_) {}
+  }
   logsLoading = true;
   const seq = ++logsLoadSeq;
   const q = ($("logs-q") && $("logs-q").value || "").trim();
@@ -5231,22 +5495,33 @@ async function loadAdminLogs({ reset = false } = {}) {
     }
     if ($("logs-page-prev")) $("logs-page-prev").disabled = logsPage <= 1;
     if ($("logs-page-next")) $("logs-page-next").disabled = logsPage >= logsTotalPages;
+    // Rebuild detail cache for this page so clicks never depend on fragile HTML attrs.
+    logsDetailCache = Object.create(null);
     if (!items.length) {
       $("logs-tbody").innerHTML = `<tr><td colspan="6" class="g2a-muted">暂无任务日志</td></tr>`;
+      // Keep previously shown detail if user only filtered to empty page.
     } else {
-      $("logs-tbody").innerHTML = items.map((it) => {
+      $("logs-tbody").innerHTML = items.map((it, idx) => {
+        const rowId = String(it.id != null ? it.id : (it.task_id || `row-${idx}`));
         const payload = {
-          ...(it.detail || {}),
+          id: it.id != null ? it.id : null,
+          created_at: it.created_at || null,
+          updated_at: it.updated_at || null,
+          finished_at: it.finished_at || null,
           task_id: it.task_id || null,
           kind: it.kind || it.action || null,
           status: it.status || null,
+          summary: it.summary || null,
+          ok: it.ok,
           progress_done: it.progress_done,
           progress_total: it.progress_total,
+          detail: it.detail || {},
         };
-        const detail = esc(JSON.stringify(payload));
+        logsDetailCache[rowId] = payload;
         const kind = it.kind || it.action || "—";
         const st = it.status || "—";
-        return `<tr data-log-detail='${detail.replace(/'/g, "&#39;")}' style="cursor:pointer">
+        const selected = logsSelectedId && String(logsSelectedId) === rowId;
+        return `<tr data-log-id="${esc(rowId)}" style="cursor:pointer${selected ? ";outline:1px solid var(--g2a-primary, #4f8cff)" : ""}">
           <td class="g2a-muted">${esc(fmtTime(it.created_at))}</td>
           <td class="mono">${esc(kind)}</td>
           <td class="mono g2a-muted">${esc(st)}</td>
@@ -5255,6 +5530,14 @@ async function loadAdminLogs({ reset = false } = {}) {
           <td>${taskStatusTag(st, it.ok)}</td>
         </tr>`;
       }).join("");
+      // Re-show selected detail after refresh so the panel doesn't go blank.
+      if (logsSelectedId && logsDetailCache[logsSelectedId]) {
+        setLogPanel(
+          "logs-detail",
+          JSON.stringify(logsDetailCache[logsSelectedId], null, 2),
+          { forceShow: true }
+        );
+      }
     }
   } catch (e) {
     if (seq !== logsLoadSeq) return;

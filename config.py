@@ -343,6 +343,11 @@ MODEL_ALIASES: dict[str, str] = {
     "claude-haiku-4-5-20251001": DEFAULT_MODEL,
     "grok": DEFAULT_MODEL,
     "grok-latest": DEFAULT_MODEL,
+    # Real cli-chat-proxy model id (often omitted from /v1/models list).
     "grok-build": "grok-build",
+    "grok-build-latest": "grok-build",
+    # Historical free-tier name seen in free-usage error payloads.
+    "grok-4.5-build-free": "grok-build",
+    "grok-4.5-build": "grok-build",
     "default": DEFAULT_MODEL,
 }

@@ -160,6 +160,9 @@ class TurnstileAPIServer:
         # YesCaptcha / CapSolver 兼容协议
         self.app.route('/createTask', methods=['POST'])(self.create_task)
         self.app.route('/getTaskResult', methods=['POST'])(self.get_task_result)
+        # Memory/ops helpers
+        self.app.route('/health', methods=['GET'])(self.health)
+        self.app.route('/reclaim', methods=['POST', 'GET'])(self.reclaim)
         self.app.route('/')(self.index)
         
 
@@ -295,6 +298,89 @@ class TurnstileAPIServer:
             except Exception:
                 break
 
+    async def _close_maybe_async(self, obj, *method_names: str, label: str = "resource") -> bool:
+        """Best-effort close helper for browser/driver objects."""
+        if obj is None:
+            return False
+        for meth_name in method_names:
+            meth = getattr(obj, meth_name, None)
+            if meth is None:
+                continue
+            try:
+                if meth_name == "__aexit__":
+                    result = meth(None, None, None)
+                else:
+                    result = meth()
+                if asyncio.iscoroutine(result):
+                    await asyncio.wait_for(result, timeout=8.0)
+                logger.debug(f"{label}: {meth_name} ok")
+                return True
+            except Exception as e:
+                if self.debug:
+                    logger.warning(f"{label}: {meth_name} failed: {e}")
+        return False
+
+    def _kill_process_tree(self, proc) -> None:
+        """Force-kill a browser child process tree (Camoufox/Chromium leftovers)."""
+        if proc is None:
+            return
+        pid = getattr(proc, "pid", None)
+        if not pid:
+            return
+        try:
+            import signal
+            import os as _os
+
+            # Prefer process group kill when available.
+            try:
+                pgid = _os.getpgid(int(pid))
+                _os.killpg(pgid, signal.SIGTERM)
+            except Exception:
+                try:
+                    _os.kill(int(pid), signal.SIGTERM)
+                except Exception:
+                    pass
+            try:
+                # Give it a moment, then hard kill.
+                time.sleep(0.05)
+                try:
+                    pgid = _os.getpgid(int(pid))
+                    _os.killpg(pgid, signal.SIGKILL)
+                except Exception:
+                    try:
+                        _os.kill(int(pid), signal.SIGKILL)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+        except Exception as e:
+            if self.debug:
+                logger.warning(f"kill process tree pid={pid} failed: {e}")
+
+    async def _force_kill_browser(self, browser, index: int | None = None) -> None:
+        """Hard cleanup for browsers that ignore close()/aclose()."""
+        label = f"Browser {index}" if index is not None else "Browser"
+        # Playwright-style browser process
+        for attr in ("process", "_process"):
+            proc = getattr(browser, attr, None)
+            if proc is not None:
+                self._kill_process_tree(proc)
+                if self.debug:
+                    logger.debug(f"{label}: force-killed via {attr}")
+                return
+        # Nested browser objects (some wrappers)
+        for attr in ("browser", "_browser", "impl_obj", "_impl_obj"):
+            nested = getattr(browser, attr, None)
+            if nested is None or nested is browser:
+                continue
+            for nested_attr in ("process", "_process"):
+                proc = getattr(nested, nested_attr, None)
+                if proc is not None:
+                    self._kill_process_tree(proc)
+                    if self.debug:
+                        logger.debug(f"{label}: force-killed nested {attr}.{nested_attr}")
+                    return
+
     async def _shutdown_browsers(self) -> None:
         """Close every browser and release Playwright/Camoufox drivers."""
         items = list(self._owned_browsers or [])
@@ -302,21 +388,24 @@ class TurnstileAPIServer:
         await self._drain_pool_discard()
 
         for index, browser, _config in items:
-            try:
-                closer = getattr(browser, "close", None)
-                if closer is not None:
-                    result = closer()
-                    if asyncio.iscoroutine(result):
-                        await result
-                if self.debug:
-                    logger.debug(f"Browser {index}: closed")
-            except Exception as e:
-                if self.debug:
-                    logger.warning(f"Browser {index}: close failed: {e}")
+            closed = await self._close_maybe_async(
+                browser, "close", "aclose", label=f"Browser {index}"
+            )
+            if not closed:
+                await self._force_kill_browser(browser, index=index)
+            else:
+                # Even after close(), Camoufox occasionally leaves zombie children.
+                # Best-effort hard cleanup when process handle is still visible.
+                try:
+                    await self._force_kill_browser(browser, index=index)
+                except Exception:
+                    pass
+            if self.debug:
+                logger.debug(f"Browser {index}: closed")
 
         if self._playwright is not None:
             try:
-                await self._playwright.stop()
+                await asyncio.wait_for(self._playwright.stop(), timeout=8.0)
             except Exception as e:
                 if self.debug:
                     logger.warning(f"Playwright stop failed: {e}")
@@ -324,24 +413,21 @@ class TurnstileAPIServer:
 
         if self._camoufox is not None:
             # AsyncCamoufox may expose aclose / __aexit__; best-effort.
-            for meth_name in ("aclose", "close", "__aexit__"):
-                meth = getattr(self._camoufox, meth_name, None)
-                if meth is None:
-                    continue
-                try:
-                    if meth_name == "__aexit__":
-                        result = meth(None, None, None)
-                    else:
-                        result = meth()
-                    if asyncio.iscoroutine(result):
-                        await result
-                    break
-                except Exception as e:
-                    if self.debug:
-                        logger.warning(f"Camoufox {meth_name} failed: {e}")
+            await self._close_maybe_async(
+                self._camoufox, "aclose", "close", "__aexit__", label="Camoufox"
+            )
             self._camoufox = None
 
+        # Idle reclaim must not keep a stuck counter forever.
+        # If a solve task crashed without finally, _in_flight could block all future reclaim.
+        if self._in_flight != 0:
+            logger.warning(
+                f"Resetting leaked in-flight counter during reclaim: was {self._in_flight}"
+            )
+            self._in_flight = 0
+
         self._pool_ready = False
+        # Keep last_used as historical activity; do not bump it here or reclaim loops thrash.
         logger.info("Browser pool reclaimed (idle / rebuild)")
 
     async def _ensure_pool(self) -> None:
@@ -362,7 +448,7 @@ class TurnstileAPIServer:
             logger.info(
                 f"Warming browser pool (thread={self.thread_count}, type={self.browser_type})"
             )
-            if self._pool_ready:
+            if self._pool_ready or self._owned_browsers or self._playwright or self._camoufox:
                 await self._shutdown_browsers()
             await self._initialize_browser()
 
@@ -370,28 +456,58 @@ class TurnstileAPIServer:
         """Close browsers after TURNSTILE_IDLE_SEC with no captcha activity."""
         # Check more frequently than idle window so reclaim is timely.
         interval = 15.0 if self.idle_sec <= 60 else min(30.0, max(10.0, self.idle_sec / 6.0))
+        stuck_since = 0.0
         while True:
             try:
                 await asyncio.sleep(interval)
-                if self.idle_sec <= 0 or not self._pool_ready:
+                if self.idle_sec <= 0:
                     continue
-                if self._in_flight > 0:
+                # Nothing warm / owned → nothing to reclaim.
+                if not self._pool_ready and not self._owned_browsers:
+                    stuck_since = 0.0
                     continue
+
                 idle_for = time.time() - (self._last_used or 0.0)
                 if idle_for < self.idle_sec:
+                    stuck_since = 0.0
                     continue
-                if self._pool_lock is None:
-                    continue
-                async with self._pool_lock:
-                    if not self._pool_ready or self._in_flight > 0:
+
+                # Guard against leaked in-flight counters: if we have been idle longer
+                # than 2x idle window and still see in-flight > 0, force reclaim.
+                if self._in_flight > 0:
+                    if stuck_since <= 0:
+                        stuck_since = time.time()
+                    stuck_for = time.time() - stuck_since
+                    if stuck_for < max(self.idle_sec * 2.0, 120.0):
+                        if self.debug:
+                            logger.debug(
+                                f"Idle reaper waiting: in_flight={self._in_flight}, "
+                                f"idle={idle_for:.0f}s, stuck={stuck_for:.0f}s"
+                            )
                         continue
+                    logger.warning(
+                        f"Idle reaper force-reclaim: in_flight stuck at {self._in_flight} "
+                        f"for {stuck_for:.0f}s (idle={idle_for:.0f}s)"
+                    )
+                else:
+                    stuck_since = 0.0
+
+                if self._pool_lock is None:
+                    self._pool_lock = asyncio.Lock()
+                async with self._pool_lock:
                     idle_for = time.time() - (self._last_used or 0.0)
                     if idle_for < self.idle_sec:
                         continue
+                    if self._in_flight > 0 and idle_for < max(self.idle_sec * 2.0, 120.0):
+                        continue
+                    owned_n = len(self._owned_browsers or [])
+                    qsize = self.browser_pool.qsize()
                     logger.info(
-                        f"No captcha for {idle_for:.0f}s — reclaiming {self.browser_pool.qsize()} browser(s)"
+                        f"No captcha for {idle_for:.0f}s — reclaiming "
+                        f"queue={qsize} owned={owned_n} in_flight={self._in_flight}"
                     )
                     await self._shutdown_browsers()
+                    stuck_since = 0.0
             except asyncio.CancelledError:
                 raise
             except Exception as e:
@@ -775,89 +891,87 @@ class TurnstileAPIServer:
         acquired = False
 
         # Mark in-flight before warm-up so the idle reaper cannot reclaim mid-acquire.
+        # Always pair with the outer finally decrement — never leave this sticky.
         self._in_flight += 1
         try:
-            await self._ensure_pool()
-            self._last_used = time.time()
-            index, browser, browser_config = await self.browser_pool.get()
-            acquired = True
-            self._last_used = time.time()
-        except Exception as e:
-            logger.error(f"Failed to acquire browser from pool: {e}")
-            await save_result(task_id, "turnstile", {"value": "CAPTCHA_FAIL", "elapsed_time": 0, "error": str(e)})
-            if self._in_flight > 0:
-                self._in_flight -= 1
-            return
-
-        try:
-            if hasattr(browser, 'is_connected') and not browser.is_connected():
-                if self.debug:
-                    logger.warning(f"Browser {index}: Browser disconnected, skipping")
-                await self.browser_pool.put((index, browser, browser_config))
-                acquired = False
-                await save_result(task_id, "turnstile", {"value": "CAPTCHA_FAIL", "elapsed_time": 0, "error": "browser_disconnected"})
-                return
-        except Exception as e:
-            if self.debug:
-                logger.warning(f"Browser {index}: Cannot check browser state: {str(e)}")
-
-        if self.proxy_support:
-            proxy_file_path = os.path.join(os.getcwd(), "proxies.txt")
-
             try:
-                with open(proxy_file_path) as proxy_file:
-                    proxies = [line.strip() for line in proxy_file if line.strip()]
-
-                proxy = random.choice(proxies) if proxies else None
-                
-                if self.debug and proxy:
-                    logger.debug(f"Browser {index}: Selected proxy: {proxy}")
-                elif self.debug and not proxy:
-                    logger.debug(f"Browser {index}: No proxies available")
-                    
-            except FileNotFoundError:
-                logger.warning(f"Proxy file not found: {proxy_file_path}")
-                proxy = None
+                await self._ensure_pool()
+                self._last_used = time.time()
+                index, browser, browser_config = await self.browser_pool.get()
+                acquired = True
+                self._last_used = time.time()
             except Exception as e:
-                logger.error(f"Error reading proxy file: {str(e)}")
-                proxy = None
+                logger.error(f"Failed to acquire browser from pool: {e}")
+                await save_result(task_id, "turnstile", {"value": "CAPTCHA_FAIL", "elapsed_time": 0, "error": str(e)})
+                return
 
-            if proxy and self.debug:
-                logger.debug(f"Browser {index}: Creating context with proxy enabled")
-            elif self.debug:
-                logger.debug(f"Browser {index}: Creating context without proxy")
-
-            context_options = self._build_context_options(browser_config or {}, proxy if self.proxy_support else None)
             try:
-                context = await browser.new_context(**context_options)
-            except Exception as ctx_err:
-                # Fallback for Camoufox protocol mismatches / stricter option sets.
+                if hasattr(browser, 'is_connected') and not browser.is_connected():
+                    if self.debug:
+                        logger.warning(f"Browser {index}: Browser disconnected, skipping")
+                    await self.browser_pool.put((index, browser, browser_config))
+                    acquired = False
+                    await save_result(task_id, "turnstile", {"value": "CAPTCHA_FAIL", "elapsed_time": 0, "error": "browser_disconnected"})
+                    return
+            except Exception as e:
                 if self.debug:
-                    logger.warning(f"Browser {index}: new_context failed ({ctx_err}); retry minimal options")
-                context = await browser.new_context(no_viewport=True)
-        else:
-            if self.debug:
-                logger.debug(f"Browser {index}: Creating context without proxy")
-            context_options = self._build_context_options(browser_config or {}, None)
+                    logger.warning(f"Browser {index}: Cannot check browser state: {str(e)}")
+
+            if self.proxy_support:
+                proxy_file_path = os.path.join(os.getcwd(), "proxies.txt")
+
+                try:
+                    with open(proxy_file_path) as proxy_file:
+                        proxies = [line.strip() for line in proxy_file if line.strip()]
+
+                    proxy = random.choice(proxies) if proxies else None
+
+                    if self.debug and proxy:
+                        logger.debug(f"Browser {index}: Selected proxy: {proxy}")
+                    elif self.debug and not proxy:
+                        logger.debug(f"Browser {index}: No proxies available")
+
+                except FileNotFoundError:
+                    logger.warning(f"Proxy file not found: {proxy_file_path}")
+                    proxy = None
+                except Exception as e:
+                    logger.error(f"Error reading proxy file: {str(e)}")
+                    proxy = None
+
+                if proxy and self.debug:
+                    logger.debug(f"Browser {index}: Creating context with proxy enabled")
+                elif self.debug:
+                    logger.debug(f"Browser {index}: Creating context without proxy")
+
+                context_options = self._build_context_options(browser_config or {}, proxy if self.proxy_support else None)
+                try:
+                    context = await browser.new_context(**context_options)
+                except Exception as ctx_err:
+                    # Fallback for Camoufox protocol mismatches / stricter option sets.
+                    if self.debug:
+                        logger.warning(f"Browser {index}: new_context failed ({ctx_err}); retry minimal options")
+                    context = await browser.new_context(no_viewport=True)
+            else:
+                if self.debug:
+                    logger.debug(f"Browser {index}: Creating context without proxy")
+                context_options = self._build_context_options(browser_config or {}, None)
+                try:
+                    context = await browser.new_context(**context_options)
+                except Exception as ctx_err:
+                    if self.debug:
+                        logger.warning(f"Browser {index}: new_context failed ({ctx_err}); retry minimal options")
+                    context = await browser.new_context(no_viewport=True)
+
+            page = await context.new_page()
+
             try:
-                context = await browser.new_context(**context_options)
-            except Exception as ctx_err:
-                if self.debug:
-                    logger.warning(f"Browser {index}: new_context failed ({ctx_err}); retry minimal options")
-                context = await browser.new_context(no_viewport=True)
+                await page.set_viewport_size({"width": 500, "height": 100})
+            except Exception:
+                pass
 
-        page = await context.new_page()
-
-        try:
-            await page.set_viewport_size({"width": 500, "height": 100})
-        except Exception:
-            pass
-
-        await self._antishadow_inject(page)
-
-        await self._block_rendering(page)
-
-        await page.add_init_script("""
+            await self._antishadow_inject(page)
+            await self._block_rendering(page)
+            await page.add_init_script("""
         Object.defineProperty(navigator, 'webdriver', {
             get: () => undefined,
         });
@@ -869,137 +983,127 @@ class TurnstileAPIServer:
         };
         """)
 
-        try:
-            if self.debug:
-                logger.debug(f"Browser {index}: Starting Turnstile solve for URL: {url} with Sitekey: {sitekey} | Action: {action} | Cdata: {cdata} | Proxy: {proxy}")
-                logger.debug(f"Browser {index}: Setting up optimized page loading with resource blocking")
+            try:
+                if self.debug:
+                    logger.debug(f"Browser {index}: Starting Turnstile solve for URL: {url} with Sitekey: {sitekey} | Action: {action} | Cdata: {cdata} | Proxy: {proxy}")
+                    logger.debug(f"Browser {index}: Setting up optimized page loading with resource blocking")
+                    logger.debug(f"Browser {index}: Loading real website directly: {url}")
 
-            if self.debug:
-                logger.debug(f"Browser {index}: Loading real website directly: {url}")
+                await page.goto(url, wait_until='domcontentloaded', timeout=30000)
+                await self._unblock_rendering(page)
 
-            await page.goto(url, wait_until='domcontentloaded', timeout=30000)
+                if self.debug:
+                    logger.debug(f"Browser {index}: Injecting Turnstile widget directly into target site")
 
-            await self._unblock_rendering(page)
+                await self._inject_captcha_directly(page, sitekey, action or '', cdata or '', index)
+                await asyncio.sleep(3)
 
-            # Сразу инъектируем виджет Turnstile на целевой сайт
-            if self.debug:
-                logger.debug(f"Browser {index}: Injecting Turnstile widget directly into target site")
+                locator = page.locator('input[name="cf-turnstile-response"]')
+                max_attempts = 30
+                click_count = 0
+                max_clicks = 10
 
-            await self._inject_captcha_directly(page, sitekey, action or '', cdata or '', index)
-
-            # Ждем время для загрузки и рендеринга виджета
-            await asyncio.sleep(3)
-
-            locator = page.locator('input[name="cf-turnstile-response"]')
-            max_attempts = 30
-            click_count = 0
-            max_clicks = 10
-
-            for attempt in range(max_attempts):
-                try:
-                    # Безопасная проверка количества элементов с токеном
+                for attempt in range(max_attempts):
                     try:
-                        count = await locator.count()
-                    except Exception as e:
-                        if self.debug:
-                            logger.debug(f"Browser {index}: Locator count failed on attempt {attempt + 1}: {str(e)}")
-                        count = 0
-
-                    if count == 0:
-                        if self.debug and attempt % 5 == 0:
-                            logger.debug(f"Browser {index}: No token elements found on attempt {attempt + 1}")
-                    elif count == 1:
-                        # Если только один элемент, проверяем его токен
                         try:
-                            token = await locator.input_value(timeout=500)
-                            if token:
-                                elapsed_time = round(time.time() - start_time, 3)
-                                logger.success(f"Browser {index}: Successfully solved captcha - {COLORS.get('MAGENTA')}{token[:10]}{COLORS.get('RESET')} in {COLORS.get('GREEN')}{elapsed_time}{COLORS.get('RESET')} Seconds")
-                                await save_result(task_id, "turnstile", {"value": token, "elapsed_time": elapsed_time})
-                                return
+                            count = await locator.count()
                         except Exception as e:
                             if self.debug:
-                                logger.debug(f"Browser {index}: Single token element check failed: {str(e)}")
-                    else:
-                        # Если несколько элементов, проверяем все по очереди
-                        if self.debug:
-                            logger.debug(f"Browser {index}: Found {count} token elements, checking all")
+                                logger.debug(f"Browser {index}: Locator count failed on attempt {attempt + 1}: {str(e)}")
+                            count = 0
 
-                        for i in range(count):
+                        if count == 0:
+                            if self.debug and attempt % 5 == 0:
+                                logger.debug(f"Browser {index}: No token elements found on attempt {attempt + 1}")
+                        elif count == 1:
                             try:
-                                element_token = await locator.nth(i).input_value(timeout=500)
-                                if element_token:
+                                token = await locator.input_value(timeout=500)
+                                if token:
                                     elapsed_time = round(time.time() - start_time, 3)
-                                    logger.success(f"Browser {index}: Successfully solved captcha - {COLORS.get('MAGENTA')}{element_token[:10]}{COLORS.get('RESET')} in {COLORS.get('GREEN')}{elapsed_time}{COLORS.get('RESET')} Seconds")
-                                    await save_result(task_id, "turnstile", {"value": element_token, "elapsed_time": elapsed_time})
+                                    logger.success(f"Browser {index}: Successfully solved captcha - {COLORS.get('MAGENTA')}{token[:10]}{COLORS.get('RESET')} in {COLORS.get('GREEN')}{elapsed_time}{COLORS.get('RESET')} Seconds")
+                                    await save_result(task_id, "turnstile", {"value": token, "elapsed_time": elapsed_time})
                                     return
                             except Exception as e:
                                 if self.debug:
-                                    logger.debug(f"Browser {index}: Token element {i} check failed: {str(e)}")
-                                continue
+                                    logger.debug(f"Browser {index}: Single token element check failed: {str(e)}")
+                        else:
+                            if self.debug:
+                                logger.debug(f"Browser {index}: Found {count} token elements, checking all")
+                            for i in range(count):
+                                try:
+                                    element_token = await locator.nth(i).input_value(timeout=500)
+                                    if element_token:
+                                        elapsed_time = round(time.time() - start_time, 3)
+                                        logger.success(f"Browser {index}: Successfully solved captcha - {COLORS.get('MAGENTA')}{element_token[:10]}{COLORS.get('RESET')} in {COLORS.get('GREEN')}{elapsed_time}{COLORS.get('RESET')} Seconds")
+                                        await save_result(task_id, "turnstile", {"value": element_token, "elapsed_time": elapsed_time})
+                                        return
+                                except Exception as e:
+                                    if self.debug:
+                                        logger.debug(f"Browser {index}: Token element {i} check failed: {str(e)}")
+                                    continue
 
-                    if attempt > 2 and attempt % 3 == 0 and click_count < max_clicks:
-                        click_success = await self._try_click_strategies(page, index)
-                        click_count += 1
-                        if click_success and self.debug:
-                            logger.debug(f"Browser {index}: Click successful (click #{click_count}/{max_clicks})")
-                        elif not click_success and self.debug:
-                            logger.debug(f"Browser {index}: All click strategies failed on attempt {attempt + 1} (click #{click_count}/{max_clicks})")
+                        if attempt > 2 and attempt % 3 == 0 and click_count < max_clicks:
+                            click_success = await self._try_click_strategies(page, index)
+                            click_count += 1
+                            if click_success and self.debug:
+                                logger.debug(f"Browser {index}: Click successful (click #{click_count}/{max_clicks})")
+                            elif not click_success and self.debug:
+                                logger.debug(f"Browser {index}: All click strategies failed on attempt {attempt + 1} (click #{click_count}/{max_clicks})")
 
-                    # Адаптивное ожидание
-                    wait_time = min(0.5 + (attempt * 0.05), 2.0)
-                    await asyncio.sleep(wait_time)
+                        wait_time = min(0.5 + (attempt * 0.05), 2.0)
+                        await asyncio.sleep(wait_time)
 
-                    if self.debug and attempt % 5 == 0:
-                        logger.debug(f"Browser {index}: Attempt {attempt + 1}/{max_attempts} - Waiting for token (clicks: {click_count}/{max_clicks})")
+                        if self.debug and attempt % 5 == 0:
+                            logger.debug(f"Browser {index}: Attempt {attempt + 1}/{max_attempts} - Waiting for token (clicks: {click_count}/{max_clicks})")
 
-                except Exception as e:
-                    if self.debug:
-                        logger.debug(f"Browser {index}: Attempt {attempt + 1} error: {str(e)}")
-                    continue
-            
-            elapsed_time = round(time.time() - start_time, 3)
-            await save_result(task_id, "turnstile", {"value": "CAPTCHA_FAIL", "elapsed_time": elapsed_time, "error": "timeout"})
-            if self.debug:
-                logger.error(f"Browser {index}: Error solving Turnstile in {COLORS.get('RED')}{elapsed_time}{COLORS.get('RESET')} Seconds")
-        except Exception as e:
-            elapsed_time = round(time.time() - start_time, 3)
-            await save_result(task_id, "turnstile", {"value": "CAPTCHA_FAIL", "elapsed_time": elapsed_time, "error": str(e)})
-            logger.error(f"Browser {index}: Error solving Turnstile: {str(e)}")
-        finally:
-            if self.debug:
-                logger.debug(f"Browser {index}: Closing browser context and cleaning up")
-
-            if context is not None:
-                try:
-                    await context.close()
-                    if self.debug:
-                        logger.debug(f"Browser {index}: Context closed successfully")
-                except Exception as e:
-                    if self.debug:
-                        logger.warning(f"Browser {index}: Error closing context: {str(e)}")
-
-            try:
-                if acquired and browser is not None and index is not None:
-                    connected = True
-                    try:
-                        if hasattr(browser, 'is_connected'):
-                            connected = bool(browser.is_connected())
-                    except Exception:
-                        connected = True
-                    if connected:
-                        await self.browser_pool.put((index, browser, browser_config))
+                    except Exception as e:
                         if self.debug:
-                            logger.debug(f"Browser {index}: Browser returned to pool")
-                    elif self.debug:
-                        logger.warning(f"Browser {index}: Browser disconnected, not returning to pool")
-            except Exception as e:
+                            logger.debug(f"Browser {index}: Attempt {attempt + 1} error: {str(e)}")
+                        continue
+
+                elapsed_time = round(time.time() - start_time, 3)
+                await save_result(task_id, "turnstile", {"value": "CAPTCHA_FAIL", "elapsed_time": elapsed_time, "error": "timeout"})
                 if self.debug:
-                    logger.warning(f"Browser {index}: Error returning browser to pool: {str(e)}")
+                    logger.error(f"Browser {index}: Error solving Turnstile in {COLORS.get('RED')}{elapsed_time}{COLORS.get('RESET')} Seconds")
+            except Exception as e:
+                elapsed_time = round(time.time() - start_time, 3)
+                await save_result(task_id, "turnstile", {"value": "CAPTCHA_FAIL", "elapsed_time": elapsed_time, "error": str(e)})
+                logger.error(f"Browser {index}: Error solving Turnstile: {str(e)}")
             finally:
-                if self._in_flight > 0:
-                    self._in_flight -= 1
-                self._last_used = time.time()
+                if self.debug:
+                    logger.debug(f"Browser {index}: Closing browser context and cleaning up")
+
+                if context is not None:
+                    try:
+                        await context.close()
+                        if self.debug:
+                            logger.debug(f"Browser {index}: Context closed successfully")
+                    except Exception as e:
+                        if self.debug:
+                            logger.warning(f"Browser {index}: Error closing context: {str(e)}")
+
+                try:
+                    if acquired and browser is not None and index is not None:
+                        connected = True
+                        try:
+                            if hasattr(browser, 'is_connected'):
+                                connected = bool(browser.is_connected())
+                        except Exception:
+                            connected = True
+                        if connected:
+                            await self.browser_pool.put((index, browser, browser_config))
+                            if self.debug:
+                                logger.debug(f"Browser {index}: Browser returned to pool")
+                        elif self.debug:
+                            logger.warning(f"Browser {index}: Browser disconnected, not returning to pool")
+                except Exception as e:
+                    if self.debug:
+                        logger.warning(f"Browser {index}: Error returning browser to pool: {str(e)}")
+        finally:
+            # Always release in-flight even on early return / unexpected exception.
+            if self._in_flight > 0:
+                self._in_flight -= 1
+            self._last_used = time.time()
 
 
 
@@ -1197,6 +1301,45 @@ class TurnstileAPIServer:
         return jsonify(self._format_task_result(task_id, result)), 200
 
     
+
+    async def health(self):
+        """Lightweight pool status for ops / memory debugging."""
+        idle_for = None
+        if self._last_used:
+            idle_for = round(time.time() - self._last_used, 1)
+        return jsonify({
+            "ok": True,
+            "lazy": bool(self.lazy_browsers),
+            "idle_sec": self.idle_sec,
+            "pool_ready": bool(self._pool_ready),
+            "thread": self.thread_count,
+            "browser_type": self.browser_type,
+            "queue": self.browser_pool.qsize(),
+            "owned": len(self._owned_browsers or []),
+            "in_flight": int(self._in_flight or 0),
+            "idle_for_sec": idle_for,
+        }), 200
+
+    async def reclaim(self):
+        """Force reclaim browser pool (manual memory drop)."""
+        if self._pool_lock is None:
+            self._pool_lock = asyncio.Lock()
+        async with self._pool_lock:
+            owned = len(self._owned_browsers or [])
+            qsize = self.browser_pool.qsize()
+            in_flight = int(self._in_flight or 0)
+            await self._shutdown_browsers()
+        return jsonify({
+            "ok": True,
+            "reclaimed": True,
+            "owned_before": owned,
+            "queue_before": qsize,
+            "in_flight_before": in_flight,
+            "pool_ready": bool(self._pool_ready),
+            "owned": len(self._owned_browsers or []),
+            "queue": self.browser_pool.qsize(),
+            "in_flight": int(self._in_flight or 0),
+        }), 200
 
     @staticmethod
     async def index():
