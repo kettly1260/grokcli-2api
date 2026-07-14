@@ -2508,7 +2508,8 @@ def _run_registration(
         if not token or not token.get("access_token"):
             raise RuntimeError(
                 "SSO obtained but sso_to_auth_json conversion failed "
-                "(device verify/approve/token poll). "
+                "(device verify/approve/token poll; often xAI device-flow "
+                "rate_limited/slow_down under concurrent registration). "
                 f"adapter_build={ADAPTER_BUILD}; sso_prefix={sso[:24]!r}"
             )
         _key, entry = sso_import.token_to_auth_entry(token, email=email)

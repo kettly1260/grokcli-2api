@@ -53,6 +53,65 @@ except Exception:  # pragma: no cover - standalone fallback
 
 AUTH_KEY = f"{OIDC_ISSUER}::{GROK_CLI_CLIENT_ID}"
 
+# Serialize / throttle OIDC device-flow across concurrent registration workers.
+# xAI returns HTTP 429 slow_down / rate_limited when many device/code+verify
+# requests fan out together — that is the "two consecutive failures" pattern.
+import threading as _threading
+
+_DEVICE_FLOW_LOCK = _threading.RLock()
+_DEVICE_FLOW_LAST_TS = 0.0
+
+
+def _device_flow_gap_sec() -> float:
+    try:
+        return max(0.0, float(os.getenv("GROK2API_SSO_DEVICE_GAP_SEC", "1.2") or 1.2))
+    except (TypeError, ValueError):
+        return 1.2
+
+
+def _device_flow_retries() -> int:
+    try:
+        return max(1, min(6, int(os.getenv("GROK2API_SSO_DEVICE_RETRIES", "3") or 3)))
+    except (TypeError, ValueError):
+        return 3
+
+
+def _device_flow_backoff_sec(attempt: int) -> float:
+    # attempt is 1-based after a failure
+    base = 2.0 * attempt
+    try:
+        base = float(os.getenv("GROK2API_SSO_DEVICE_BACKOFF_SEC", str(base)) or base)
+    except (TypeError, ValueError):
+        pass
+    return max(1.0, min(20.0, base))
+
+
+def _wait_device_flow_slot() -> None:
+    """Global min-gap between device-flow starts (cross-thread)."""
+    global _DEVICE_FLOW_LAST_TS
+    gap = _device_flow_gap_sec()
+    with _DEVICE_FLOW_LOCK:
+        now = time.time()
+        wait = (_DEVICE_FLOW_LAST_TS + gap) - now
+        if wait > 0:
+            time.sleep(wait)
+        _DEVICE_FLOW_LAST_TS = time.time()
+
+
+def _is_rate_limited_payload(text: str | None = None, url: str | None = None, status: int | None = None) -> bool:
+    blob = f"{status or ''} {url or ''} {text or ''}".lower()
+    return any(
+        k in blob
+        for k in (
+            "slow_down",
+            "rate_limited",
+            "rate limit",
+            "too many",
+            "429",
+        )
+    )
+
+
 
 def _proxy_kwargs() -> dict:
     """Return curl_cffi compatible proxy kwargs from env / proxy pool."""
@@ -135,41 +194,74 @@ def _poll_interval_sec(raw: Any = None) -> float:
 
 
 def request_device_code(session: Any | None = None) -> dict | None:
-    """Request OIDC device code. Prefer shared curl_cffi session when given."""
+    """Request OIDC device code. Prefer shared curl_cffi session when given.
+
+    Retries on xAI rate limits (HTTP 429 / slow_down) — common when several
+    registration workers enter device-flow together.
+    """
     form = {"client_id": GROK_CLI_CLIENT_ID, "scope": OIDC_SCOPES}
     timeout = _http_timeout()
-    if session is not None:
-        try:
-            r = session.post(
-                f"{OIDC_ISSUER}/oauth2/device/code",
-                data=form,
-                headers={"Content-Type": "application/x-www-form-urlencoded"},
-                impersonate="chrome",
-                timeout=timeout,
-                **_proxy_kwargs(),
-            )
-            if int(getattr(r, "status_code", 0) or 0) >= 400:
-                print(f"  ❌ device/code HTTP {r.status_code}: {(r.text or '')[:200]}")
+    retries = _device_flow_retries()
+    last_err = ""
+    for attempt in range(1, retries + 1):
+        _wait_device_flow_slot()
+        if session is not None:
+            try:
+                r = session.post(
+                    f"{OIDC_ISSUER}/oauth2/device/code",
+                    data=form,
+                    headers={"Content-Type": "application/x-www-form-urlencoded"},
+                    impersonate="chrome",
+                    timeout=timeout,
+                    **_proxy_kwargs(),
+                )
+                code = int(getattr(r, "status_code", 0) or 0)
+                body = (getattr(r, "text", None) or "")[:300]
+                if code >= 400:
+                    last_err = f"HTTP {code}: {body[:200]}"
+                    print(f"  ❌ device/code {last_err}")
+                    if _is_rate_limited_payload(body, status=code) and attempt < retries:
+                        time.sleep(_device_flow_backoff_sec(attempt))
+                        continue
+                    return None
+                data = r.json()
+                return data if isinstance(data, dict) else None
+            except Exception as e:  # noqa: BLE001
+                last_err = str(e)
+                print(f"  ❌ device/code: {e}")
+                if attempt < retries and _is_rate_limited_payload(str(e)):
+                    time.sleep(_device_flow_backoff_sec(attempt))
+                    continue
                 return None
-            data = r.json()
-            return data if isinstance(data, dict) else None
-        except Exception as e:  # noqa: BLE001
-            print(f"  ❌ device/code: {e}")
-            return None
 
-    data = urllib.parse.urlencode(form).encode()
-    req = urllib.request.Request(
-        f"{OIDC_ISSUER}/oauth2/device/code",
-        data=data,
-        method="POST",
-        headers={"Content-Type": "application/x-www-form-urlencoded"},
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return json.loads(resp.read())
-    except urllib.error.HTTPError as e:
-        print(f"  ❌ device/code HTTP {e.code}: {e.read().decode()[:200]}")
-        return None
+        data = urllib.parse.urlencode(form).encode()
+        req = urllib.request.Request(
+            f"{OIDC_ISSUER}/oauth2/device/code",
+            data=data,
+            method="POST",
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return json.loads(resp.read())
+        except urllib.error.HTTPError as e:
+            body = e.read().decode()[:300]
+            last_err = f"HTTP {e.code}: {body[:200]}"
+            print(f"  ❌ device/code {last_err}")
+            if _is_rate_limited_payload(body, status=e.code) and attempt < retries:
+                time.sleep(_device_flow_backoff_sec(attempt))
+                continue
+            return None
+        except Exception as e:  # noqa: BLE001
+            last_err = str(e)
+            print(f"  ❌ device/code: {e}")
+            if attempt < retries:
+                time.sleep(_device_flow_backoff_sec(attempt))
+                continue
+            return None
+    if last_err:
+        print(f"  ❌ device/code exhausted retries: {last_err}")
+    return None
 
 
 def poll_token(
@@ -271,6 +363,10 @@ def sso_to_token(sso_cookie: str, *, quiet: bool = False) -> dict | None:
     """SSO cookie → token dict (access/refresh/expires_in).
 
     ``quiet=True`` reduces per-account stdout (faster under high concurrency).
+
+    Retries the full device flow on xAI rate limits (device/code 429 slow_down,
+    verify/approve ``rate_limited``). Concurrent registration workers otherwise
+    produce consecutive conversion failures after SSO was already obtained.
     """
     log = (lambda *a, **k: None) if quiet else print
     s = requests.Session()
@@ -293,74 +389,103 @@ def sso_to_token(sso_cookie: str, *, quiet: bool = False) -> dict | None:
         return None
     log("  ✅ sso 有效")
 
-    log("  🔑 Device Flow...")
-    dc = request_device_code(session=s)
-    if not dc:
-        return None
-    log(f"  📋 user_code: {dc.get('user_code')}")
-
-    try:
-        s.get(
-            dc["verification_uri_complete"],
-            impersonate="chrome",
-            timeout=timeout,
-            **proxy_kw,
-        )
-        r = s.post(
-            f"{OIDC_ISSUER}/oauth2/device/verify",
-            data={"user_code": dc["user_code"]},
-            headers={"Content-Type": "application/x-www-form-urlencoded"},
-            impersonate="chrome",
-            timeout=timeout,
-            allow_redirects=True,
-            **proxy_kw,
-        )
-        if "consent" not in r.url:
-            log(f"  ❌ verify 失败: {r.url}")
+    retries = _device_flow_retries()
+    for attempt in range(1, retries + 1):
+        log(f"  🔑 Device Flow... (try {attempt}/{retries})")
+        dc = request_device_code(session=s)
+        if not dc:
+            if attempt < retries:
+                time.sleep(_device_flow_backoff_sec(attempt))
+                continue
             return None
-    except Exception as e:
-        log(f"  ❌ verify 异常: {e}")
-        return None
+        log(f"  📋 user_code: {dc.get('user_code')}")
 
-    try:
-        r = s.post(
-            f"{OIDC_ISSUER}/oauth2/device/approve",
-            data={
-                "user_code": dc["user_code"],
-                "action": "allow",
-                "principal_type": "User",
-                "principal_id": "",
-            },
-            headers={"Content-Type": "application/x-www-form-urlencoded"},
-            impersonate="chrome",
-            timeout=timeout,
-            allow_redirects=True,
-            **proxy_kw,
-        )
-        if "done" not in r.url:
-            log(f"  ❌ approve 失败: {r.url}")
+        rate_limited = False
+        try:
+            s.get(
+                dc["verification_uri_complete"],
+                impersonate="chrome",
+                timeout=timeout,
+                **proxy_kw,
+            )
+            r = s.post(
+                f"{OIDC_ISSUER}/oauth2/device/verify",
+                data={"user_code": dc["user_code"]},
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+                impersonate="chrome",
+                timeout=timeout,
+                allow_redirects=True,
+                **proxy_kw,
+            )
+            if "consent" not in (r.url or ""):
+                log(f"  ❌ verify 失败: {r.url}")
+                if _is_rate_limited_payload(getattr(r, "text", None), r.url, getattr(r, "status_code", None)):
+                    rate_limited = True
+                else:
+                    return None
+        except Exception as e:
+            log(f"  ❌ verify 异常: {e}")
+            if _is_rate_limited_payload(str(e)):
+                rate_limited = True
+            else:
+                return None
+        if rate_limited:
+            if attempt < retries:
+                time.sleep(_device_flow_backoff_sec(attempt))
+                continue
             return None
-        log("  ✅ 授权确认")
-    except Exception as e:
-        log(f"  ❌ approve 异常: {e}")
-        return None
 
-    # Approve already happened — poll immediately with a short interval.
-    token = poll_token(
-        dc["device_code"],
-        dc.get("interval", 1),
-        dc.get("expires_in", 1800),
-        timeout=float(os.getenv("GROK2API_SSO_POLL_TIMEOUT", "45") or 45),
-        session=s,
-        immediate=True,
-    )
-    if not token:
-        return None
-    log(
-        f"  ✅ access_token (expires_in={token.get('expires_in')}s)"
-        + (" + refresh_token" if token.get("refresh_token") else "")
-    )
-    return token
+        try:
+            r = s.post(
+                f"{OIDC_ISSUER}/oauth2/device/approve",
+                data={
+                    "user_code": dc["user_code"],
+                    "action": "allow",
+                    "principal_type": "User",
+                    "principal_id": "",
+                },
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+                impersonate="chrome",
+                timeout=timeout,
+                allow_redirects=True,
+                **proxy_kw,
+            )
+            if "done" not in (r.url or ""):
+                log(f"  ❌ approve 失败: {r.url}")
+                if _is_rate_limited_payload(getattr(r, "text", None), r.url, getattr(r, "status_code", None)):
+                    if attempt < retries:
+                        time.sleep(_device_flow_backoff_sec(attempt))
+                        continue
+                return None
+            log("  ✅ 授权确认")
+        except Exception as e:
+            log(f"  ❌ approve 异常: {e}")
+            if _is_rate_limited_payload(str(e)) and attempt < retries:
+                time.sleep(_device_flow_backoff_sec(attempt))
+                continue
+            return None
+
+        # Approve already happened — poll immediately with a short interval.
+        token = poll_token(
+            dc["device_code"],
+            dc.get("interval", 1),
+            dc.get("expires_in", 1800),
+            timeout=float(os.getenv("GROK2API_SSO_POLL_TIMEOUT", "45") or 45),
+            session=s,
+            immediate=True,
+        )
+        if not token:
+            if attempt < retries:
+                log("  ⏳ token poll empty — retry device flow")
+                time.sleep(_device_flow_backoff_sec(attempt))
+                continue
+            return None
+        log(
+            f"  ✅ access_token (expires_in={token.get('expires_in')}s)"
+            + (" + refresh_token" if token.get("refresh_token") else "")
+        )
+        return token
+    return None
 
 
 def token_to_auth_entry(token: dict, email: str = "") -> tuple[str, dict]:
