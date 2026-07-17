@@ -53,3 +53,21 @@ func TestPickNoEligible(t *testing.T) {
 		t.Fatalf("expected ErrNoEligibleAccounts, got %v", err)
 	}
 }
+
+func TestModelBlockedObjectUntil(t *testing.T) {
+	now := time.Unix(1_700_000_100, 0)
+	blocked := map[string]any{
+		"grok-4.5": map[string]any{"until": float64(1_700_000_200), "source": "temp_usage"},
+	}
+	if !modelBlocked(blocked, "grok-4.5", now) {
+		t.Fatal("future until should block")
+	}
+	blocked["grok-4.5"] = map[string]any{"until": float64(1_700_000_000)}
+	if modelBlocked(blocked, "grok-4.5", now) {
+		t.Fatal("past until should not block")
+	}
+	// other model not blocked
+	if modelBlocked(blocked, "grok-3", now) {
+		t.Fatal("unrelated model should not block")
+	}
+}

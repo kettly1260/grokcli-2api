@@ -175,20 +175,69 @@ func (c *Connector) BlockPoolModel(ctx context.Context, accountID, model string,
 	if accountID == "" || model == "" {
 		return nil
 	}
-	value := any(true)
-	if until != nil {
-		value = until.Unix()
+	// Match Python account_pool.block_model shape so UI/picker/SQL all agree.
+	entry := map[string]any{
+		"blocked_at": float64(time.Now().Unix()),
+		"source":     "go_model_health",
 	}
-	blocked, err := json.Marshal(map[string]any{model: value})
+	if until != nil {
+		u := float64(until.Unix())
+		entry["until"] = u
+		entry["ttl_sec"] = u - float64(time.Now().Unix())
+		entry["reason"] = "model temporarily blocked"
+	} else {
+		entry["blocked"] = true
+		entry["reason"] = "model permanently blocked"
+	}
+	blocked, err := json.Marshal(map[string]any{model: entry})
 	if err != nil {
 		return err
 	}
 	_, err = c.Pool.Exec(ctx, `
-		INSERT INTO account_pool (account_id, blocked_models, extra, updated_at)
-		VALUES ($1, $2::jsonb, '{}'::jsonb, now())
+		INSERT INTO account_pool (account_id, blocked_models, pool_status, extra, updated_at)
+		VALUES ($1, $2::jsonb, 'model_blocked', '{}'::jsonb, now())
 		ON CONFLICT (account_id) DO UPDATE SET
 			blocked_models = COALESCE(account_pool.blocked_models, '{}'::jsonb) || $2::jsonb,
+			pool_status = CASE
+				WHEN account_pool.enabled = false OR account_pool.disabled_for_quota = true THEN 'disabled'
+				WHEN account_pool.cooldown_until IS NOT NULL AND account_pool.cooldown_until > now() THEN 'cooldown'
+				ELSE 'model_blocked'
+			END,
 			updated_at = now()`, accountID, blocked)
+	return err
+}
+
+// UnblockPoolModel removes one model (or all when model empty) from blocked_models.
+func (c *Connector) UnblockPoolModel(ctx context.Context, accountID, model string) error {
+	accountID = strings.TrimSpace(accountID)
+	model = strings.TrimSpace(model)
+	if accountID == "" {
+		return nil
+	}
+	if model == "" {
+		_, err := c.Pool.Exec(ctx, `
+			UPDATE account_pool
+			SET blocked_models = '{}'::jsonb,
+			    pool_status = CASE
+					WHEN enabled = false OR disabled_for_quota = true THEN 'disabled'
+					WHEN cooldown_until IS NOT NULL AND cooldown_until > now() THEN 'cooldown'
+					ELSE 'normal'
+				END,
+			    updated_at = now()
+			WHERE account_id = $1`, accountID)
+		return err
+	}
+	_, err := c.Pool.Exec(ctx, `
+		UPDATE account_pool
+		SET blocked_models = COALESCE(blocked_models, '{}'::jsonb) - $2,
+		    pool_status = CASE
+				WHEN enabled = false OR disabled_for_quota = true THEN 'disabled'
+				WHEN cooldown_until IS NOT NULL AND cooldown_until > now() THEN 'cooldown'
+				WHEN (COALESCE(blocked_models, '{}'::jsonb) - $2) = '{}'::jsonb THEN 'normal'
+				ELSE 'model_blocked'
+			END,
+		    updated_at = now()
+		WHERE account_id = $1`, accountID, model)
 	return err
 }
 

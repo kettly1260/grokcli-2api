@@ -326,7 +326,35 @@ func buildAccountListWhere(query, status string, hasSSO *bool) (string, []any) {
 		quotaExpr := `(COALESCE(ap.disabled_for_quota, false) = true OR COALESCE(ap.pool_status,'') = 'quota_disabled')`
 		disabledExpr := `(COALESCE(ap.enabled, true) = false OR COALESCE(ap.pool_status,'') = 'disabled')`
 		cooldownExpr := `((ap.cooldown_until IS NOT NULL AND ap.cooldown_until > now()) OR COALESCE(ap.cooldown_count,0) > 0 OR COALESCE(ap.pool_status,'') = 'cooldown')`
-		modelBlockExpr := `((COALESCE(ap.blocked_models, '{}'::jsonb) <> '{}'::jsonb AND COALESCE(ap.blocked_models, '{}'::jsonb) <> 'null'::jsonb) OR COALESCE(ap.pool_status,'') = 'model_blocked')`
+		// Active model block: non-empty blocked_models with at least one entry that is
+		// permanent (true/object without expired until) or until > now().
+		modelBlockExpr := `(
+			EXISTS (
+				SELECT 1
+				FROM jsonb_each(COALESCE(ap.blocked_models, '{}'::jsonb)) AS e(model, value)
+				WHERE
+					-- permanent boolean true
+					(jsonb_typeof(e.value) = 'boolean' AND e.value = 'true'::jsonb)
+					-- bare unix until still in future (number)
+					OR (jsonb_typeof(e.value) = 'number' AND (
+						(e.value::text::float8 > 1000000000000 AND (e.value::text::float8/1000.0) > extract(epoch from now()))
+						OR (e.value::text::float8 > 1577836800 AND e.value::text::float8 <= 1000000000000 AND e.value::text::float8 > extract(epoch from now()))
+						OR (e.value::text::float8 > 0 AND e.value::text::float8 <= 1577836800) -- small permanent markers
+					))
+					-- object form {"until": ...} still active, or permanent object without expired until
+					OR (jsonb_typeof(e.value) = 'object' AND (
+						(e.value ? 'until' AND NULLIF(e.value->>'until','') IS NOT NULL AND (
+							CASE
+								WHEN (e.value->>'until')::float8 > 1000000000000 THEN ((e.value->>'until')::float8/1000.0) > extract(epoch from now())
+								ELSE (e.value->>'until')::float8 > extract(epoch from now())
+							END
+						))
+						OR (NOT (e.value ? 'until') OR NULLIF(e.value->>'until','') IS NULL)
+						OR ((e.value ? 'blocked') AND (e.value->>'blocked') IN ('true','1'))
+					))
+			)
+			OR COALESCE(ap.pool_status,'') = 'model_blocked'
+		)`
 		liveExpr := `(COALESCE(ap.enabled, true) = true
 			AND COALESCE(ap.disabled_for_quota, false) = false
 			AND NOT ` + expiredExpr + `
@@ -506,8 +534,17 @@ func hasSSO(payload map[string]any) bool {
 	return strings.TrimSpace(accounts.GetSSOValue(payload)) != ""
 }
 
-// activeBlockedModels drops expired soft blocks (until < now) so the UI does
-// not keep showing "模型封禁" after TTL.
+// activeBlockedModels drops expired soft blocks so the UI / picker only see
+// currently enforced model bans.
+//
+// Supported value shapes (Python + Go):
+//
+//	true | 1
+//	<unix until seconds/ms>
+//	{"until": <unix>, "reason": "...", "source": "...", ...}
+//	{"blocked": true}
+//
+// Empty map / false / expired until => not blocked.
 func activeBlockedModels(blocked map[string]any, now time.Time) map[string]any {
 	if len(blocked) == 0 {
 		return map[string]any{}
@@ -515,37 +552,91 @@ func activeBlockedModels(blocked map[string]any, now time.Time) map[string]any {
 	out := make(map[string]any, len(blocked))
 	nowUnix := float64(now.Unix())
 	for mid, entry := range blocked {
-		if m, ok := entry.(map[string]any); ok {
-			if until, ok := m["until"]; ok && until != nil {
-				var u float64
-				switch v := until.(type) {
-				case float64:
-					u = v
-				case float32:
-					u = float64(v)
-				case int:
-					u = float64(v)
-				case int64:
-					u = float64(v)
-				case json.Number:
-					u, _ = v.Float64()
-				case string:
-					if f, err := strconv.ParseFloat(v, 64); err == nil {
-						u = f
-					}
-				}
-				// Support both unix seconds and ms.
-				if u > 1e12 {
-					u = u / 1000
-				}
-				if u > 0 && nowUnix >= u {
-					continue
-				}
-			}
+		if !modelBlockEntryActive(entry, nowUnix) {
+			continue
 		}
 		out[mid] = entry
 	}
 	return out
+}
+
+func modelBlockEntryActive(entry any, nowUnix float64) bool {
+	if entry == nil {
+		return false
+	}
+	switch v := entry.(type) {
+	case bool:
+		return v
+	case float64:
+		if v <= 0 {
+			// permanent-ish numeric marker used by older writers
+			return true
+		}
+		u := v
+		if u > 1e12 {
+			u = u / 1000
+		}
+		// If value looks like a unix timestamp in the future => still blocked.
+		// Heuristic: timestamps after year 2020.
+		if u > 1577836800 {
+			return u > nowUnix
+		}
+		// small numbers (1) treat as permanent true
+		return true
+	case float32:
+		return modelBlockEntryActive(float64(v), nowUnix)
+	case int:
+		return modelBlockEntryActive(float64(v), nowUnix)
+	case int64:
+		return modelBlockEntryActive(float64(v), nowUnix)
+	case json.Number:
+		f, err := v.Float64()
+		if err != nil {
+			return true
+		}
+		return modelBlockEntryActive(f, nowUnix)
+	case string:
+		s := strings.TrimSpace(v)
+		if s == "" || s == "0" || strings.EqualFold(s, "false") {
+			return false
+		}
+		if f, err := strconv.ParseFloat(s, 64); err == nil {
+			return modelBlockEntryActive(f, nowUnix)
+		}
+		return true
+	case map[string]any:
+		// Explicit false/disabled
+		if b, ok := v["blocked"].(bool); ok && !b {
+			return false
+		}
+		if until, ok := v["until"]; ok && until != nil {
+			var u float64
+			switch x := until.(type) {
+			case float64:
+				u = x
+			case float32:
+				u = float64(x)
+			case int:
+				u = float64(x)
+			case int64:
+				u = float64(x)
+			case json.Number:
+				u, _ = x.Float64()
+			case string:
+				u, _ = strconv.ParseFloat(x, 64)
+			}
+			if u > 1e12 {
+				u = u / 1000
+			}
+			if u > 0 {
+				return u > nowUnix
+			}
+		}
+		// Object without until (or until=0) => permanent block while present.
+		return true
+	default:
+		return true
+	}
 }
 
 func derivePoolStatus(fields map[string]any) string {

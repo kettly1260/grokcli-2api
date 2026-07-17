@@ -73,3 +73,26 @@ func TestBuildAccountListWhereStatus(t *testing.T) {
 func containsFold(s, sub string) bool {
 	return strings.Contains(strings.ToLower(s), strings.ToLower(sub))
 }
+
+func TestActiveBlockedModelsObjectForm(t *testing.T) {
+	now := time.Unix(1_700_000_100, 0)
+	blocked := map[string]any{
+		"future": map[string]any{"until": float64(1_700_000_200), "reason": "temp", "source": "temp_usage"},
+		"past":   map[string]any{"until": float64(1_700_000_000), "reason": "temp", "source": "temp_usage"},
+		"perm":   map[string]any{"blocked": true, "reason": "hard"},
+		"bare":   float64(1_700_000_200),
+		"oldnum": float64(1_700_000_000),
+	}
+	out := activeBlockedModels(blocked, now)
+	if _, ok := out["past"]; ok {
+		t.Fatalf("expired object should drop: %#v", out)
+	}
+	if _, ok := out["oldnum"]; ok {
+		t.Fatalf("expired bare until should drop: %#v", out)
+	}
+	for _, k := range []string{"future", "perm", "bare"} {
+		if _, ok := out[k]; !ok {
+			t.Fatalf("missing active block %s: %#v", k, out)
+		}
+	}
+}

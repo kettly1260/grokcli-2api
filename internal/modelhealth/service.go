@@ -952,6 +952,12 @@ func (s *Service) probeAccount(ctx context.Context, auth postgres.AccountAuth, m
 		if _, err := s.Store.ClearAccountCooldown(ctx, auth.ID); err == nil {
 			base["recovered"] = true
 		}
+		// Successful probe for this model clears its soft/hard block (Python parity).
+		if model != "" {
+			if err := s.Store.UnblockPoolModel(ctx, auth.ID, model); err == nil {
+				base["unblocked_model"] = model
+			}
+		}
 		if !deferSave {
 			_ = s.Store.SaveLastProbe(ctx, auth.ID, base)
 		}
