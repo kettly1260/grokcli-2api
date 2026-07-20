@@ -187,12 +187,18 @@ func TestUpdateSearchReplaceAliases(t *testing.T) {
 	if parsed["file_path"] != "/x.go" || parsed["old_string"] != "old code" || parsed["new_string"] != "new code" {
 		t.Fatalf("parsed=%#v from %s", parsed, got)
 	}
-	// Grep must keep search → query, not old_string.
+	// Grep: search → pattern (required); path stays path (NOT file_path).
 	g := NormalizeJSON(`{"search":"TODO","path":"."}`, "Grep")
 	var gparsed map[string]any
 	_ = json.Unmarshal([]byte(g), &gparsed)
-	if gparsed["query"] != "TODO" {
-		t.Fatalf("grep search should map to query: %s", g)
+	if gparsed["pattern"] != "TODO" {
+		t.Fatalf("grep search should map to pattern: %s", g)
+	}
+	if gparsed["path"] != "." {
+		t.Fatalf("grep path should stay path: %s", g)
+	}
+	if _, ok := gparsed["file_path"]; ok {
+		t.Fatalf("grep must not emit file_path: %s", g)
 	}
 	if _, ok := gparsed["old_string"]; ok {
 		t.Fatalf("grep must not become edit: %s", g)
@@ -809,6 +815,74 @@ func TestShellEmptyArgvIncomplete(t *testing.T) {
 	}
 }
 
+// Codex live regression (2026-07-20): Grok emits empty-array artifacts glued
+// onto the real shell command. PowerShell then sees:
+//
+//	[    ]Write-Output 'shell-ok'
+//
+// and dies with "Missing type name after '['".
+func TestShellStripsEmptyArrayJunkPrefix(t *testing.T) {
+	cases := []struct {
+		name string
+		raw  string
+		want string // empty → must be incomplete / no usable command
+	}{
+		{"four-space glue", `{"cmd":"[    ]Write-Output 'shell-ok'"}`, "Write-Output 'shell-ok'"},
+		{"tight glue", `{"command":"[]Get-Content -LiteralPath 'G:\\LLM\\x'"}`, "Get-Content -LiteralPath 'G:\\LLM\\x'"},
+		{"space glue", `{"cmd":"[ ]pwd"}`, "pwd"},
+		{"pure empty array", `{"command":"[]"}`, ""},
+		{"pure four-space array", `{"cmd":"[    ]"}`, ""},
+		{"json empty array", `{"command":[]}`, ""},
+		{"nested empty", `{"command":[[""]]}`, ""},
+		{"clean untouched", `{"cmd":"Write-Output 'shell-ok'"}`, "Write-Output 'shell-ok'"},
+		{"real argv still flattens", `{"command":["ls","-la"]}`, "ls -la"},
+		{"argv token glue", `{"command":["[    ]Write-Output 'shell-ok'"]}`, "Write-Output 'shell-ok'"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			internal := EffectiveJSON(tc.raw, "exec_command")
+			out := ProjectShellArgsForClient(internal, "exec_command", "cmd")
+			if tc.want == "" {
+				if CompleteJSON(internal, "exec_command") {
+					t.Fatalf("expected incomplete, internal=%s client=%s", internal, out)
+				}
+				if strings.Contains(out, "[") && strings.Contains(out, "]") {
+					// client may still hold empty object; must not carry array junk as cmd value
+					var p map[string]any
+					if json.Unmarshal([]byte(out), &p) == nil {
+						if s, ok := p["cmd"].(string); ok && strings.Contains(s, "[") {
+							t.Fatalf("junk cmd leaked: %s", out)
+						}
+					}
+				}
+				return
+			}
+			if !CompleteJSON(internal, "exec_command") {
+				t.Fatalf("expected complete, internal=%s", internal)
+			}
+			var obj map[string]any
+			if err := json.Unmarshal([]byte(internal), &obj); err != nil {
+				t.Fatalf("internal json: %v (%s)", err, internal)
+			}
+			cmd, _ := obj["command"].(string)
+			if cmd != tc.want {
+				t.Fatalf("internal command=%q want %q full=%s", cmd, tc.want, internal)
+			}
+			var client map[string]any
+			if err := json.Unmarshal([]byte(out), &client); err != nil {
+				t.Fatalf("client json: %v (%s)", err, out)
+			}
+			got, _ := client["cmd"].(string)
+			if got != tc.want {
+				t.Fatalf("client cmd=%q want %q full=%s", got, tc.want, out)
+			}
+			if strings.HasPrefix(strings.TrimSpace(got), "[") {
+				t.Fatalf("leading bracket junk survived: %q", got)
+			}
+		})
+	}
+}
+
 func TestShellArgvArrayBecomesString(t *testing.T) {
 	// Codex: cmd must be string, not argv array.
 	cases := []struct {
@@ -1320,5 +1394,55 @@ func TestCoerceSalvageDoesNotInventEmptyShell(t *testing.T) {
 	got := CoerceCompleteJSON(`{"cmd":""}`, "exec_command")
 	if CompleteJSON(got, "exec_command") {
 		t.Fatalf("empty cmd must not be complete: %q", got)
+	}
+}
+
+
+func TestGrepNeverEmitsFilePath(t *testing.T) {
+	cases := []struct {
+		name string
+		raw  string
+	}{
+		{"path key", `{"pattern":"foo","path":"internal"}`},
+		{"file_path alias", `{"pattern":"foo","file_path":"internal"}`},
+		{"search+path", `{"search":"foo","path":"internal"}`},
+		{"query+filepath", `{"query":"foo","filepath":"internal"}`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := NormalizeJSON(tc.raw, "Grep")
+			var obj map[string]any
+			if err := json.Unmarshal([]byte(got), &obj); err != nil {
+				t.Fatalf("json: %v got=%s", err, got)
+			}
+			if _, ok := obj["file_path"]; ok {
+				t.Fatalf("file_path leaked: %s", got)
+			}
+			if obj["pattern"] != "foo" {
+				t.Fatalf("pattern=%v want foo in %s", obj["pattern"], got)
+			}
+			if obj["path"] != "internal" {
+				t.Fatalf("path=%v want internal in %s", obj["path"], got)
+			}
+		})
+	}
+}
+
+func TestConfigureDebugShellArgs(t *testing.T) {
+	// Ensure toggle is hot and default starts from current state restore.
+	prev := DebugShellArgsEnabled()
+	t.Cleanup(func() { ConfigureDebugShellArgs(prev) })
+
+	ConfigureDebugShellArgs(false)
+	if DebugShellArgsEnabled() {
+		t.Fatal("expected debug shell args off")
+	}
+	ConfigureDebugShellArgs(true)
+	if !DebugShellArgsEnabled() {
+		t.Fatal("expected debug shell args on")
+	}
+	ConfigureDebugShellArgs(false)
+	if DebugShellArgsEnabled() {
+		t.Fatal("expected debug shell args off again")
 	}
 }

@@ -349,6 +349,10 @@
     <div class="g2a-actions" style="grid-column:1/-1">
       <label class="g2a-check"><input type="checkbox" id="set-history-compact" /> 历史压缩（长工具循环时缩小请求体）</label>
     </div>
+    <div class="g2a-actions" style="grid-column:1/-1">
+      <label class="g2a-check"><input type="checkbox" id="set-debug-shell-args" /> Shell 参数调试日志（记录 cmd 投影前后，排查 <code>[    ]</code> 前缀等问题）</label>
+      <div class="g2a-muted" style="margin-top:4px;margin-left:1.6em">开启后服务端日志会打印 raw_cmd / projected_cmd；定位 Codex/PowerShell 脏命令时使用，平时请关闭</div>
+    </div>
   </div>
   <div class="g2a-actions" style="margin-top:14px;justify-content:flex-end;gap:8px;flex-wrap:wrap">
     <button type="button" class="g2a-btn g2a-btn-default" id="btn-reset-settings-relay">重置默认</button>
@@ -560,6 +564,6 @@
   <script src="/static/dist/api.443dfc63c0.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
   <script src="/static/dist/state.5846ce62e4.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
   <script src="/static/dist/auth.539061a1a7.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
-  <script src="/static/dist/core.91996c4713.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
+  <script src="/static/dist/core.ec18482289.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
 </body>
 </html>

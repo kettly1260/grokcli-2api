@@ -6,9 +6,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"regexp"
 	"sort"
 	"strings"
+	"sync"
 )
 
 var nonName = regexp.MustCompile(`[^a-z0-9_]+`)
@@ -189,7 +191,40 @@ func canonicalArgKeyForTool(key, toolName string) string {
 			return alias
 		}
 	}
+	// Grep/Glob (Claude Code): schema uses path + pattern, NOT file_path.
+	// Global aliases map path→file_path for Read/Edit, which makes Grep reject with
+	// "An unexpected parameter file_path was provided".
+	if isGrepLikeTool(toolName) {
+		switch folded {
+		case "path", "filepath", "file_path", "file", "filename", "file_name",
+			"target_file", "targetfile", "targetpath", "target_path", "target":
+			return "path"
+		case "search", "query", "q", "search_query", "searchquery":
+			// required["grep"] is pattern; Grok often emits search/query instead.
+			return "pattern"
+		}
+		if alnum == "filepath" || alnum == "filename" || alnum == "targetfile" || alnum == "targetpath" {
+			return "path"
+		}
+		if alnum == "searchquery" {
+			return "pattern"
+		}
+	}
 	return canonicalArgKey(key)
+}
+
+// isGrepLikeTool is true for Claude Code Grep / Glob and common aliases.
+// These tools accept path (directory/file scope), not file_path.
+func isGrepLikeTool(name string) bool {
+	key := nameKey(name)
+	switch key {
+	case "grep", "glob", "searchfiles", "search_files", "rg", "ripgrep":
+		return true
+	}
+	if strings.HasSuffix(key, "grep") || strings.HasSuffix(key, "glob") {
+		return true
+	}
+	return false
 }
 
 func isEditTool(name string) bool {
@@ -434,8 +469,49 @@ func applyEditDefaults(obj map[string]any, toolName string) map[string]any {
 		// before Grok finished streaming the real replacement, then drop the
 		// late args (tool already stopped) — intermittent Update failures.
 	}
+	obj = applyGrepDefaults(obj, toolName)
 	return applyShellDefaults(obj, toolName)
 }
+
+// applyGrepDefaults rewrites Read/Edit-style path keys onto Claude Code Grep/Glob
+// schema (path + pattern) and drops file_path so clients stop rejecting with
+// "An unexpected parameter file_path was provided".
+func applyGrepDefaults(obj map[string]any, toolName string) map[string]any {
+	if obj == nil || !isGrepLikeTool(toolName) {
+		return obj
+	}
+	// file_path / leftovers → path
+	if v, ok := obj["path"]; !ok || empty(v) {
+		for _, alt := range []string{"file_path", "filepath", "file", "target_file", "targetfile"} {
+			if av, exists := obj[alt]; exists && !empty(av) {
+				obj["path"] = unwrapPathValue(av)
+				break
+			}
+		}
+	} else {
+		obj["path"] = unwrapPathValue(v)
+	}
+	for _, alt := range []string{"file_path", "filepath", "file", "target_file", "targetfile"} {
+		delete(obj, alt)
+	}
+	// search/query → pattern (required field for Grep)
+	if v, ok := obj["pattern"]; !ok || empty(v) {
+		for _, alt := range []string{"query", "search", "q", "search_query", "regex"} {
+			if av, exists := obj[alt]; exists && !empty(av) {
+				obj["pattern"] = av
+				break
+			}
+		}
+	}
+	// Drop query/search when pattern is set so clients never see dual keys.
+	if _, has := obj["pattern"]; has && !empty(obj["pattern"]) {
+		for _, alt := range []string{"query", "search", "q", "search_query"} {
+			delete(obj, alt)
+		}
+	}
+	return obj
+}
+
 
 // recoverEditPoisonedKeys remaps leftover Grep/generic aliases onto Edit schema
 // when the tool is known to be Edit/Update. Safe only for isEditTool names.
@@ -657,6 +733,17 @@ func applyShellDefaults(obj map[string]any, toolName string) map[string]any {
 	return obj
 }
 
+// emptyArrayJunkPrefix matches a leading empty JSON-array artifact that Grok
+// sometimes glues onto the real shell command for Codex, e.g.
+//
+//	"[    ]Get-Content ..."  →  "Get-Content ..."
+//	"[]Write-Output 'ok'"    →  "Write-Output 'ok'"
+//
+// Four-space form is common in live Codex sessions (2026-07-20). PowerShell
+// then parses "[    ]Write-Output" as a type-cast and fails with
+// "Missing type name after '['".
+var emptyArrayJunkPrefix = regexp.MustCompile(`^\s*\[\s*\]\s*`)
+
 // normalizeShellCommand always returns a non-empty string (or nil if incomplete).
 //
 // Codex exec_command / shell local schema requires:
@@ -671,11 +758,13 @@ func normalizeShellCommand(value any) any {
 	case nil:
 		return nil
 	case string:
-		s := strings.TrimSpace(v)
+		s := stripShellCommandJunk(strings.TrimSpace(v))
 		if s == "" {
 			return nil
 		}
 		// Unwrap accidental JSON-encoded argv: "[\"ls\",\"-la\"]"
+		// Also reject pure empty-array strings ("[]", "[    ]") which used to
+		// fall through and become a "valid" command that later glued onto real text.
 		if (strings.HasPrefix(s, "[") && strings.HasSuffix(s, "]")) ||
 			(strings.HasPrefix(s, `"[`) && strings.Contains(s, `]`)) {
 			var arr []any
@@ -683,18 +772,33 @@ func normalizeShellCommand(value any) any {
 				if flat := flattenCommandParts(arr); len(flat) > 0 {
 					return joinShellArgv(flat)
 				}
+				// Parsed as empty array — not a usable command.
+				return nil
 			}
 			var unquoted string
 			if json.Unmarshal([]byte(s), &unquoted) == nil {
-				unquoted = strings.TrimSpace(unquoted)
+				unquoted = stripShellCommandJunk(strings.TrimSpace(unquoted))
 				if unquoted != "" && unquoted[0] == '[' {
 					if json.Unmarshal([]byte(unquoted), &arr) == nil {
 						if flat := flattenCommandParts(arr); len(flat) > 0 {
 							return joinShellArgv(flat)
 						}
+						return nil
 					}
 				}
+				if unquoted != "" {
+					return unquoted
+				}
 			}
+		}
+		// Leading empty-array junk + real command: "[    ]Get-Content ..."
+		if cleaned := emptyArrayJunkPrefix.ReplaceAllString(s, ""); cleaned != s {
+			cleaned = strings.TrimSpace(cleaned)
+			if cleaned == "" {
+				return nil
+			}
+			// Recurse so nested argv-string cases still flatten.
+			return normalizeShellCommand(cleaned)
 		}
 		return s
 	case []any:
@@ -723,12 +827,29 @@ func normalizeShellCommand(value any) any {
 				}
 			}
 		}
-		s := strings.TrimSpace(stringify(v))
+		s := stripShellCommandJunk(strings.TrimSpace(stringify(v)))
 		if s == "" || s == "null" || s == "[]" || s == "{}" {
 			return nil
 		}
 		return s
 	}
+}
+
+// stripShellCommandJunk drops pure empty-array / null-looking shells that must
+// never be treated as a complete Codex cmd.
+func stripShellCommandJunk(s string) string {
+	s = strings.TrimSpace(s)
+	if s == "" || s == "null" || s == "[]" || s == "{}" {
+		return ""
+	}
+	// Pure whitespace-inside-brackets empty array: "[    ]", "[ ]", "[\t\n]"
+	if strings.HasPrefix(s, "[") && strings.HasSuffix(s, "]") {
+		inner := strings.TrimSpace(s[1 : len(s)-1])
+		if inner == "" {
+			return ""
+		}
+	}
+	return s
 }
 
 // joinShellArgv joins argv parts into one shell command string.
@@ -781,7 +902,7 @@ func flattenCommandParts(parts []any) []string {
 		case nil:
 			return
 		case string:
-			s := strings.TrimSpace(t)
+			s := cleanShellToken(strings.TrimSpace(t))
 			if s != "" {
 				out = append(out, s)
 			}
@@ -794,7 +915,7 @@ func flattenCommandParts(parts []any) []string {
 				walk(item)
 			}
 		default:
-			s := strings.TrimSpace(stringify(t))
+			s := cleanShellToken(strings.TrimSpace(stringify(t)))
 			if s != "" && s != "null" {
 				out = append(out, s)
 			}
@@ -804,6 +925,19 @@ func flattenCommandParts(parts []any) []string {
 		walk(p)
 	}
 	return out
+}
+
+// cleanShellToken drops empty-array junk prefixes from a single argv token
+// (e.g. "[    ]Write-Output 'ok'" → "Write-Output 'ok'").
+func cleanShellToken(s string) string {
+	s = stripShellCommandJunk(strings.TrimSpace(s))
+	if s == "" {
+		return ""
+	}
+	if cleaned := emptyArrayJunkPrefix.ReplaceAllString(s, ""); cleaned != s {
+		return strings.TrimSpace(cleaned)
+	}
+	return s
 }
 
 // shellCommandNonEmpty reports whether a normalized command value is usable.
@@ -2691,8 +2825,10 @@ func ProjectShellArgsForClient(argsJSON, toolName, preferredKey string) string {
 	}
 	encoded, err := compactJSON(out)
 	if err != nil {
+		maybeLogShellArgsProjection(toolName, argsJSON, normalized)
 		return normalized
 	}
+	maybeLogShellArgsProjection(toolName, argsJSON, encoded)
 	return encoded
 }
 
@@ -2704,3 +2840,94 @@ func firstNonNil(values ...any) any {
 	}
 	return nil
 }
+
+// debugShellArgs is the durable admin setting (WebUI → 系统设置 → Relay).
+// Hot-reloaded via ConfigureDebugShellArgs; default off.
+var (
+	debugShellArgsMu      sync.RWMutex
+	debugShellArgsEnabled bool
+	shellArgsDebugOnce    sync.Once
+)
+
+// ConfigureDebugShellArgs turns on/off shell cmd projection logging from
+// app_settings.debug_shell_args (admin WebUI). Hot without restart.
+func ConfigureDebugShellArgs(enabled bool) {
+	debugShellArgsMu.Lock()
+	prev := debugShellArgsEnabled
+	debugShellArgsEnabled = enabled
+	debugShellArgsMu.Unlock()
+	if enabled && !prev {
+		slog.Info("shell args debug enabled", "source", "admin_settings", "key", "debug_shell_args")
+	} else if !enabled && prev {
+		slog.Info("shell args debug disabled", "source", "admin_settings", "key", "debug_shell_args")
+	}
+}
+
+// DebugShellArgsEnabled reports whether shell projection debug logging is on.
+func DebugShellArgsEnabled() bool {
+	debugShellArgsMu.RLock()
+	defer debugShellArgsMu.RUnlock()
+	return debugShellArgsEnabled
+}
+
+func shellArgsDebugEnabled() bool {
+	return DebugShellArgsEnabled()
+}
+
+func maybeLogShellArgsProjection(toolName, raw, projected string) {
+	if !shellArgsDebugEnabled() {
+		return
+	}
+	shellArgsDebugOnce.Do(func() {
+		slog.Info("shell args projection logging active")
+	})
+	rawCmd := extractShellCmdValue(raw)
+	outCmd := extractShellCmdValue(projected)
+	junkIn := strings.Contains(rawCmd, "[") && emptyArrayJunkPrefix.MatchString(rawCmd)
+	junkOut := strings.Contains(outCmd, "[") && emptyArrayJunkPrefix.MatchString(outCmd)
+	slog.Info("shell args projection",
+		"tool", toolName,
+		"raw_cmd", truncateForLog(rawCmd, 240),
+		"projected_cmd", truncateForLog(outCmd, 240),
+		"junk_prefix_in_raw", junkIn,
+		"junk_prefix_in_projected", junkOut,
+		"raw_len", len(raw),
+		"projected_len", len(projected),
+	)
+	if junkIn || junkOut {
+		slog.Warn("shell empty-array junk detected",
+			"tool", toolName,
+			"raw_cmd", truncateForLog(rawCmd, 320),
+			"projected_cmd", truncateForLog(outCmd, 320),
+		)
+	}
+}
+
+func extractShellCmdValue(argsJSON string) string {
+	text := strings.TrimSpace(argsJSON)
+	if text == "" {
+		return ""
+	}
+	var obj map[string]any
+	if json.Unmarshal([]byte(text), &obj) != nil {
+		return text
+	}
+	for _, k := range []string{"cmd", "command", "argv", "args", "shell_command", "cmdline"} {
+		if v, ok := obj[k]; ok && !empty(v) {
+			if s, ok := v.(string); ok {
+				return s
+			}
+			return stringify(v)
+		}
+	}
+	return text
+}
+
+func truncateForLog(s string, n int) string {
+	s = strings.ReplaceAll(s, "\n", "\\n")
+	if n <= 0 || len(s) <= n {
+		return s
+	}
+	return s[:n] + "…"
+}
+

@@ -126,6 +126,10 @@ func (o Options) applySettingsToRuntime(settings map[string]any) {
 	}
 	// History compact knobs live in historycompact package (not Config struct).
 	applyHistoryCompactSettings(settings)
+	// Shell projection debug logging (admin WebUI debug_shell_args).
+	if v, ok := settings["debug_shell_args"].(bool); ok {
+		toolcall.ConfigureDebugShellArgs(v)
+	}
 }
 
 func applyHistoryCompactSettings(settings map[string]any) {
