@@ -119,13 +119,17 @@ start_registration_sidecar() {
   fi
   mkdir -p /app/turnstile-solver/logs
   echo "[entrypoint] starting Python registration/SSO sidecar on ${reg_host}:${reg_port}"
+  # Tee so docker logs show registration/captcha worker output (previously only
+  # written to turnstile-solver/logs/registration_sidecar.log, which made
+  # `docker logs` look empty when every batch job failed).
   (
     cd /app
     exec python scripts/registration_service.py
-  ) > /app/turnstile-solver/logs/registration_sidecar.log 2>&1 &
+  ) > >(tee -a /app/turnstile-solver/logs/registration_sidecar.log) 2>&1 &
   reg_pid=$!
   echo "${reg_pid}" > /app/turnstile-solver/logs/registration_sidecar.pid
   echo "[entrypoint] registration sidecar pid=${reg_pid} url=${GROK2API_REGISTRATION_SERVICE_URL}"
+  echo "[entrypoint] registration sidecar log: turnstile-solver/logs/registration_sidecar.log (also teed to docker logs)"
 
   for i in $(seq 1 "${wait_sec}"); do
     if curl -fsS -m 1 "${GROK2API_REGISTRATION_SERVICE_URL}/health" >/dev/null 2>&1; then

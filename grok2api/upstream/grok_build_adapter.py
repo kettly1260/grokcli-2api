@@ -2231,7 +2231,52 @@ def _spawn_batch_runner(
                 start_delay=delay,
             )
             if not prepared.get("ok"):
-                return prepared
+                # Materialize a terminal error session so admin UI / batch stats
+                # can show the real failure (mailbox key, domain, proxy, …).
+                # Without this, prepare failures only leave a bare error string
+                # that gets clobbered by the integer fail counter on the batch.
+                err_msg = str(
+                    prepared.get("error")
+                    or prepared.get("message")
+                    or "registration session prepare failed"
+                )
+                err_sid = f"gba_prep_{uuid.uuid4().hex[:14]}"
+                err_sess = {
+                    "id": err_sid,
+                    "status": "error",
+                    "created_at": _now(),
+                    "updated_at": _now(),
+                    "email": prepared.get("email") or "",
+                    "message": f"prepare failed: {err_msg}",
+                    "error": err_msg,
+                    "adapter_build": ADAPTER_BUILD,
+                    "batch_id": bid,
+                    "batch_index": i,
+                    "batch_total": int(
+                        (_load_reg_batch(bid) or {}).get("count") or remaining
+                    ),
+                    "log_lines": [
+                        f"[{time.strftime('%H:%M:%S')}] error | prepare failed: {err_msg}"
+                    ],
+                }
+                with _lock:
+                    _sessions[err_sid] = err_sess
+                    if bid in _batches:
+                        _batches[bid].setdefault("session_ids", []).append(err_sid)
+                        _batches[bid]["updated_at"] = _now()
+                        _mirror_reg_batch(bid, dict(_batches[bid]))
+                _mirror_reg_sess(err_sid, err_sess)
+                print(
+                    f"[grok-build-auth] batch {bid} job#{i} prepare failed: {err_msg}",
+                    flush=True,
+                )
+                return {
+                    "ok": False,
+                    "id": err_sid,
+                    "status": "error",
+                    "error": err_msg,
+                    "email": err_sess.get("email"),
+                }
             sid = str(prepared.get("id") or "")
             with _lock:
                 # Re-check cancel after prepare (user may stop mid-queue).
@@ -2500,7 +2545,10 @@ def _spawn_batch_runner(
                         )
                     elif fail_n and not ok_n:
                         b["status"] = "error"
-                        b["error"] = "; ".join(errors[:5]) or "all failed"
+                        # Keep free-text detail on error_detail — `error` is the
+                        # integer fail counter owned by _batch_stats / UI.
+                        err_detail = "; ".join(errors[:5]) or "all failed"
+                        b["error_detail"] = err_detail
                         b["message"] = (
                             f"finished {finished}/{target_total} "
                             f"(ok={ok_n} fail={fail_n}, threads={workers})"
@@ -2508,6 +2556,8 @@ def _spawn_batch_runner(
                         )
                     elif fail_n:
                         b["status"] = "partial"
+                        if errors:
+                            b["error_detail"] = "; ".join(errors[:5])
                         b["message"] = (
                             f"finished {finished}/{target_total} "
                             f"(ok={ok_n} fail={fail_n}, threads={workers})"
@@ -2519,8 +2569,29 @@ def _spawn_batch_runner(
                             f"finished {finished}/{target_total} "
                             f"(ok={ok_n} fail={fail_n}, threads={workers})"
                         )
+                    # Persist counters as ints so UI/stats don't have to parse message.
+                    b["imported"] = int(ok_n)
+                    b["error"] = int(fail_n)
+                    b["done"] = int(finished)
                     _mirror_reg_batch(bid, dict(b))
                     st = str(b.get("status") or "done")
+                    # Always emit a terminal line to sidecar log (docker logs
+                    # only see entrypoint stdout; registration lives in
+                    # turnstile-solver/logs/registration_sidecar.log).
+                    try:
+                        print(
+                            f"[grok-build-auth] batch {bid} {st}: "
+                            f"finished={finished}/{target_total} "
+                            f"ok={ok_n} fail={fail_n} threads={workers}"
+                            + (
+                                f" errors={errors[:5]!r}"
+                                if errors
+                                else ""
+                            ),
+                            flush=True,
+                        )
+                    except Exception:
+                        pass
                     _record_register_task(
                         task_id=str(bid),
                         summary=str(b.get("message") or f"协议注册批次 {bid}"),
@@ -2536,6 +2607,7 @@ def _spawn_batch_runner(
                             "threads": workers,
                             "status": st,
                             "errors": (errors or [])[:10],
+                            "error_detail": b.get("error_detail"),
                             "phase": "finished",
                             "adapter_build": ADAPTER_BUILD,
                         },
@@ -4775,14 +4847,25 @@ def _batch_stats(
         if stored in ("done", "partial", "error", "cancelled", "stopped"):
             status = stored
             # Prefer stored counters when present so UI keeps final totals.
+            # `error` used to be a free-text detail string (clobbering the int
+            # count); accept only int-like values and fall back to fail_count.
             try:
-                imported = int(batch.get("imported") or imported)
+                imported = int(batch.get("imported") or batch.get("ok_count") or imported)
             except Exception:
                 pass
             try:
-                error = int(batch.get("error") or error)
+                raw_err = batch.get("error")
+                if isinstance(raw_err, (int, float)):
+                    error = int(raw_err)
+                elif isinstance(raw_err, str) and raw_err.strip().isdigit():
+                    error = int(raw_err.strip())
+                else:
+                    error = int(batch.get("fail_count") or error)
             except Exception:
-                pass
+                try:
+                    error = int(batch.get("fail_count") or error)
+                except Exception:
+                    pass
             try:
                 cancelled = int(batch.get("cancelled") or cancelled)
             except Exception:
@@ -4799,13 +4882,22 @@ def _batch_stats(
             msg = str((batch or {}).get("message") or "")
             if isinstance(batch, dict):
                 try:
-                    imported = int(batch.get("imported") or imported or 0)
+                    imported = int(batch.get("imported") or batch.get("ok_count") or imported or 0)
                 except Exception:
                     pass
                 try:
-                    error = int(batch.get("error") or error or 0)
+                    raw_err = batch.get("error")
+                    if isinstance(raw_err, (int, float)):
+                        error = int(raw_err)
+                    elif isinstance(raw_err, str) and raw_err.strip().isdigit():
+                        error = int(raw_err.strip())
+                    else:
+                        error = int(batch.get("fail_count") or error or 0)
                 except Exception:
-                    pass
+                    try:
+                        error = int(batch.get("fail_count") or error or 0)
+                    except Exception:
+                        pass
                 try:
                     cancelled = int(batch.get("cancelled") or cancelled or 0)
                 except Exception:
@@ -4922,7 +5014,19 @@ def get_registration_batch(batch_id: str) -> dict[str, Any] | None:
     sessions = nonterm[:MAX_BATCH_SESSIONS]
     if len(sessions) < MAX_BATCH_SESSIONS:
         sessions.extend(term[: MAX_BATCH_SESSIONS - len(sessions)])
+    # Preserve free-text failure detail. stats.error is the integer fail count
+    # and must win for that key; surface the text under error_detail / spawn_errors.
+    error_detail = b.get("error_detail")
+    if not error_detail:
+        raw_err = b.get("error")
+        if isinstance(raw_err, str) and raw_err.strip() and not raw_err.strip().isdigit():
+            error_detail = raw_err.strip()
+    spawn_errors = list(b.get("spawn_errors") or [])
     out = {**b, **stats, "sessions": sessions}
+    if error_detail:
+        out["error_detail"] = error_detail
+    if spawn_errors:
+        out["spawn_errors"] = spawn_errors[:20]
     # Surface effective status for older UIs that only read `status`.
     if stats.get("batch_status"):
         # Don't clobber an explicit cooperative "stopping" marker while workers live.
