@@ -1397,7 +1397,6 @@ func TestCoerceSalvageDoesNotInventEmptyShell(t *testing.T) {
 	}
 }
 
-
 func TestGrepNeverEmitsFilePath(t *testing.T) {
 	cases := []struct {
 		name string
@@ -1549,7 +1548,7 @@ func TestSanitizeBashQuoteGlueAndMultiStatement(t *testing.T) {
 }
 
 // Linux / bash clients must keep legitimate bash quote-glue. Projection with
-// preferredKey=command (non-Codex) must NOT strip '\''.
+// preferredKey=command (non-Codex) must NOT strip '\”.
 func TestLinuxCLIPreservesBashQuoteGlue(t *testing.T) {
 	prevR, prevG := CodexPowerShellRulesEnabled(), CodexPowerShellGuardEnabled()
 	t.Cleanup(func() { ConfigureCodexShellPolicy(prevR, prevG) })
@@ -1583,7 +1582,6 @@ func TestLinuxCLIPreservesBashQuoteGlue(t *testing.T) {
 		t.Fatalf("PowerShell projection must strip bash quote-glue, got %q", cmd2)
 	}
 }
-
 
 func TestDetectBashShellDialect(t *testing.T) {
 	cases := []struct {
@@ -1689,5 +1687,3 @@ func TestProjectShellArgsGuardRewrites(t *testing.T) {
 		t.Fatalf("expected guard rewrite, got %q (in=%q)", cmd, cmdIn)
 	}
 }
-
-

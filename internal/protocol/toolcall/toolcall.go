@@ -512,7 +512,6 @@ func applyGrepDefaults(obj map[string]any, toolName string) map[string]any {
 	return obj
 }
 
-
 // recoverEditPoisonedKeys remaps leftover Grep/generic aliases onto Edit schema
 // when the tool is known to be Edit/Update. Safe only for isEditTool names.
 func recoverEditPoisonedKeys(obj map[string]any) {
@@ -1009,7 +1008,6 @@ func shellQuoteToken(s string, dialect shellDialect) string {
 	// POSIX/bash: embed ' as '\''  (end quote, escaped quote, reopen).
 	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }
-
 
 func flattenCommandParts(parts []any) []string {
 	out := make([]string, 0, len(parts))
@@ -2955,7 +2953,7 @@ func ProjectShellArgsForClient(argsJSON, toolName, preferredKey string) string {
 	if val == nil {
 		return normalized
 	}
-		// Codex / OpenAI shell clients require a STRING for cmd/command — never argv
+	// Codex / OpenAI shell clients require a STRING for cmd/command — never argv
 	// arrays. Grok frequently emits ["ls","-la"] or nested lists; flatten+join
 	// at the final client projection boundary.
 	// Use client dialect so Linux bash keeps quote-glue while Codex PowerShell gets
@@ -3146,7 +3144,6 @@ func truncateForLog(s string, n int) string {
 	}
 	return s[:n] + "…"
 }
-
 
 // ---------------------------------------------------------------------------
 // Codex / Windows PowerShell soft+hard helpers
@@ -3411,4 +3408,3 @@ func GuardShellCmdForClient(cmd string) (out string, issue *ShellDialectIssue) {
 	)
 	return msg, issue
 }
-

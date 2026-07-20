@@ -63,9 +63,9 @@ func (c *Connector) PublicSettings(ctx context.Context) (map[string]any, error) 
 		"history_max_tool_result_chars": intSetting(values, "history_max_tool_result_chars", 0),
 		"debug_shell_args":              boolSetting(values, "debug_shell_args", false),
 		// Codex/Windows: inject short PS hard rules; optional bash-dialect reject.
-		"codex_powershell_rules": boolSetting(values, "codex_powershell_rules", false),
-		"codex_powershell_guard": boolSetting(values, "codex_powershell_guard", false),
-		"sse_keepalive":          floatSetting(values, "sse_keepalive", 4),
+		"codex_powershell_rules":        boolSetting(values, "codex_powershell_rules", false),
+		"codex_powershell_guard":        boolSetting(values, "codex_powershell_guard", false),
+		"sse_keepalive":                 floatSetting(values, "sse_keepalive", 4),
 		"conversation_affinity_enabled": boolSetting(values, "conversation_affinity_enabled", true),
 		"conversation_affinity_ttl_sec": floatSetting(values, "conversation_affinity_ttl_sec", 7200),
 		"token_maintain_interval_sec":   floatSetting(values, "token_maintain_interval_sec", 90),
