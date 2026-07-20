@@ -94,3 +94,44 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      # GHCR packages default to private even when the repo is public.
+      # Make the container pullable anonymously for testing / docker pull.
+      - name: Make GHCR package public
+        if: github.event_name != 'pull_request'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          PKG="${GITHUB_REPOSITORY##*/}"
+          OWNER="${GITHUB_REPOSITORY%%/*}"
+          echo "Setting package ${OWNER}/${PKG} visibility=public"
+          # Prefer user package endpoint; fall back to org if needed.
+          code=$(curl -sS -o /tmp/pkg_vis.json -w "%{http_code}" \
+            -X PATCH \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/user/packages/container/${PKG}" \
+            -d '{"visibility":"public"}' || true)
+          echo "user endpoint HTTP ${code}"
+          cat /tmp/pkg_vis.json || true
+          if [[ "${code}" != "200" && "${code}" != "204" ]]; then
+            code2=$(curl -sS -o /tmp/pkg_vis2.json -w "%{http_code}" \
+              -X PATCH \
+              -H "Accept: application/vnd.github+json" \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              "https://api.github.com/orgs/${OWNER}/packages/container/${PKG}" \
+              -d '{"visibility":"public"}' || true)
+            echo "org endpoint HTTP ${code2}"
+            cat /tmp/pkg_vis2.json || true
+          fi
+          # Anonymous pull probe (best-effort).
+          tok=$(curl -sS "https://ghcr.io/token?scope=repository:${OWNER,,}/${PKG}:pull&service=ghcr.io" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("token",""))' || true)
+          if [[ -n "${tok}" ]]; then
+            http=$(curl -sS -o /dev/null -w "%{http_code}" \
+              -H "Authorization: Bearer ${tok}" \
+              "https://ghcr.io/v2/${OWNER,,}/${PKG}/manifests/edge" || true)
+            echo "anonymous pull probe edge -> HTTP ${http}"
+          fi
