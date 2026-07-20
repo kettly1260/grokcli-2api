@@ -209,6 +209,11 @@ func main() {
 			if v, ok := settings["debug_shell_args"].(bool); ok {
 				toolcall.ConfigureDebugShellArgs(v)
 			}
+			{
+				rules, _ := settings["codex_powershell_rules"].(bool)
+				guard, _ := settings["codex_powershell_guard"].(bool)
+				toolcall.ConfigureCodexShellPolicy(rules, guard)
+			}
 			snap := historycompact.Snapshot()
 			slog.Info("loaded durable settings into runtime config",
 				"default_model", runtimeCfg.DefaultModel,
@@ -217,6 +222,8 @@ func main() {
 				"history_compact_enabled", snap["enabled"],
 				"history_compact_auto_chars", snap["auto_chars"],
 				"debug_shell_args", toolcall.DebugShellArgsEnabled(),
+				"codex_powershell_rules", toolcall.CodexPowerShellRulesEnabled(),
+				"codex_powershell_guard", toolcall.CodexPowerShellGuardEnabled(),
 			)
 		} else {
 			slog.Warn("failed to load durable settings at boot", "error", err)

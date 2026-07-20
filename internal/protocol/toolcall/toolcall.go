@@ -770,7 +770,7 @@ func normalizeShellCommand(value any) any {
 			var arr []any
 			if json.Unmarshal([]byte(s), &arr) == nil {
 				if flat := flattenCommandParts(arr); len(flat) > 0 {
-					return joinShellArgv(flat)
+					return joinShellArgv(flat, DialectPOSIX)
 				}
 				// Parsed as empty array — not a usable command.
 				return nil
@@ -781,7 +781,7 @@ func normalizeShellCommand(value any) any {
 				if unquoted != "" && unquoted[0] == '[' {
 					if json.Unmarshal([]byte(unquoted), &arr) == nil {
 						if flat := flattenCommandParts(arr); len(flat) > 0 {
-							return joinShellArgv(flat)
+							return joinShellArgv(flat, DialectPOSIX)
 						}
 						return nil
 					}
@@ -806,7 +806,7 @@ func normalizeShellCommand(value any) any {
 		if len(flat) == 0 {
 			return nil
 		}
-		return joinShellArgv(flat)
+		return joinShellArgv(flat, DialectPOSIX)
 	case []string:
 		tmp := make([]any, len(v))
 		for i, s := range v {
@@ -823,7 +823,7 @@ func normalizeShellCommand(value any) any {
 					if len(flat) == 0 {
 						return nil
 					}
-					return joinShellArgv(flat)
+					return joinShellArgv(flat, DialectPOSIX)
 				}
 			}
 		}
@@ -852,36 +852,148 @@ func stripShellCommandJunk(s string) string {
 	return s
 }
 
+// shellDialect selects join/quote/sanitize rules for the target shell runtime.
+//
+// Codex exec_command on Windows runs PowerShell → DialectPowerShell.
+// Linux CLI / bash / zsh / Hermes terminal → DialectPOSIX.
+// Internal normalize (before client projection) uses DialectPOSIX so we never
+// destroy legitimate bash quote-glue that a Linux client needs.
+type shellDialect int
+
+const (
+	DialectPOSIX shellDialect = iota
+	DialectPowerShell
+)
+
+// shellDialectForClient picks dialect from client-facing preferred key / tool name.
+// preferredKey "cmd" is Codex schema; exec_command is the Codex tool family.
+func shellDialectForClient(toolName, preferredKey string) shellDialect {
+	pk := strings.ToLower(strings.TrimSpace(preferredKey))
+	if pk == "cmd" {
+		return DialectPowerShell
+	}
+	nk := nameKey(toolName)
+	if nk == "exec_command" || strings.Contains(nk, "exec_command") {
+		return DialectPowerShell
+	}
+	// Namespaced: default_api.exec_command
+	low := strings.ToLower(toolName)
+	if strings.Contains(low, "exec_command") {
+		return DialectPowerShell
+	}
+	return DialectPOSIX
+}
+
 // joinShellArgv joins argv parts into one shell command string.
-// Tokens that need quoting (spaces / quotes / meta) are single-quoted POSIX-style.
-func joinShellArgv(parts []string) string {
+//
+// dialect controls quoting and whether bash quote-glue is stripped:
+//
+//	DialectPowerShell — Codex on Windows:
+//	  1) sanitize bash '\'' glue + lone-CR path recovery
+//	  2) single part → as-is
+//	  3) multi complete statements → join with "; "
+//	  4) classic argv with PowerShell '' embedded-quote form
+//
+//	DialectPOSIX — Linux bash/zsh/CLI:
+//	  no glue strip; multi-statement still "; " (valid in bash);
+//	  classic argv uses bash '\'' embedded-quote form
+func joinShellArgv(parts []string, dialect shellDialect) string {
 	if len(parts) == 0 {
 		return ""
 	}
-	if len(parts) == 1 {
-		return parts[0]
-	}
-	out := make([]string, 0, len(parts))
+	cleaned := make([]string, 0, len(parts))
 	for _, p := range parts {
 		p = strings.TrimSpace(p)
+		if dialect == DialectPowerShell {
+			p = sanitizeShellDialectArtifacts(p)
+		}
 		if p == "" {
 			continue
 		}
-		out = append(out, shellQuoteToken(p))
+		cleaned = append(cleaned, p)
 	}
-	if len(out) == 0 {
+	if len(cleaned) == 0 {
 		return ""
+	}
+	if len(cleaned) == 1 {
+		// Full command string already: do not re-quote.
+		return cleaned[0]
+	}
+	// Multi complete statements (spaces inside each part, not bare flags).
+	// Includes PowerShell here-strings (@' ... '@) that Grok often splits across
+	// argv slots — "; " keeps them as sequential statements, not re-quoted tokens.
+	// "; " is also valid bash (sequential), so safe for DialectPOSIX.
+	if allLookLikeShellStatements(cleaned) {
+		return strings.Join(cleaned, "; ")
+	}
+	// Classic argv: quote only meta-bearing tokens.
+	out := make([]string, 0, len(cleaned))
+	for _, p := range cleaned {
+		out = append(out, shellQuoteToken(p, dialect))
 	}
 	return strings.Join(out, " ")
 }
 
-func shellQuoteToken(s string) string {
+// allLookLikeShellStatements is true when every token already looks like a full
+// command line (contains whitespace and is not a bare -flag). Used to decide
+// "; " join vs argv join for multi-part shell args from Grok.
+//
+// Also true when any part is a multi-line here-string body / has newlines, even
+// if a sibling part is a short PowerShell opener like "@'" — Grok splits
+// Set-Content here-strings across argv slots; space-joining + re-quote breaks PS.
+func allLookLikeShellStatements(parts []string) bool {
+	if len(parts) < 2 {
+		return false
+	}
+	hasNewline := false
+	multiWord := 0
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			return false
+		}
+		// Bare flags / short tokens that are clearly argv pieces.
+		if strings.HasPrefix(p, "-") && !strings.ContainsAny(p, " \t\n") {
+			return false
+		}
+		if strings.ContainsAny(p, "\n\r") {
+			hasNewline = true
+		}
+		if strings.ContainsAny(p, " \t\n") {
+			multiWord++
+		}
+	}
+	// Classic: every part multi-word → statements.
+	if multiWord == len(parts) {
+		return true
+	}
+	// Here-string / multi-line split across argv: prefer "; " if majority
+	// multi-word and no bare -flags (already filtered).
+	if hasNewline && multiWord >= len(parts)-1 {
+		return true
+	}
+	// PowerShell cmdlet pattern Verb-Noun in every multi-ish part.
+	cmdletish := 0
+	for _, p := range parts {
+		tok := strings.Fields(strings.TrimSpace(p))
+		if len(tok) == 0 {
+			continue
+		}
+		head := tok[0]
+		if strings.Contains(head, "-") && head[0] >= 'A' && head[0] <= 'Z' {
+			cmdletish++
+		}
+	}
+	return cmdletish >= 2 && multiWord >= len(parts)-1
+}
+
+func shellQuoteToken(s string, dialect shellDialect) string {
 	// Safe bare token: alnum + common path/flag chars.
 	safe := true
 	for i := 0; i < len(s); i++ {
 		c := s[i]
 		if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
-			c == '-' || c == '_' || c == '.' || c == '/' || c == '=' || c == ':' || c == '@' || c == '+' || c == '%' {
+			c == '-' || c == '_' || c == '.' || c == '/' || c == '\\' || c == '=' || c == ':' || c == '@' || c == '+' || c == '%' {
 			continue
 		}
 		safe = false
@@ -890,9 +1002,14 @@ func shellQuoteToken(s string) string {
 	if safe {
 		return s
 	}
-	// POSIX single-quote: 'foo'\''bar'
+	if dialect == DialectPowerShell {
+		// PowerShell single-quote: embed ' as '' (NOT bash '\'').
+		return "'" + strings.ReplaceAll(s, "'", "''") + "'"
+	}
+	// POSIX/bash: embed ' as '\''  (end quote, escaped quote, reopen).
 	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }
+
 
 func flattenCommandParts(parts []any) []string {
 	out := make([]string, 0, len(parts))
@@ -928,14 +1045,63 @@ func flattenCommandParts(parts []any) []string {
 }
 
 // cleanShellToken drops empty-array junk prefixes from a single argv token
-// (e.g. "[    ]Write-Output 'ok'" → "Write-Output 'ok'").
+// (e.g. "[    ]Write-Output 'ok'" → "Write-Output 'ok'") and always strips
+// bash dialect artifacts that explode under Codex PowerShell.
 func cleanShellToken(s string) string {
+	// POSIX-safe: only strip empty-array junk. Bash quote-glue MUST stay intact
+	// for Linux CLI clients; PowerShell sanitization runs only at client projection
+	// when shellDialectForClient → DialectPowerShell.
 	s = stripShellCommandJunk(strings.TrimSpace(s))
 	if s == "" {
 		return ""
 	}
 	if cleaned := emptyArrayJunkPrefix.ReplaceAllString(s, ""); cleaned != s {
 		return strings.TrimSpace(cleaned)
+	}
+	return s
+}
+
+// sanitizeShellDialectArtifacts rewrites bash quote-glue / lone-CR path damage
+// for PowerShell targets ONLY. Callers must gate on DialectPowerShell — never run
+// this on Linux bash/CLI commands (bash legitimate use of quote-glue would break).
+// Not gated by codex_powershell_guard (that optional path rejects mega-cmds).
+//
+// Grok often emits bash-safe quote glue and Windows-path escapes that PowerShell
+// cannot parse, even when the rest of the command is "pure PowerShell":
+func sanitizeShellDialectArtifacts(s string) string {
+	if s == "" {
+		return s
+	}
+	// bash quote glue → plain single quote. Longest patterns first so
+	// LiteralPath '\''path'\''' collapses to 'path' (not 'path'').
+	// Live Codex: Set-Location -LiteralPath '\''G:\LLM\rehab'\'''
+	for {
+		before := s
+		// close/open variants with trailing extra quote
+		s = strings.ReplaceAll(s, `'\'''`, "'")
+		s = strings.ReplaceAll(s, `'\''`, "'")
+		s = strings.ReplaceAll(s, `'"'"''`, "'")
+		s = strings.ReplaceAll(s, `'"'"'`, "'")
+		if s == before {
+			break
+		}
+	}
+	// Recover lone CR (not CRLF) → backslash + 'r' so paths like G:\LLM\rehab survive.
+	if strings.ContainsRune(s, '\r') {
+		var b strings.Builder
+		b.Grow(len(s) + 8)
+		for i := 0; i < len(s); i++ {
+			if s[i] == '\r' {
+				if i+1 < len(s) && s[i+1] == '\n' {
+					b.WriteByte('\r') // keep real CRLF line endings
+					continue
+				}
+				b.WriteString(`\r`)
+				continue
+			}
+			b.WriteByte(s[i])
+		}
+		s = b.String()
 	}
 	return s
 }
@@ -2738,6 +2904,7 @@ func ProjectShellArgsForClient(argsJSON, toolName, preferredKey string) string {
 		// Hermes "terminal" (and any other command-style shell) uses DefaultShellArgKey.
 		preferredKey = DefaultShellArgKey(toolName)
 	}
+	dialect := shellDialectForClient(toolName, preferredKey)
 	text := strings.TrimSpace(argsJSON)
 	if text == "" {
 		return argsJSON
@@ -2788,10 +2955,42 @@ func ProjectShellArgsForClient(argsJSON, toolName, preferredKey string) string {
 	if val == nil {
 		return normalized
 	}
-	// Codex / OpenAI shell clients require a STRING for cmd/command — never argv
+		// Codex / OpenAI shell clients require a STRING for cmd/command — never argv
 	// arrays. Grok frequently emits ["ls","-la"] or nested lists; flatten+join
 	// at the final client projection boundary.
-	strVal := normalizeShellCommand(val)
+	// Use client dialect so Linux bash keeps quote-glue while Codex PowerShell gets
+	// PS-safe quotes + glue-strip — never bake PS rewrites into internal POSIX normalize.
+	var strVal any
+	switch v := val.(type) {
+	case []any:
+		if flat := flattenCommandParts(v); len(flat) > 0 {
+			strVal = joinShellArgv(flat, dialect)
+		}
+	case []string:
+		tmp := make([]any, len(v))
+		for i, s := range v {
+			tmp[i] = s
+		}
+		if flat := flattenCommandParts(tmp); len(flat) > 0 {
+			strVal = joinShellArgv(flat, dialect)
+		}
+	default:
+		strVal = normalizeShellCommand(val)
+		// JSON-array string under PowerShell projection: re-join with PS dialect.
+		if dialect == DialectPowerShell {
+			if s, ok := val.(string); ok {
+				s = strings.TrimSpace(s)
+				if strings.HasPrefix(s, "[") && strings.HasSuffix(s, "]") {
+					var arr []any
+					if json.Unmarshal([]byte(s), &arr) == nil {
+						if flat := flattenCommandParts(arr); len(flat) > 0 {
+							strVal = joinShellArgv(flat, dialect)
+						}
+					}
+				}
+			}
+		}
+	}
 	if strVal == nil {
 		// Last resort for exotic non-string/non-array leftovers.
 		if s, ok := val.(string); ok {
@@ -2800,7 +2999,7 @@ func ProjectShellArgsForClient(argsJSON, toolName, preferredKey string) string {
 			var arr []any
 			if json.Unmarshal([]byte(encoded), &arr) == nil {
 				if flat := flattenCommandParts(arr); len(flat) > 0 {
-					strVal = joinShellArgv(flat)
+					strVal = joinShellArgv(flat, dialect)
 				}
 			}
 		} else if val != nil {
@@ -2811,6 +3010,18 @@ func ProjectShellArgsForClient(argsJSON, toolName, preferredKey string) string {
 	}
 	if strVal == nil {
 		return normalized
+	}
+	// PowerShell (Codex cmd) only: strip bash quote-glue / lone-CR path damage.
+	// Linux bash/CLI (command key / non-exec_command): leave cmd untouched so
+	// legitimate bash quote-glue and paths keep working.
+	// Optional codex_powershell_guard may still rewrite remaining unfixable cmds.
+	if s, ok := strVal.(string); ok {
+		if shellDialectForClient(toolName, preferredKey) == DialectPowerShell {
+			s = sanitizeShellDialectArtifacts(s)
+			strVal, _ = GuardShellCmdForClient(s)
+		} else {
+			strVal = s
+		}
 	}
 	// Rebuild: preferred key first, keep non-alias extras (workdir, timeout, ...).
 	out := map[string]any{preferredKey: strVal}
@@ -2885,6 +3096,10 @@ func maybeLogShellArgsProjection(toolName, raw, projected string) {
 	outCmd := extractShellCmdValue(projected)
 	junkIn := strings.Contains(rawCmd, "[") && emptyArrayJunkPrefix.MatchString(rawCmd)
 	junkOut := strings.Contains(outCmd, "[") && emptyArrayJunkPrefix.MatchString(outCmd)
+	// Noise control: skip identical projections unless junk is present.
+	if !junkIn && !junkOut && rawCmd == outCmd {
+		return
+	}
 	slog.Info("shell args projection",
 		"tool", toolName,
 		"raw_cmd", truncateForLog(rawCmd, 240),
@@ -2893,6 +3108,7 @@ func maybeLogShellArgsProjection(toolName, raw, projected string) {
 		"junk_prefix_in_projected", junkOut,
 		"raw_len", len(raw),
 		"projected_len", len(projected),
+		"changed", rawCmd != outCmd,
 	)
 	if junkIn || junkOut {
 		slog.Warn("shell empty-array junk detected",
@@ -2929,5 +3145,270 @@ func truncateForLog(s string, n int) string {
 		return s
 	}
 	return s[:n] + "…"
+}
+
+
+// ---------------------------------------------------------------------------
+// Codex / Windows PowerShell soft+hard helpers
+// ---------------------------------------------------------------------------
+//
+// B) codex_powershell_rules  — inject short hard rules into instructions when
+//    the request looks like Codex (historycompact.LooksLikeCodexRequest).
+// C) codex_powershell_guard  — optional reject of bash-ish shell cmd at the
+//    client projection boundary (python -c nested quotes, bash $(), bash quote escape).
+//
+// Both are durable admin settings, hot-reloaded via ConfigureCodexShellPolicy.
+
+var (
+	codexShellMu         sync.RWMutex
+	codexPowerShellRules bool // default false until admin enables
+	codexPowerShellGuard bool // default false (optional hard reject)
+)
+
+// ConfigureCodexShellPolicy hot-applies WebUI settings:
+//   - rules: inject PowerShell hard rules into Codex instructions
+//   - guard: reject bash-dialect shell cmds at projection boundary
+func ConfigureCodexShellPolicy(rules, guard bool) {
+	codexShellMu.Lock()
+	prevR, prevG := codexPowerShellRules, codexPowerShellGuard
+	codexPowerShellRules, codexPowerShellGuard = rules, guard
+	codexShellMu.Unlock()
+	if rules != prevR || guard != prevG {
+		slog.Info("codex shell policy updated",
+			"codex_powershell_rules", rules,
+			"codex_powershell_guard", guard,
+			"source", "admin_settings",
+		)
+	}
+}
+
+// CodexPowerShellRulesEnabled reports whether instruction injection is on.
+func CodexPowerShellRulesEnabled() bool {
+	codexShellMu.RLock()
+	defer codexShellMu.RUnlock()
+	return codexPowerShellRules
+}
+
+// CodexPowerShellGuardEnabled reports whether bash-dialect reject is on.
+func CodexPowerShellGuardEnabled() bool {
+	codexShellMu.RLock()
+	defer codexShellMu.RUnlock()
+	return codexPowerShellGuard
+}
+
+// CodexPowerShellHardRules is the short block injected into Codex instructions.
+// Keep it short: long AGENTS.md is soft; this is a high-signal reminder each turn.
+const CodexPowerShellHardRules = `[grokcli-2api / Windows PowerShell]
+Environment: native Windows PowerShell (Codex exec_command), NOT bash/Git-Bash.
+REQUIRED:
+- Emit valid PowerShell only (Select-String, Get-Content, Set-Content, Join-Path, ...).
+- Prefer several short commands over one nested mega-command.
+- For non-trivial Python: write a temp .py under the repo .tmp, then: python path\to\script.py
+- Paths: use single quotes 'G:\LLM\rehab\...' so backslashes stay literal (never bash '\'' glue).
+FORBIDDEN:
+- bash-only: tail/grep/sed/awk/xargs/rm -rf / $(...) / bash && chains
+- bash quote escape sequences ('\'' or '"'"') anywhere in cmd — PowerShell uses '' inside '...'
+- multiline or heavily quoted python -c (one short expression max)
+- wrapping already-PowerShell cmd in another powershell -Command
+After one quoting failure: stop permuting quotes; write a temp script instead.
+`
+
+// InjectCodexPowerShellRules appends hard rules to OpenAI-style body messages
+// (system/developer) and/or body instructions when rules are enabled and looksCodex.
+// Idempotent: skips if marker already present.
+//
+// looksCodex should come from historycompact.LooksLikeCodexRequest so we do not
+// pollute pure OpenAI/Claude clients.
+func InjectCodexPowerShellRules(body map[string]any, looksCodex bool) {
+	if body == nil || !looksCodex || !CodexPowerShellRulesEnabled() {
+		return
+	}
+	const marker = "[grokcli-2api / Windows PowerShell]"
+	// instructions (Responses / Codex primary)
+	if inst, ok := body["instructions"].(string); ok {
+		if !strings.Contains(inst, marker) {
+			if strings.TrimSpace(inst) == "" {
+				body["instructions"] = CodexPowerShellHardRules
+			} else {
+				body["instructions"] = strings.TrimSpace(inst) + "\n\n" + CodexPowerShellHardRules
+			}
+		}
+	}
+	// messages: prepend/merge into first system/developer message, else prepend.
+	msgs := normalizeMessageListLocal(body["messages"])
+	if len(msgs) == 0 {
+		if _, ok := body["instructions"]; !ok {
+			body["instructions"] = CodexPowerShellHardRules
+		} else if s, ok := body["instructions"].(string); ok && !strings.Contains(s, marker) {
+			if strings.TrimSpace(s) == "" {
+				body["instructions"] = CodexPowerShellHardRules
+			} else {
+				body["instructions"] = strings.TrimSpace(s) + "\n\n" + CodexPowerShellHardRules
+			}
+		}
+		return
+	}
+	for i, item := range msgs {
+		msg, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		role := strings.ToLower(strings.TrimSpace(fmt.Sprint(msg["role"])))
+		if role != "system" && role != "developer" {
+			continue
+		}
+		content := messageContentString(msg["content"])
+		if strings.Contains(content, marker) {
+			return
+		}
+		if strings.TrimSpace(content) == "" {
+			msg["content"] = CodexPowerShellHardRules
+		} else {
+			msg["content"] = content + "\n\n" + CodexPowerShellHardRules
+		}
+		msgs[i] = msg
+		body["messages"] = msgs
+		return
+	}
+	// No system/developer yet — prepend.
+	sys := map[string]any{"role": "system", "content": CodexPowerShellHardRules}
+	body["messages"] = append([]any{sys}, msgs...)
+}
+
+func normalizeMessageListLocal(raw any) []any {
+	switch v := raw.(type) {
+	case []any:
+		return v
+	case []map[string]any:
+		out := make([]any, len(v))
+		for i, m := range v {
+			out[i] = m
+		}
+		return out
+	default:
+		return nil
+	}
+}
+
+func messageContentString(content any) string {
+	switch v := content.(type) {
+	case string:
+		return v
+	case []any:
+		var b strings.Builder
+		for _, part := range v {
+			switch p := part.(type) {
+			case string:
+				b.WriteString(p)
+			case map[string]any:
+				if t, ok := p["text"].(string); ok {
+					b.WriteString(t)
+				} else if t, ok := p["content"].(string); ok {
+					b.WriteString(t)
+				}
+			}
+		}
+		return b.String()
+	default:
+		if content == nil {
+			return ""
+		}
+		return fmt.Sprint(content)
+	}
+}
+
+// ShellDialectIssue describes a bash-ish pattern unsafe under PowerShell.
+type ShellDialectIssue struct {
+	Reason string
+	Hint   string
+}
+
+// DetectBashShellDialect flags cmd strings that commonly explode under PowerShell.
+// Used by the optional codex_powershell_guard (reject path).
+func DetectBashShellDialect(cmd string) *ShellDialectIssue {
+	s := strings.TrimSpace(cmd)
+	if s == "" {
+		return nil
+	}
+	// bash $() / ${}
+	if strings.Contains(s, "$(") || strings.Contains(s, "${") {
+		return &ShellDialectIssue{
+			Reason: "bash_command_substitution",
+			Hint:   "PowerShell does not expand $(...). Use PowerShell subexpressions or separate commands.",
+		}
+	}
+	// bash quote glue used inside python -c mega-strings: '\''  or  '"'"'
+	if strings.Contains(s, `'\''`) || strings.Contains(s, `'"'"'`) {
+		return &ShellDialectIssue{
+			Reason: "bash_quote_escape",
+			Hint:   "Do not use bash quote-glue. Write a temp .py with Set-Content / apply_patch, then: python path\\script.py",
+		}
+	}
+	// multiline python -c or very nested python -c with escaped newlines
+	low := strings.ToLower(s)
+	if strings.Contains(low, "python -c") || strings.Contains(low, "python3 -c") || strings.Contains(low, "py -3 -c") {
+		if strings.Contains(s, `\n`) || strings.Contains(s, "\n") || len(s) > 280 {
+			return &ShellDialectIssue{
+				Reason: "complex_python_c",
+				Hint:   "python -c is only for short one-liners. Write .tmp\\script.py then run: python .tmp\\script.py",
+			}
+		}
+		if strings.Count(s, `"`)+strings.Count(s, "'") >= 8 {
+			return &ShellDialectIssue{
+				Reason: "complex_python_c_quotes",
+				Hint:   "Too many nested quotes in python -c. Prefer a temp script file.",
+			}
+		}
+	}
+	// classic bash utils as first token
+	first := strings.Fields(s)
+	if len(first) > 0 {
+		tok := strings.ToLower(strings.Trim(first[0], `"'`))
+		switch tok {
+		case "tail", "grep", "sed", "awk", "xargs":
+			return &ShellDialectIssue{
+				Reason: "bash_utility",
+				Hint:   "Use PowerShell equivalents: Select-Object -Last, Select-String, ForEach-Object, ...",
+			}
+		case "rm":
+			if len(first) > 1 {
+				a := first[1]
+				if a == "-rf" || a == "-r" || a == "-fr" || a == "-f" {
+					return &ShellDialectIssue{
+						Reason: "bash_utility",
+						Hint:   "Use Remove-Item -Recurse -Force instead of rm -rf.",
+					}
+				}
+			}
+		}
+	}
+	return nil
+}
+
+// GuardShellCmdForClient applies optional dialect reject. When guard is off,
+// returns cmd unchanged and issue=nil. When on and issue found, returns a
+// PowerShell-safe Write-Output of the rejection so Codex does not ParserError.
+//
+// We intentionally still return a valid cmd string rather than empty — empty
+// often causes client schema retries with worse shapes.
+func GuardShellCmdForClient(cmd string) (out string, issue *ShellDialectIssue) {
+	if !CodexPowerShellGuardEnabled() {
+		return cmd, nil
+	}
+	issue = DetectBashShellDialect(cmd)
+	if issue == nil {
+		return cmd, nil
+	}
+	msg := fmt.Sprintf(
+		"Write-Output '[grokcli-2api] blocked bash-like shell cmd (%s). %s Original (truncated): %s'",
+		issue.Reason,
+		issue.Hint,
+		truncateForLog(cmd, 160),
+	)
+	slog.Warn("codex powershell guard blocked shell cmd",
+		"reason", issue.Reason,
+		"cmd", truncateForLog(cmd, 240),
+	)
+	return msg, issue
 }
 

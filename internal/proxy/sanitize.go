@@ -111,13 +111,21 @@ func PrepareUpstreamBody(body map[string]any) map[string]any {
 
 // PrepareUpstreamBodyDetailed returns the sanitized upstream body plus stabilize/compact stats.
 // Optional userAgent enables Codex default auto-compact when admin auto_chars is 0.
+//
+// When codex_powershell_rules is enabled and the request looks like Codex,
+// short PowerShell hard rules are injected into instructions/system before
+// sanitize (so metadata is still available for LooksLikeCodexRequest).
 func PrepareUpstreamBodyDetailed(body map[string]any, userAgent ...string) (map[string]any, BodyPrepStats) {
 	out := cloneAnyMap(body)
-	stabilize := StabilizePromptBody(out)
 	ua := ""
 	if len(userAgent) > 0 {
 		ua = userAgent[0]
 	}
+	// B: Codex PowerShell hard rules — before Sanitize strips metadata.
+	// Detect with raw (pre-sanitize) tools/metadata so UA-less Codex still matches.
+	looksCodex := historycompact.LooksLikeCodexRequest(ua, out["tools"], out)
+	toolcall.InjectCodexPowerShellRules(out, looksCodex)
+	stabilize := StabilizePromptBody(out)
 	compact := historycompact.Apply(out, ua)
 	return SanitizeUpstreamBody(out), BodyPrepStats{Stabilize: stabilize, Compact: compact}
 }

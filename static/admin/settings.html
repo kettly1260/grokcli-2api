@@ -353,6 +353,14 @@
       <label class="g2a-check"><input type="checkbox" id="set-debug-shell-args" /> Shell 参数调试日志（记录 cmd 投影前后，排查 <code>[    ]</code> 前缀等问题）</label>
       <div class="g2a-muted" style="margin-top:4px;margin-left:1.6em">开启后服务端日志会打印 raw_cmd / projected_cmd；定位 Codex/PowerShell 脏命令时使用，平时请关闭</div>
     </div>
+    <div class="g2a-actions" style="grid-column:1/-1">
+      <label class="g2a-check"><input type="checkbox" id="set-codex-ps-rules" /> Codex PowerShell 硬规则注入（推荐）</label>
+      <div class="g2a-muted" style="margin-top:4px;margin-left:1.6em">检测到 Codex 请求时，向 instructions/system 追加短硬规则：只用 PowerShell、禁止 bash 引号与复杂 python -c。不改变非 Codex 客户端。</div>
+    </div>
+    <div class="g2a-actions" style="grid-column:1/-1">
+      <label class="g2a-check"><input type="checkbox" id="set-codex-ps-guard" /> Codex Shell 方言拦截（可选，较强）</label>
+      <div class="g2a-muted" style="margin-top:4px;margin-left:1.6em">开启后：投影阶段拦截 bash 味 cmd（如 bash 单引号拼接转义、复杂 <code>python -c</code>、<code>$(...)</code>、<code>grep/sed</code>），替换为 PowerShell Write-Output 提示，避免 ParserError。可能增加一轮 tool 重试。</div>
+    </div>
   </div>
   <div class="g2a-actions" style="margin-top:14px;justify-content:flex-end;gap:8px;flex-wrap:wrap">
     <button type="button" class="g2a-btn g2a-btn-default" id="btn-reset-settings-relay">重置默认</button>
@@ -564,6 +572,6 @@
   <script src="/static/dist/api.443dfc63c0.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
   <script src="/static/dist/state.5846ce62e4.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
   <script src="/static/dist/auth.539061a1a7.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
-  <script src="/static/dist/core.d7f2b44ff9.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
+  <script src="/static/dist/core.9ca8f8d744.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
 </body>
 </html>

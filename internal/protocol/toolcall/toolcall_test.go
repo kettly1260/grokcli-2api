@@ -1446,3 +1446,248 @@ func TestConfigureDebugShellArgs(t *testing.T) {
 		t.Fatal("expected debug shell args off again")
 	}
 }
+
+func TestJoinShellArgvMultiStatement(t *testing.T) {
+	// Multi complete statements must join with "; " — not POSIX single-quoted tokens.
+	got := joinShellArgv([]string{
+		`Test-Path -LiteralPath 'G:\LLM\rehab'`,
+		`git -C 'G:\LLM\rehab' worktree list`,
+	}, DialectPowerShell)
+	want := `Test-Path -LiteralPath 'G:\LLM\rehab'; git -C 'G:\LLM\rehab' worktree list`
+	if got != want {
+		t.Fatalf("got %q want %q", got, want)
+	}
+	// Real argv stays space-joined (and short tokens quoted only if needed).
+	got2 := joinShellArgv([]string{"echo", "hi"}, DialectPOSIX)
+	if got2 != "echo hi" {
+		t.Fatalf("argv join: %q", got2)
+	}
+	// Single full string never re-quoted.
+	one := `Select-String -LiteralPath 'x' -Pattern 'a|b'`
+	if joinShellArgv([]string{one}, DialectPowerShell) != one {
+		t.Fatalf("single re-quoted: %q", joinShellArgv([]string{one}, DialectPowerShell))
+	}
+	// PowerShell-safe quote for spaces: embed ' as '' not bash '\''.
+	q := shellQuoteToken("a b'c", DialectPowerShell)
+	if q != "'a b''c'" {
+		t.Fatalf("quote: %q", q)
+	}
+	if strings.Contains(q, `'\''`) {
+		t.Fatalf("bash quote leaked: %q", q)
+	}
+	// POSIX still uses bash '\'' for embedded single quote.
+	pq := shellQuoteToken("a b'c", DialectPOSIX)
+	if pq != `'a b'\''c'` {
+		t.Fatalf("posix quote: %q", pq)
+	}
+}
+
+func TestSanitizeBashQuoteGlueAndMultiStatement(t *testing.T) {
+	// Path with bash glue as emitted by Grok.
+	rawPath := `Set-Location -LiteralPath '\''G:\LLM\rehab\.claude\worktrees\ai-json-rehab-weekly'\'''`
+	got := sanitizeShellDialectArtifacts(rawPath)
+	want := `Set-Location -LiteralPath 'G:\LLM\rehab\.claude\worktrees\ai-json-rehab-weekly'`
+	if got != want {
+		t.Fatalf("sanitize path:\n got %q\nwant %q", got, want)
+	}
+	if strings.Contains(got, `'\''`) {
+		t.Fatalf("bash glue remains: %q", got)
+	}
+
+	// Lone CR (path \r eaten): G:\LLM + CR + ehab → G:\LLM\rehab
+	crPath := "Set-Location -LiteralPath 'G:\\LLM\rehab\\x'"
+	// Force a real CR between LLM and ehab (simulate broken path).
+	broken := "Set-Location -LiteralPath 'G:\\LLM" + "\r" + "ehab\\x'"
+	fixed := sanitizeShellDialectArtifacts(broken)
+	if !strings.Contains(fixed, `G:\LLM\rehab`) {
+		t.Fatalf("CR recovery failed: %q", fixed)
+	}
+	if strings.ContainsRune(fixed, '\r') {
+		t.Fatalf("lone CR remains: %q", fixed)
+	}
+	_ = crPath
+
+	// Multi-statement join with glue inside each part (the live ParserError shape).
+	parts := []string{
+		`Set-Location -LiteralPath '\''G:\LLM\rehab\.claude\worktrees\ai-json-rehab-weekly'\'''`,
+		`New-Item -ItemType Directory -Force -Path '\''.tmp'\'' | Out-Null`,
+		`python .tmp\printlines.py ai-api.js 216 340`,
+	}
+	joined := joinShellArgv(parts, DialectPowerShell)
+	if strings.Contains(joined, `'\''`) {
+		t.Fatalf("joined still has bash glue: %q", joined)
+	}
+	if !strings.Contains(joined, "; ") {
+		t.Fatalf("expected statement join with ; : %q", joined)
+	}
+	if strings.Contains(joined, `''"''"'`) || strings.HasPrefix(strings.TrimSpace(joined), "'Set-Location") {
+		t.Fatalf("parts were re-quoted as tokens: %q", joined)
+	}
+	// Projection end-to-end (guard OFF — sanitize is always-on).
+	prevR, prevG := CodexPowerShellRulesEnabled(), CodexPowerShellGuardEnabled()
+	t.Cleanup(func() { ConfigureCodexShellPolicy(prevR, prevG) })
+	ConfigureCodexShellPolicy(false, false)
+	payload, err := json.Marshal(map[string]any{"command": parts})
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := ProjectShellArgsForClient(string(payload), "exec_command", "cmd")
+	var obj map[string]any
+	if err := json.Unmarshal([]byte(out), &obj); err != nil {
+		t.Fatalf("out json: %v (%s)", err, out)
+	}
+	cmd, _ := obj["cmd"].(string)
+	if strings.Contains(cmd, `'\''`) {
+		t.Fatalf("projected glue remains: %q", cmd)
+	}
+	if !strings.Contains(cmd, "Set-Location -LiteralPath 'G:\\LLM\\rehab") {
+		t.Fatalf("projected missing cleaned Set-Location: %q", cmd)
+	}
+	if !strings.Contains(cmd, "; ") {
+		t.Fatalf("projected missing ; join: %q", cmd)
+	}
+}
+
+// Linux / bash clients must keep legitimate bash quote-glue. Projection with
+// preferredKey=command (non-Codex) must NOT strip '\''.
+func TestLinuxCLIPreservesBashQuoteGlue(t *testing.T) {
+	prevR, prevG := CodexPowerShellRulesEnabled(), CodexPowerShellGuardEnabled()
+	t.Cleanup(func() { ConfigureCodexShellPolicy(prevR, prevG) })
+	ConfigureCodexShellPolicy(false, false)
+
+	// Legitimate bash: echo 'it'\''s fine'
+	cmdIn := `echo 'it'\''s fine'`
+	payload, err := json.Marshal(map[string]any{"command": cmdIn})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// shell + command key → DialectPOSIX
+	out := ProjectShellArgsForClient(string(payload), "shell", "command")
+	var obj map[string]any
+	if err := json.Unmarshal([]byte(out), &obj); err != nil {
+		t.Fatalf("json: %v %s", err, out)
+	}
+	cmd, _ := obj["command"].(string)
+	if !strings.Contains(cmd, `'\''`) {
+		t.Fatalf("POSIX projection must preserve bash quote-glue, got %q", cmd)
+	}
+
+	// Same payload under Codex cmd key → stripped for PowerShell.
+	out2 := ProjectShellArgsForClient(string(payload), "exec_command", "cmd")
+	var obj2 map[string]any
+	if err := json.Unmarshal([]byte(out2), &obj2); err != nil {
+		t.Fatalf("json2: %v %s", err, out2)
+	}
+	cmd2, _ := obj2["cmd"].(string)
+	if strings.Contains(cmd2, `'\''`) {
+		t.Fatalf("PowerShell projection must strip bash quote-glue, got %q", cmd2)
+	}
+}
+
+
+func TestDetectBashShellDialect(t *testing.T) {
+	cases := []struct {
+		cmd    string
+		reason string // empty = no issue
+	}{
+		{`Get-Content -LiteralPath 'x'`, ""},
+		{`echo $(whoami)`, "bash_command_substitution"},
+		{`python -c 'from pathlib import Path; p=Path(r'\''G:/x'\'')'`, "bash_quote_escape"},
+		{"python -c \"print(1)\nprint(2)\"", "complex_python_c"},
+		{"grep -R foo .", "bash_utility"},
+		{"rm -rf /tmp/x", "bash_utility"},
+		{"python -c \"print(1)\"", ""}, // short ok
+	}
+	for _, tc := range cases {
+		iss := DetectBashShellDialect(tc.cmd)
+		if tc.reason == "" {
+			if iss != nil {
+				t.Fatalf("cmd %q unexpected issue %v", tc.cmd, iss)
+			}
+			continue
+		}
+		if iss == nil || iss.Reason != tc.reason {
+			t.Fatalf("cmd %q got %#v want reason %s", tc.cmd, iss, tc.reason)
+		}
+	}
+}
+
+func TestGuardShellCmdForClient(t *testing.T) {
+	prevR, prevG := CodexPowerShellRulesEnabled(), CodexPowerShellGuardEnabled()
+	t.Cleanup(func() { ConfigureCodexShellPolicy(prevR, prevG) })
+
+	ConfigureCodexShellPolicy(false, false)
+	raw := `echo $(whoami)`
+	out, iss := GuardShellCmdForClient(raw)
+	if iss != nil || out != raw {
+		t.Fatalf("guard off should pass-through: out=%q iss=%v", out, iss)
+	}
+
+	ConfigureCodexShellPolicy(false, true)
+	out, iss = GuardShellCmdForClient(raw)
+	if iss == nil || iss.Reason != "bash_command_substitution" {
+		t.Fatalf("guard on: %#v", iss)
+	}
+	if !strings.Contains(out, "Write-Output") || !strings.Contains(out, "blocked") {
+		t.Fatalf("expected PS rejection cmd, got %q", out)
+	}
+}
+
+func TestInjectCodexPowerShellRules(t *testing.T) {
+	prevR, prevG := CodexPowerShellRulesEnabled(), CodexPowerShellGuardEnabled()
+	t.Cleanup(func() { ConfigureCodexShellPolicy(prevR, prevG) })
+
+	ConfigureCodexShellPolicy(true, false)
+	body := map[string]any{
+		"instructions": "You are Codex",
+		"messages": []any{
+			map[string]any{"role": "user", "content": "hi"},
+		},
+	}
+	InjectCodexPowerShellRules(body, true)
+	inst, _ := body["instructions"].(string)
+	if !strings.Contains(inst, "[grokcli-2api / Windows PowerShell]") {
+		t.Fatalf("instructions not injected: %q", inst)
+	}
+	// idempotent
+	InjectCodexPowerShellRules(body, true)
+	if strings.Count(body["instructions"].(string), "[grokcli-2api / Windows PowerShell]") != 1 {
+		t.Fatalf("double inject")
+	}
+	// non-codex skipped
+	body2 := map[string]any{"instructions": "plain"}
+	InjectCodexPowerShellRules(body2, false)
+	if body2["instructions"] != "plain" {
+		t.Fatalf("non-codex polluted: %v", body2["instructions"])
+	}
+	// rules off
+	ConfigureCodexShellPolicy(false, false)
+	body3 := map[string]any{"instructions": "plain"}
+	InjectCodexPowerShellRules(body3, true)
+	if body3["instructions"] != "plain" {
+		t.Fatalf("rules-off polluted")
+	}
+}
+
+func TestProjectShellArgsGuardRewrites(t *testing.T) {
+	prevR, prevG := CodexPowerShellRulesEnabled(), CodexPowerShellGuardEnabled()
+	t.Cleanup(func() { ConfigureCodexShellPolicy(prevR, prevG) })
+	ConfigureCodexShellPolicy(false, true)
+	// Command value contains the literal bash quote-glue sequence: backslash-quote glue.
+	cmdIn := "python -c " + `'from pathlib import Path; p=Path(r'''G:/x''')'`
+	payload, err := json.Marshal(map[string]any{"command": cmdIn})
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := ProjectShellArgsForClient(string(payload), "exec_command", "cmd")
+	var obj map[string]any
+	if err := json.Unmarshal([]byte(out), &obj); err != nil {
+		t.Fatalf("out json: %v (%s)", err, out)
+	}
+	cmd, _ := obj["cmd"].(string)
+	if !strings.Contains(cmd, "Write-Output") || !strings.Contains(cmd, "blocked") {
+		t.Fatalf("expected guard rewrite, got %q (in=%q)", cmd, cmdIn)
+	}
+}
+
+

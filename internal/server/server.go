@@ -130,6 +130,21 @@ func (o Options) applySettingsToRuntime(settings map[string]any) {
 	if v, ok := settings["debug_shell_args"].(bool); ok {
 		toolcall.ConfigureDebugShellArgs(v)
 	}
+	// Codex PowerShell rules inject + optional bash-dialect guard.
+	// Missing keys leave the previous runtime value (hot-reload patches are partial).
+	rules := toolcall.CodexPowerShellRulesEnabled()
+	guard := toolcall.CodexPowerShellGuardEnabled()
+	if v, ok := settings["codex_powershell_rules"].(bool); ok {
+		rules = v
+	}
+	if v, ok := settings["codex_powershell_guard"].(bool); ok {
+		guard = v
+	}
+	if _, okR := settings["codex_powershell_rules"].(bool); okR {
+		toolcall.ConfigureCodexShellPolicy(rules, guard)
+	} else if _, okG := settings["codex_powershell_guard"].(bool); okG {
+		toolcall.ConfigureCodexShellPolicy(rules, guard)
+	}
 }
 
 func applyHistoryCompactSettings(settings map[string]any) {
