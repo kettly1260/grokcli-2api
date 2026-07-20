@@ -124,7 +124,8 @@ start_registration_sidecar() {
   # `docker logs` look empty when every batch job failed).
   (
     cd /app
-    exec python scripts/registration_service.py
+    export PYTHONDONTWRITEBYTECODE=1
+    exec python3 -B scripts/registration_service.py
   ) > >(tee -a /app/turnstile-solver/logs/registration_sidecar.log) 2>&1 &
   reg_pid=$!
   echo "${reg_pid}" > /app/turnstile-solver/logs/registration_sidecar.pid
