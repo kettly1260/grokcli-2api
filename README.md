@@ -123,7 +123,7 @@ TURNSTILE_THREAD=3 GROK2API_REG_CONCURRENCY=3 docker compose up -d --build
 | `GROK2API_CAPTCHA_PROVIDER` | `local` | `local`（容器内联）/ `yescaptcha` |
 | `GROK2API_INLINE_SOLVER` | `1` | `1` 时入口脚本在主容器内启动过盾 |
 | `GROK2API_REG_CONCURRENCY` | `3` | 协议注册默认并发 |
-| `GROK2API_REG_GLOBAL_INFLIGHT` | `6` | 跨批次全局同时注册上限 |
+| UI / API `concurrency` | `2` | 用户自定义并发，不设本地/全局硬上限；高值仅显示资源风险警告 |
 | `GROK2API_REG_TTL_SEC` | `259200`（72h） | 注册批次/会话 Redis TTL（大批量可调高） |
 | `GROK2API_REG_WATCHDOG_SEC` | `45` | 运行中自愈扫描间隔 |
 | `GROK2API_SSO_DEVICE_RETRIES` | `6` | device-flow 限流重试次数 |

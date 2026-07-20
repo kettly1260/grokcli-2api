@@ -1070,8 +1070,17 @@ func sanitizeShellDialectArtifacts(s string) string {
 	if s == "" {
 		return s
 	}
-	// bash quote glue → plain single quote. Longest patterns first so
-	// LiteralPath '\''path'\''' collapses to 'path' (not 'path'').
+	// FIRST: rewrite python -c with bash quote-glue into a PS-safe form.
+	// Blind glue strip turns:
+	//   python -c 'p=Path(r'\''x'\'')'
+	// into the broken:
+	//   python -c 'p=Path(r'x')'   (outer single quote closes early)
+	// so we must resolve the python source first, then wrap with double quotes.
+	if fixed, ok := rewritePythonCBashGlueForPS(s); ok {
+		s = fixed
+	}
+	// bash quote glue -> plain single quote (for pure PS cmdlets / paths).
+	// Longest patterns first so LiteralPath '\''path'\''' collapses to 'path'.
 	// Live Codex: Set-Location -LiteralPath '\''G:\LLM\rehab'\'''
 	for {
 		before := s
@@ -1084,7 +1093,7 @@ func sanitizeShellDialectArtifacts(s string) string {
 			break
 		}
 	}
-	// Recover lone CR (not CRLF) → backslash + 'r' so paths like G:\LLM\rehab survive.
+	// Recover lone CR (not CRLF) -> backslash + 'r' so paths like G:\LLM\rehab survive.
 	if strings.ContainsRune(s, '\r') {
 		var b strings.Builder
 		b.Grow(len(s) + 8)
@@ -1103,6 +1112,144 @@ func sanitizeShellDialectArtifacts(s string) string {
 	}
 	s = stripFakePSArrayJoinPrefix(s)
 	return s
+}
+
+// rewritePythonCBashGlueForPS rewrites short python -c / python3 -c / py -3 -c
+// invocations that embed bash quote-glue inside a single-quoted script, into a
+// PowerShell-safe double-quoted form with resolved Python source.
+//
+// Example (live log):
+//
+//	python -c 'from pathlib import Path; p=Path(r'\''static/admin/settings.html'\''); print(p.exists())'
+//
+// becomes:
+//
+//	python -c "from pathlib import Path; p=Path(r'static/admin/settings.html'); print(p.exists())"
+//
+// Only rewrites when bash glue is present. Leaves complex multi-statement cmds alone
+// if no clear single -c payload is found. PS dialect only (caller-gated).
+func rewritePythonCBashGlueForPS(s string) (string, bool) {
+	if s == "" {
+		return s, false
+	}
+	if !strings.Contains(s, `'\''`) && !strings.Contains(s, `'"'"'`) {
+		return s, false
+	}
+	low := strings.ToLower(s)
+	// Find a python -c / python3 -c / py -3 -c occurrence.
+	type hit struct{ start, cEnd int } // start of "python", end after "-c"
+	var hits []hit
+	for _, needle := range []string{"python3 -c", "python -c", "py -3 -c"} {
+		from := 0
+		for {
+			i := strings.Index(low[from:], needle)
+			if i < 0 {
+				break
+			}
+			abs := from + i
+			// word boundary-ish: start or non-alnum before
+			if abs > 0 {
+				prev := low[abs-1]
+				if (prev >= 'a' && prev <= 'z') || (prev >= '0' && prev <= '9') || prev == '_' {
+					from = abs + 1
+					continue
+				}
+			}
+			hits = append(hits, hit{start: abs, cEnd: abs + len(needle)})
+			from = abs + len(needle)
+		}
+	}
+	if len(hits) == 0 {
+		return s, false
+	}
+	// Prefer the first hit; rewrite one payload (models almost always emit one).
+	h := hits[0]
+	// Skip whitespace after -c
+	i := h.cEnd
+	for i < len(s) && (s[i] == ' ' || s[i] == '\t') {
+		i++
+	}
+	if i >= len(s) || s[i] != '\'' {
+		// Only handle outer single-quoted -c scripts (the glue pattern).
+		return s, false
+	}
+	// Parse bash single-quoted string with glue -> Python source body.
+	body, end, ok := parseBashSingleQuotedWithGlue(s, i)
+	if !ok {
+		return s, false
+	}
+	// Refuse huge bodies — prefer temp script (guard will still catch if glue remains).
+	if len(body) > 400 {
+		return s, false
+	}
+	// Rebuild: prefix + python -c "escaped body" + suffix
+	prefix := s[:h.start]
+	// Keep original python token casing from s[h.start:h.cEnd]
+	pyTok := s[h.start:h.cEnd]
+	// PowerShell double-quoted expands $var — escape $ as `$ for safety when present.
+	wrapped := pyTok + " " + quotePythonCForPS(body)
+	suffix := s[end:]
+	out := prefix + wrapped + suffix
+	if out == s {
+		return s, false
+	}
+	return out, true
+}
+
+// parseBashSingleQuotedWithGlue parses a bash-style single-quoted string starting at
+// openIdx (must be a single quote). Returns the unescaped body, index after the closing
+// quote, and ok. Understands bash quote-glue as embedding a single quote.
+func parseBashSingleQuotedWithGlue(s string, openIdx int) (body string, end int, ok bool) {
+	if openIdx >= len(s) || s[openIdx] != '\'' {
+		return "", openIdx, false
+	}
+	var b strings.Builder
+	i := openIdx + 1
+	for i < len(s) {
+		// bash glue: quote-backslash-quote-quote embeds one single quote
+		if i+3 < len(s) && s[i] == '\'' && s[i+1] == '\\' && s[i+2] == '\'' && s[i+3] == '\'' {
+			b.WriteByte('\'')
+			i += 4
+			continue
+		}
+		// bash glue: quote-dquote-quote-dquote-quote embeds one single quote
+		if i+4 < len(s) && s[i] == '\'' && s[i+1] == '"' && s[i+2] == '\'' && s[i+3] == '"' && s[i+4] == '\'' {
+			b.WriteByte('\'')
+			i += 5
+			continue
+		}
+		// closing quote (not glue)
+		if s[i] == '\'' {
+			return b.String(), i + 1, true
+		}
+		b.WriteByte(s[i])
+		i++
+	}
+	return "", openIdx, false
+}
+
+// quotePythonCForPS wraps a resolved Python -c body for PowerShell.
+// Prefers double quotes; escapes ", $, and backtick for PS double-quoted strings.
+func quotePythonCForPS(body string) string {
+	var b strings.Builder
+	b.WriteByte('"')
+	for i := 0; i < len(body); i++ {
+		c := body[i]
+		switch c {
+		case '"', '$', '`':
+			b.WriteByte('`')
+			b.WriteByte(c)
+		case '\n':
+			// real newline inside -c is rare; use PS backtick-n escape
+			b.WriteString("`n")
+		case '\r':
+			// skip bare CR
+		default:
+			b.WriteByte(c)
+		}
+	}
+	b.WriteByte('"')
+	return b.String()
 }
 
 // stripFakePSArrayJoinPrefix removes a model anti-pattern seen in Codex Desktop
@@ -3405,11 +3552,15 @@ REQUIRED:
 - Multi-line file content: Set-Content first line, then Add-Content for each next line
   (or use apply_patch). Do NOT put multi-line bodies in one -Value string.
 - Arrays: -Value @( 'a', 'b' ) - never quote the whole array: -Value '@(...)' is a STRING.
+- Quoted exe/script paths MUST use the call operator: & 'C:\Program Files\...\pwsh.exe' -NoProfile ...
+  Bare 'path\to\exe' -arg is a STRING, not a command (ParserError: Unexpected token '-arg').
+- Prefer native cmdlets over nesting another pwsh/powershell -Command (you are already in PS).
 FORBIDDEN:
 - bash-only: tail/grep/sed/awk/xargs/rm -rf / $(...) / bash && chains
 - bash quote escape sequences ('\'' or '"'"') anywhere in cmd - PowerShell uses '' inside '...'
 - multiline or heavily quoted python -c (one short expression max)
-- wrapping already-PowerShell cmd in another powershell -Command
+- wrapping already-PowerShell cmd in another powershell/pwsh -Command
+- bare quoted executable without call operator: 'C:\Program Files\...\app.exe' -Flag  (use & '...' -Flag)
 - fake multi-cmd arrays: do NOT write [ "cmd1", "cmd2" ] -join (newline) | Out-Null; emit real PS statements separated by ;
 - over-quoted arrays: -Value '@('a','b')' or -Value "@(...)"  (quotes make a string, not @())
 - broken here-strings: -Value '@  or -Value "@ without a proper @'...'@ / @"..."@ pair

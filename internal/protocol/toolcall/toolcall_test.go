@@ -1823,6 +1823,13 @@ func TestHardRulesMentionArrayAndHereString(t *testing.T) {
 	if !strings.Contains(CodexPowerShellHardRules, "backtick-n") {
 		t.Fatalf("hard rules missing backtick-n guidance")
 	}
+	// Live Codex: bare 'C:\Program Files\...\pwsh.exe' -NoProfile → Unexpected token.
+	if !strings.Contains(CodexPowerShellHardRules, "call operator") {
+		t.Fatalf("hard rules missing call-operator guidance for quoted exe paths")
+	}
+	if !strings.Contains(CodexPowerShellHardRules, "& '") {
+		t.Fatalf("hard rules missing & 'path' example")
+	}
 }
 
 func TestStripFakePSArrayJoinPrefix(t *testing.T) {
@@ -1884,5 +1891,75 @@ func TestStripFakePSArrayJoinPrefix(t *testing.T) {
 	cast2 := `[pscustomobject]@{a=1} | ConvertTo-Json`
 	if g := sanitizeShellDialectArtifacts(cast2); strings.TrimSpace(g) == "" || !strings.Contains(g, "pscustomobject") {
 		t.Fatalf("pscustomobject damaged: %q", g)
+	}
+}
+
+func TestRewritePythonCBashGlueForPS(t *testing.T) {
+	// Live gateway log: bash-joined python -c with '\'' glue inside single-quoted -c.
+	// Blind strip produced: python -c '...Path(r'path')...' which closes the outer quote early.
+	raw := `python -c 'from pathlib import Path; p=Path(r'\''static/admin/settings.html'\''); print(p.exists(), p.stat().st_size)'`
+	got := sanitizeShellDialectArtifacts(raw)
+	if strings.Contains(got, `'\''`) {
+		t.Fatalf("bash glue remains after sanitize: %q", got)
+	}
+	// Outer -c must be double-quoted for PowerShell; inner path keeps single quotes.
+	if !strings.Contains(got, `python -c "`) {
+		t.Fatalf("expected double-quoted -c payload: %q", got)
+	}
+	if !strings.Contains(got, `Path(r'static/admin/settings.html')`) {
+		t.Fatalf("expected resolved Path(r'...'): %q", got)
+	}
+	if strings.Contains(got, `python -c '`) {
+		t.Fatalf("outer single-quoted -c should have been rewritten: %q", got)
+	}
+	fixed, ok := rewritePythonCBashGlueForPS(raw)
+	if !ok {
+		t.Fatalf("rewritePythonCBashGlueForPS returned !ok for live case")
+	}
+	if !strings.Contains(fixed, `Path(r'static/admin/settings.html')`) {
+		t.Fatalf("helper rewrite unexpected: %q", fixed)
+	}
+
+	// Pure PS path glue still strips (non-python)
+	pathRaw := `Set-Location -LiteralPath '\''G:\LLM\rehab'\'''`
+	pathGot := sanitizeShellDialectArtifacts(pathRaw)
+	wantPath := `Set-Location -LiteralPath 'G:\LLM\rehab'`
+	if pathGot != wantPath {
+		t.Fatalf("path glue strip:\n got %q\nwant %q", pathGot, wantPath)
+	}
+
+	// Projection end-to-end under PowerShell dialect
+	prevR, prevG, prevU, prevW := CodexPowerShellRulesEnabled(), CodexPowerShellGuardEnabled(), CodexPowerShellUnwrapEnabled(), CodexPowerShellWriteSafeEnabled()
+	t.Cleanup(func() { ConfigureCodexShellPolicy(prevR, prevG, prevU, prevW) })
+	ConfigureCodexShellPolicy(false, false, false, false)
+	payload, err := json.Marshal(map[string]any{"command": raw})
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := ProjectShellArgsForClient(string(payload), "exec_command", "cmd")
+	var obj map[string]any
+	if err := json.Unmarshal([]byte(out), &obj); err != nil {
+		t.Fatalf("json: %v %s", err, out)
+	}
+	cmd, _ := obj["cmd"].(string)
+	if strings.Contains(cmd, `'\''`) {
+		t.Fatalf("projected glue remains: %q", cmd)
+	}
+	if !strings.Contains(cmd, `Path(r'static/admin/settings.html')`) {
+		t.Fatalf("projected missing resolved path: %q", cmd)
+	}
+	if strings.Contains(cmd, `python -c '`) {
+		t.Fatalf("projected still single-quoted -c: %q", cmd)
+	}
+
+	// POSIX / Linux CLI must preserve bash glue
+	out2 := ProjectShellArgsForClient(string(payload), "shell", "command")
+	var obj2 map[string]any
+	if err := json.Unmarshal([]byte(out2), &obj2); err != nil {
+		t.Fatal(err)
+	}
+	cmd2, _ := obj2["command"].(string)
+	if !strings.Contains(cmd2, `'\''`) {
+		t.Fatalf("POSIX must preserve bash quote-glue in python -c, got %q", cmd2)
 	}
 }

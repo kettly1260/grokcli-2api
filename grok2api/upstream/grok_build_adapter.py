@@ -59,19 +59,9 @@ LOCAL_SOLVER_URL = (
     or "http://127.0.0.1:5072"
 ).strip().rstrip("/")
 
-# Hard cap for multi-thread registration concurrency only (YesCaptcha + xAI rate limits).
-# Batch count is intentionally uncapped — only concurrency bounds parallelism.
-# Keep low: each local-captcha worker can wait on Camoufox; 5+ browsers OOM.
-MAX_CONCURRENCY = int(os.environ.get("GROK2API_REG_MAX_CONCURRENCY", "4") or 4)
+# Compatibility fallback for callers that omit ``concurrency``. Explicit user
+# values are not capped here; the UI warns about resource-heavy values instead.
 DEFAULT_CONCURRENCY = int(os.environ.get("GROK2API_REG_CONCURRENCY", "2") or 2)
-# Hard cap when captcha_provider=local (Camoufox is ~200–400MB per browser).
-try:
-    LOCAL_CAPTCHA_MAX_CONCURRENCY = max(
-        1,
-        min(4, int(os.environ.get("GROK2API_REG_LOCAL_CONCURRENCY", "2") or 2)),
-    )
-except (TypeError, ValueError):
-    LOCAL_CAPTCHA_MAX_CONCURRENCY = 2
 
 # When captcha_provider=local, registration must wait for the inline Turnstile
 # Solver HTTP to answer before spawning workers. Prevents "already running but
@@ -94,19 +84,6 @@ _active_batch_runners: dict[str, bool] = {}
 # Local captcha solver is process-local and can collapse under fan-out; serialize
 # the createTask/getTaskResult handshake across registration workers.
 _local_captcha_lock = threading.RLock()
-# Cross-batch in-flight registration jobs (3 open batches * 8 workers used to
-# stampede local Camoufox + xAI device-flow). Cap total concurrent registrations.
-try:
-    _GLOBAL_REG_INFLIGHT_MAX = max(
-        1,
-        min(
-            8,
-            int(os.environ.get("GROK2API_REG_GLOBAL_INFLIGHT", "3") or 3),
-        ),
-    )
-except (TypeError, ValueError):
-    _GLOBAL_REG_INFLIGHT_MAX = 6
-_global_reg_inflight = threading.Semaphore(_GLOBAL_REG_INFLIGHT_MAX)
 # Soft rate-limit signal: after device-flow / captcha storms, temporarily reduce
 # new job admission without killing already-running workers.
 _reg_soft_pause_until = 0.0
@@ -139,7 +116,7 @@ def _note_reg_pressure(reason: str = "", *, pause_sec: float | None = None) -> N
 
 
 def _wait_reg_admission(*, check_cancel=None) -> None:
-    """Block until global inflight slot is free and soft-pause window ends."""
+    """Wait out a temporary upstream soft-pause without capping concurrency."""
     while True:
         if check_cancel is not None:
             try:
@@ -151,17 +128,11 @@ def _wait_reg_admission(*, check_cancel=None) -> None:
         if wait > 0:
             time.sleep(min(1.0, wait))
             continue
-        # non-blocking try then short sleep to stay cancel-friendly
-        if _global_reg_inflight.acquire(blocking=False):
-            return
-        time.sleep(0.15)
+        return
 
 
 def _release_reg_admission() -> None:
-    try:
-        _global_reg_inflight.release()
-    except Exception:
-        pass
+    """Compatibility no-op: admission is no longer semaphore-capped."""
 
 
 def _release_reg_admission_once(flag: dict[str, bool]) -> None:
@@ -1929,11 +1900,10 @@ def start_registration(
         )
     except (TypeError, ValueError):
         workers = DEFAULT_CONCURRENCY
-    workers = max(1, min(workers, MAX_CONCURRENCY, n))
-    # Local Camoufox: never run more parallel registrations than local solver
-    # can safely host (each browser ≈ hundreds of MB).
-    if provider == "local":
-        workers = max(1, min(workers, LOCAL_CAPTCHA_MAX_CONCURRENCY, n))
+    # Respect the requested value exactly, apart from the natural batch-size
+    # bound. Local Camoufox resource risk is communicated by the UI, not hidden
+    # behind a backend clamp.
+    workers = max(1, min(workers, n))
 
     try:
         stagger = int(stagger_ms if stagger_ms is not None else 400)
@@ -2256,21 +2226,7 @@ def _spawn_batch_runner(
         f"source={resolved.get('source')} pool={len(proxy_pool)} strategy={proxy_strat}",
         flush=True,
     )
-    workers = max(1, min(int(concurrency or DEFAULT_CONCURRENCY), MAX_CONCURRENCY, remaining))
-    # captcha_provider may be passed in kwargs path; prefer batch reg_config.
-    try:
-        prov = str(captcha_provider or "").strip().lower()
-    except Exception:
-        prov = ""
-    if not prov:
-        try:
-            with _lock:
-                bb = _batches.get(str(batch_id or "")) or {}
-            prov = str((bb.get("reg_config") or {}).get("captcha_provider") or "").lower()
-        except Exception:
-            prov = ""
-    if prov == "local" or (not prov and str(os.environ.get("GROK2API_CAPTCHA_PROVIDER") or os.environ.get("CAPTCHA_PROVIDER") or "local").lower() == "local"):
-        workers = max(1, min(workers, LOCAL_CAPTCHA_MAX_CONCURRENCY, remaining))
+    workers = max(1, min(int(concurrency or DEFAULT_CONCURRENCY), remaining))
     stagger = max(0, min(int(stagger_ms or 400), 10_000))
 
     with _lock:
@@ -2335,9 +2291,9 @@ def _spawn_batch_runner(
         next_i = 1
         in_flight: dict[Any, int] = {}
         prefetch = max(0, min(int(REG_PREFETCH_SLOTS), max(0, workers)))
-        # Never queue more work than global admission + local captcha can take.
-        # Prefetch used to create extra mailboxes/sessions that pile up in RAM.
-        max_inflight = max(1, min(workers + prefetch, _GLOBAL_REG_INFLIGHT_MAX, workers + 1))
+        # Prefetch may prepare a small number of jobs beyond the running worker
+        # count, but it must not silently lower the user-selected concurrency.
+        max_inflight = max(1, workers + prefetch)
 
         def _batch_cancel_requested() -> bool:
             with _lock:
@@ -4507,14 +4463,7 @@ def resume_registration_batch(
     key = str(cfg.get("yescaptcha_key") or "").strip()
     proxy = str(cfg.get("proxy") or "").strip()
     workers = int(cfg.get("concurrency") or batch.get("concurrency") or DEFAULT_CONCURRENCY)
-    # Local captcha is the bottleneck; when resuming after restart, prefer a
-    # safer concurrency so multiple auto-resumed batches don't thrash Camoufox.
-    if provider == "local":
-        try:
-            local_cap = int(os.environ.get("GROK2API_REG_LOCAL_CONCURRENCY", "3") or 3)
-        except (TypeError, ValueError):
-            local_cap = 3
-        workers = max(1, min(workers, max(1, local_cap)))
+    workers = max(1, min(workers, remaining))
     stagger = int(cfg.get("stagger_ms") or batch.get("stagger_ms") or 400)
     # Spread job starts a bit more under pressure.
     try:
