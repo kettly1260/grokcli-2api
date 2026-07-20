@@ -31,7 +31,7 @@ ROOT = Path(__file__).resolve().parents[2]
 GBA = ROOT / "grok-build-auth"
 DATA_DIR = ROOT / "data"
 REGISTER_SSO_DIR = DATA_DIR / "register_sso"
-ADAPTER_BUILD = "v1.9.94-reg-px-pass-harden"
+ADAPTER_BUILD = "v2.0.3-reg-px-strict"
 # Newly registered accounts often need a short settle window before probe.
 REGISTER_PROBE_DELAY_SEC = float(
     os.environ.get("GROK2API_REG_PROBE_DELAY_SEC", "30") or 30
@@ -1457,18 +1457,41 @@ def _proxy_url() -> str:
             return ""
 
 
+def _mask_reg_proxy(url: str | None) -> str:
+    """Mask credentials for logs / UI (never log raw passwords)."""
+    s = (url or "").strip()
+    if not s:
+        return "DIRECT"
+    try:
+        from grok2api.upstream.proxy_pool import _mask_proxy_url
+
+        return _mask_proxy_url(s) or "DIRECT"
+    except Exception:
+        if "@" in s:
+            try:
+                scheme, rest = s.split("://", 1) if "://" in s else ("", s)
+                cred, host = rest.rsplit("@", 1)
+                user = cred.split(":", 1)[0]
+                prefix = f"{scheme}://" if scheme else ""
+                return f"{prefix}{user}:***@{host}"
+            except Exception:
+                pass
+        return s[:64]
+
+
 def _proxy_pool(
     proxy_text: str | None = None,
     *,
     username: str | None = None,
     password: str | None = None,
+    allow_fallback: bool = True,
 ) -> list[str]:
     """Parse multi-line proxy text into full proxy URLs.
 
     Preference:
       1) explicit proxy_text (+ optional user/pass)
-      2) env / outbound_proxy_config pool
-      3) auto-discovered peer proxy (privoxy etc.)
+      2) env / outbound_proxy_config pool  (only when allow_fallback)
+      3) auto-discovered peer proxy (privoxy etc.)  (only when allow_fallback)
     """
     try:
         from grok2api.upstream.proxy_pool import (
@@ -1477,14 +1500,19 @@ def _proxy_pool(
             first_working_proxy,
         )
 
+        # When the registration form supplied text, never mix env fallback into
+        # the parse — invalid lines must surface as empty, not silent env hits.
+        has_explicit = bool((proxy_text or "").strip())
         pool = parse_proxy_pool(
             proxy_text,
             username=username,
             password=password,
-            fallback_env=True,
+            fallback_env=bool(allow_fallback and not has_explicit),
         )
         if pool:
             return pool
+        if not allow_fallback or has_explicit:
+            return []
         # When registration form proxy is empty, reuse outbound pool text/auth.
         src = get_outbound_proxy_source() or {}
         if src.get("enabled", True):
@@ -1502,10 +1530,99 @@ def _proxy_pool(
         if auto:
             return [auto]
     except Exception:
-        pass
+        if not allow_fallback:
+            return []
     # Fallback: treat as single proxy via classic normalizer.
-    one = (proxy_text or "").strip() or _proxy_url()
+    one = (proxy_text or "").strip() or (_proxy_url() if allow_fallback else "")
     return [one] if one else []
+
+
+def _resolve_registration_proxy_pool(
+    proxy_text: str | None = None,
+    *,
+    username: str | None = None,
+    password: str | None = None,
+) -> dict[str, Any]:
+    """Build the registration proxy pool with strict-mode guardrails.
+
+    If the admin form (or request body) has non-empty proxy lines that all fail
+    to parse, refuse silent DIRECT / outbound fallback so misconfigured pools
+    cannot look "successful" while never hitting the proxy server.
+    """
+    try:
+        from grok2api.upstream.proxy_pool import split_proxy_text, validate_proxy_pool
+    except Exception:
+        split_proxy_text = None  # type: ignore[assignment]
+        validate_proxy_pool = None  # type: ignore[assignment]
+
+    raw = (proxy_text or "").strip()
+    lines: list[str] = []
+    if split_proxy_text is not None:
+        try:
+            lines = list(split_proxy_text(raw) or [])
+        except Exception:
+            lines = [ln for ln in raw.replace("\r", "\n").split("\n") if ln.strip() and not ln.strip().startswith("#")]
+    elif raw:
+        lines = [ln for ln in raw.replace("\r", "\n").split("\n") if ln.strip() and not ln.strip().startswith("#")]
+
+    if lines:
+        pool = _proxy_pool(
+            proxy_text,
+            username=username,
+            password=password,
+            allow_fallback=False,
+        )
+        if not pool:
+            detail: dict[str, Any] = {}
+            if validate_proxy_pool is not None:
+                try:
+                    detail = validate_proxy_pool(
+                        proxy_text,
+                        username=username,
+                        password=password,
+                        fallback_env=False,
+                    )
+                except Exception as e:  # noqa: BLE001
+                    detail = {"errors": [{"error": str(e)[:200]}]}
+            err_bits = []
+            for e in (detail.get("errors") or [])[:3]:
+                if isinstance(e, dict):
+                    err_bits.append(
+                        f"line {e.get('line')}: {e.get('error') or e.get('raw') or '?'}"
+                    )
+            hint = ("; ".join(err_bits) if err_bits else "check host:port / scheme format")
+            return {
+                "ok": False,
+                "pool": [],
+                "source": "registration_config",
+                "raw_line_count": len(lines),
+                "error": (
+                    f"代理已填写 {len(lines)} 行但全部解析失败，拒绝静默直连。"
+                    f" 请修正代理格式或先点「测试代理」。详情: {hint}"
+                ),
+                "proxy_validation": detail,
+            }
+        return {
+            "ok": True,
+            "pool": pool,
+            "source": "registration_config",
+            "raw_line_count": len(lines),
+        }
+
+    # Empty form proxy: allow outbound / env / auto discovery (may still be DIRECT).
+    pool = _proxy_pool(
+        None,
+        username=username,
+        password=password,
+        allow_fallback=True,
+    )
+    source = "outbound_or_env" if pool else "direct"
+    return {
+        "ok": True,
+        "pool": pool,
+        "source": source,
+        "raw_line_count": 0,
+    }
 
 
 def _pick_proxy_from_pool(
@@ -1575,13 +1692,14 @@ def _prepare_registration_session(
         "updated_at": _now(),
         "email": email,
         "password": password,
-        "message": f"queued; email={email}",
+        "message": f"queued; email={email}; proxy={_mask_reg_proxy(proxy)}",
         "sso": None,
         "oauth": None,
         "auth_json": None,
         "error": None,
         "yescaptcha_key": yescaptcha_key,
         "proxy": proxy or None,
+        "proxy_mode": _mask_reg_proxy(proxy),
         "adapter_build": ADAPTER_BUILD,
         "batch_id": batch_id,
         "batch_index": batch_index,
@@ -1639,8 +1757,12 @@ def _start_one_registration(
         return {"ok": False, "error": "registration session prepare failed"}
     with _lock:
         if sid in _sessions:
+            pm = _mask_reg_proxy(_sessions[sid].get("proxy") or proxy)
             _sessions[sid]["status"] = "started"
-            _sessions[sid]["message"] = f"started; email={_sessions[sid].get('email') or ''}"
+            _sessions[sid]["message"] = (
+                f"started; email={_sessions[sid].get('email') or ''}; proxy={pm}"
+            )
+            _sessions[sid]["proxy_mode"] = pm
             _sessions[sid]["updated_at"] = _now()
             _mirror_reg_sess(sid, _sessions[sid])
     # Single-job starts are not covered by the batch finalizer — log "running"
@@ -1820,17 +1942,35 @@ def start_registration(
     stagger = max(0, min(stagger, 10_000))
 
     # Build proxy pool once; each job picks one URL (rotation / random / sticky).
-    proxy_pool = _proxy_pool(
+    # Strict: non-empty form text that yields empty pool → refuse silent DIRECT.
+    resolved = _resolve_registration_proxy_pool(
         proxy,
         username=proxy_username,
         password=proxy_password,
     )
+    if not resolved.get("ok"):
+        return {
+            "ok": False,
+            "error": resolved.get("error") or "proxy pool invalid",
+            "proxy_source": resolved.get("source"),
+            "proxy_validation": resolved.get("proxy_validation"),
+            "adapter_build": ADAPTER_BUILD,
+        }
+    proxy_pool = list(resolved.get("pool") or [])
+    proxy_source = str(resolved.get("source") or "direct")
     try:
         from grok2api.config import XAI_PROXY_STRATEGY as _default_strat
     except Exception:
         _default_strat = "round_robin"
     proxy_strat = (proxy_strategy or _default_strat or "round_robin").strip().lower()
     proxy_val = _pick_proxy_from_pool(proxy_pool, strategy=proxy_strat, index=0)
+    proxy_mode = _mask_reg_proxy(proxy_val)
+    print(
+        f"[grok-build-auth] start_registration proxy_mode={proxy_mode} "
+        f"source={proxy_source} pool={len(proxy_pool)} strategy={proxy_strat} "
+        f"count={n} concurrency={workers} adapter={ADAPTER_BUILD}",
+        flush=True,
+    )
     mail_prov, mail_key, mail_base, mail_dom = _resolve_mail_credentials(
         mail_provider=mail_provider,
         moemail_api_key=moemail_api_key,
@@ -1843,7 +1983,7 @@ def start_registration(
 
     # Single job — keep original response shape for UI compatibility.
     if n == 1:
-        return _start_one_registration(
+        result = _start_one_registration(
             yescaptcha_key=key,
             proxy=proxy_val,
             moemail_api_key=moemail_api_key,
@@ -1853,6 +1993,12 @@ def start_registration(
             expiry_ms=expiry_ms,
             mail_provider=mail_prov,
         )
+        if isinstance(result, dict):
+            result.setdefault("proxy_mode", proxy_mode)
+            result.setdefault("proxy_source", proxy_source)
+            result.setdefault("proxy_pool_count", len(proxy_pool))
+            result.setdefault("adapter_build", ADAPTER_BUILD)
+        return result
 
     batch_id = f"batch_{uuid.uuid4().hex[:12]}"
     # Snapshot keeps the full multi-line text so resume / UI can re-parse the pool.
@@ -1872,6 +2018,8 @@ def start_registration(
     )
     reg_cfg["proxy_strategy"] = proxy_strat
     reg_cfg["proxy_pool_count"] = len(proxy_pool)
+    reg_cfg["proxy_source"] = proxy_source
+    reg_cfg["proxy_mode_preview"] = proxy_mode
     batch = {
         "id": batch_id,
         "status": "running",
@@ -1882,7 +2030,10 @@ def start_registration(
         "stagger_ms": stagger,
         "session_ids": [],
         "adapter_build": ADAPTER_BUILD,
-        "message": f"batch started count={n} concurrency={workers}",
+        "message": (
+            f"batch started count={n} concurrency={workers} "
+            f"proxy={proxy_mode} source={proxy_source} pool={len(proxy_pool)}"
+        ),
         "error": None,
         "finished": 0,
         "ok_count": 0,
@@ -1900,7 +2051,10 @@ def start_registration(
     # session finishes (previously only the terminal row was written).
     _record_register_task(
         task_id=batch_id,
-        summary=f"协议注册批次启动 count={n} concurrency={workers}",
+        summary=(
+            f"协议注册批次启动 count={n} concurrency={workers} "
+            f"proxy={proxy_mode}"
+        ),
         status="running",
         ok=None,
         progress_done=0,
@@ -1913,6 +2067,10 @@ def start_registration(
             "stagger_ms": stagger,
             "phase": "started",
             "adapter_build": ADAPTER_BUILD,
+            "proxy_mode": proxy_mode,
+            "proxy_source": proxy_source,
+            "proxy_pool_count": len(proxy_pool),
+            "proxy_strategy": proxy_strat,
         },
     )
 
@@ -1953,9 +2111,13 @@ def start_registration(
         "session_ids": sids,
         "sessions": sessions,
         "adapter_build": ADAPTER_BUILD,
+        "proxy_mode": proxy_mode,
+        "proxy_source": proxy_source,
+        "proxy_pool_count": len(proxy_pool),
         "message": (
             f"batch started: count={n}, threads={workers} "
-            f"(in-flight cap), queued/started={len(sids)}"
+            f"(in-flight cap), queued/started={len(sids)}, "
+            f"proxy={proxy_mode} source={proxy_source}"
         ),
         # Back-compat: first session fields for old UI single-session path.
         **(sessions[0] if sessions else {"id": None, "status": "starting"}),
@@ -2065,13 +2227,35 @@ def _spawn_batch_runner(
             os.environ.pop(k, None)
 
     # `proxy` may be multi-line pool text; expand once for this runner.
-    proxy_pool = _proxy_pool(proxy)
+    # Resume/reclaim uses the snapshot text — keep strict parse (no silent DIRECT
+    # when snapshot lines exist but are unusable).
+    resolved = _resolve_registration_proxy_pool(proxy)
+    if not resolved.get("ok"):
+        err = str(resolved.get("error") or "proxy pool invalid")
+        print(f"[grok-build-auth] batch {bid} proxy resolve failed: {err}", flush=True)
+        with _lock:
+            b = _batches.get(bid) or dict(batch)
+            b["status"] = "error"
+            b["error"] = err
+            b["message"] = err
+            b["runner_alive"] = False
+            b["updated_at"] = _now()
+            _batches[bid] = b
+            _mirror_reg_batch(bid, dict(b))
+        return {"ok": False, "error": err, "batch_id": bid}
+    proxy_pool = list(resolved.get("pool") or [])
     try:
         from grok2api.config import XAI_PROXY_STRATEGY as _default_strat
     except Exception:
         _default_strat = "round_robin"
     proxy_strat = (proxy_strategy or _default_strat or "round_robin").strip().lower()
     proxy_snapshot = (proxy or "\n".join(proxy_pool) or "").strip()
+    print(
+        f"[grok-build-auth] batch {bid} proxy_mode="
+        f"{_mask_reg_proxy(_pick_proxy_from_pool(proxy_pool, strategy=proxy_strat, index=0))} "
+        f"source={resolved.get('source')} pool={len(proxy_pool)} strategy={proxy_strat}",
+        flush=True,
+    )
     workers = max(1, min(int(concurrency or DEFAULT_CONCURRENCY), MAX_CONCURRENCY, remaining))
     # captcha_provider may be passed in kwargs path; prefer batch reg_config.
     try:
@@ -2248,6 +2432,11 @@ def _spawn_batch_runner(
             job_proxy = _pick_proxy_from_pool(
                 proxy_pool, strategy=proxy_strat, index=max(0, int(i) - 1)
             )
+            job_proxy_mode = _mask_reg_proxy(job_proxy)
+            print(
+                f"[grok-build-auth] batch {bid} job#{i} proxy_mode={job_proxy_mode}",
+                flush=True,
+            )
             # Small per-slot stagger only (not cumulative across the whole batch).
             delay = (stagger / 1000.0) * ((i - 1) % max(1, workers))
             prepared = _prepare_registration_session(
@@ -2338,10 +2527,13 @@ def _spawn_batch_runner(
                     }
                 receiver = sess.get("_receiver")
                 if sid in _sessions:
+                    pm = _mask_reg_proxy(job_proxy or _sessions[sid].get("proxy"))
                     _sessions[sid]["status"] = "started"
                     _sessions[sid]["message"] = (
-                        f"started; email={_sessions[sid].get('email') or ''}"
+                        f"started; email={_sessions[sid].get('email') or ''}; "
+                        f"proxy={pm}"
                     )
+                    _sessions[sid]["proxy_mode"] = pm
                     _sessions[sid]["updated_at"] = _now()
                     _mirror_reg_sess(sid, _sessions[sid])
             if not sid or receiver is None:
@@ -2873,7 +3065,15 @@ def _run_registration(
         import grok2api.pool.accounts as accounts
         from grok2api.config import UPSTREAM_BASE
 
-        update("registering", "visiting signup page")
+        proxy_mode = _mask_reg_proxy(proxy)
+        update(
+            "registering",
+            f"visiting signup page via proxy={proxy_mode}",
+        )
+        print(
+            f"[grok-build-auth] session {sid} transport proxy_mode={proxy_mode}",
+            flush=True,
+        )
         _check_cancel()
         client = XConsoleAuthClient(
             debug=True,

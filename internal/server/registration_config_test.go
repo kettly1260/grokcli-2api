@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestNormalizeRegistrationConfigDefaults(t *testing.T) {
@@ -35,6 +36,44 @@ func TestSplitProxyLines(t *testing.T) {
 	lines := splitProxyLines("http://a:1\n#c\nhttp://b:2;http://c:3")
 	if len(lines) != 3 {
 		t.Fatalf("lines=%v", lines)
+	}
+}
+
+func TestCanonicalizeRegistrationProxyLine(t *testing.T) {
+	got, err := canonicalizeRegistrationProxyLine("127.0.0.1:18080", "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "http://127.0.0.1:18080" {
+		t.Fatalf("got %q", got)
+	}
+	got, err = canonicalizeRegistrationProxyLine("host:3128:user:pass", "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(got, "user:") || !strings.Contains(got, "@host:3128") {
+		t.Fatalf("shorthand got %q", got)
+	}
+	got, err = canonicalizeRegistrationProxyLine("http://proxy.example:8080", "u", "p")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(got, "u:") || !strings.Contains(got, "@proxy.example:8080") {
+		t.Fatalf("shared auth got %q", got)
+	}
+	if _, err := canonicalizeRegistrationProxyLine("", "", ""); err == nil {
+		t.Fatal("expected empty error")
+	}
+}
+
+func TestProbeRegistrationProxyTCPFail(t *testing.T) {
+	// Unreachable port — must report ok=false (not fake accepted).
+	res := probeRegistrationProxy("http://127.0.0.1:1", "accounts.x.ai:443", 300*time.Millisecond)
+	if truthy(fmt.Sprint(res["ok"])) {
+		t.Fatalf("expected dial fail, got %#v", res)
+	}
+	if res["message"] == "proxy entry accepted" {
+		t.Fatal("must not fake-accept")
 	}
 }
 

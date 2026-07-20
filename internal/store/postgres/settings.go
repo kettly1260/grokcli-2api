@@ -65,6 +65,8 @@ func (c *Connector) PublicSettings(ctx context.Context) (map[string]any, error) 
 		// Codex/Windows: inject short PS hard rules; optional bash-dialect reject.
 		"codex_powershell_rules":        boolSetting(values, "codex_powershell_rules", false),
 		"codex_powershell_guard":        boolSetting(values, "codex_powershell_guard", false),
+		"codex_powershell_unwrap":       boolSetting(values, "codex_powershell_unwrap", false),
+		"codex_powershell_write_safe":   boolSetting(values, "codex_powershell_write_safe", false),
 		"sse_keepalive":                 floatSetting(values, "sse_keepalive", 4),
 		"conversation_affinity_enabled": boolSetting(values, "conversation_affinity_enabled", true),
 		"conversation_affinity_ttl_sec": floatSetting(values, "conversation_affinity_ttl_sec", 7200),
@@ -374,6 +376,8 @@ func (c *Connector) UpdateRuntimeSettings(ctx context.Context, patch map[string]
 		{key: "debug_shell_args", kind: "bool"},
 		{key: "codex_powershell_rules", kind: "bool"},
 		{key: "codex_powershell_guard", kind: "bool"},
+		{key: "codex_powershell_unwrap", kind: "bool"},
+		{key: "codex_powershell_write_safe", kind: "bool"},
 		{key: "sse_keepalive", kind: "float", minF: 2, maxF: 120},
 		{key: "conversation_affinity_enabled", kind: "bool"},
 		{key: "conversation_affinity_ttl_sec", kind: "float", minF: 60, maxF: 86400},

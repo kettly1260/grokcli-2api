@@ -1523,9 +1523,9 @@ func TestSanitizeBashQuoteGlueAndMultiStatement(t *testing.T) {
 		t.Fatalf("parts were re-quoted as tokens: %q", joined)
 	}
 	// Projection end-to-end (guard OFF — sanitize is always-on).
-	prevR, prevG := CodexPowerShellRulesEnabled(), CodexPowerShellGuardEnabled()
-	t.Cleanup(func() { ConfigureCodexShellPolicy(prevR, prevG) })
-	ConfigureCodexShellPolicy(false, false)
+	prevR, prevG, prevU, prevW := CodexPowerShellRulesEnabled(), CodexPowerShellGuardEnabled(), CodexPowerShellUnwrapEnabled(), CodexPowerShellWriteSafeEnabled()
+	t.Cleanup(func() { ConfigureCodexShellPolicy(prevR, prevG, prevU, prevW) })
+	ConfigureCodexShellPolicy(false, false, false, false)
 	payload, err := json.Marshal(map[string]any{"command": parts})
 	if err != nil {
 		t.Fatal(err)
@@ -1550,9 +1550,9 @@ func TestSanitizeBashQuoteGlueAndMultiStatement(t *testing.T) {
 // Linux / bash clients must keep legitimate bash quote-glue. Projection with
 // preferredKey=command (non-Codex) must NOT strip '\”.
 func TestLinuxCLIPreservesBashQuoteGlue(t *testing.T) {
-	prevR, prevG := CodexPowerShellRulesEnabled(), CodexPowerShellGuardEnabled()
-	t.Cleanup(func() { ConfigureCodexShellPolicy(prevR, prevG) })
-	ConfigureCodexShellPolicy(false, false)
+	prevR, prevG, prevU, prevW := CodexPowerShellRulesEnabled(), CodexPowerShellGuardEnabled(), CodexPowerShellUnwrapEnabled(), CodexPowerShellWriteSafeEnabled()
+	t.Cleanup(func() { ConfigureCodexShellPolicy(prevR, prevG, prevU, prevW) })
+	ConfigureCodexShellPolicy(false, false, false, false)
 
 	// Legitimate bash: echo 'it'\''s fine'
 	cmdIn := `echo 'it'\''s fine'`
@@ -1611,17 +1611,17 @@ func TestDetectBashShellDialect(t *testing.T) {
 }
 
 func TestGuardShellCmdForClient(t *testing.T) {
-	prevR, prevG := CodexPowerShellRulesEnabled(), CodexPowerShellGuardEnabled()
-	t.Cleanup(func() { ConfigureCodexShellPolicy(prevR, prevG) })
+	prevR, prevG, prevU, prevW := CodexPowerShellRulesEnabled(), CodexPowerShellGuardEnabled(), CodexPowerShellUnwrapEnabled(), CodexPowerShellWriteSafeEnabled()
+	t.Cleanup(func() { ConfigureCodexShellPolicy(prevR, prevG, prevU, prevW) })
 
-	ConfigureCodexShellPolicy(false, false)
+	ConfigureCodexShellPolicy(false, false, false, false)
 	raw := `echo $(whoami)`
 	out, iss := GuardShellCmdForClient(raw)
 	if iss != nil || out != raw {
 		t.Fatalf("guard off should pass-through: out=%q iss=%v", out, iss)
 	}
 
-	ConfigureCodexShellPolicy(false, true)
+	ConfigureCodexShellPolicy(false, true, false, false)
 	out, iss = GuardShellCmdForClient(raw)
 	if iss == nil || iss.Reason != "bash_command_substitution" {
 		t.Fatalf("guard on: %#v", iss)
@@ -1632,10 +1632,10 @@ func TestGuardShellCmdForClient(t *testing.T) {
 }
 
 func TestInjectCodexPowerShellRules(t *testing.T) {
-	prevR, prevG := CodexPowerShellRulesEnabled(), CodexPowerShellGuardEnabled()
-	t.Cleanup(func() { ConfigureCodexShellPolicy(prevR, prevG) })
+	prevR, prevG, prevU, prevW := CodexPowerShellRulesEnabled(), CodexPowerShellGuardEnabled(), CodexPowerShellUnwrapEnabled(), CodexPowerShellWriteSafeEnabled()
+	t.Cleanup(func() { ConfigureCodexShellPolicy(prevR, prevG, prevU, prevW) })
 
-	ConfigureCodexShellPolicy(true, false)
+	ConfigureCodexShellPolicy(true, false, false, false)
 	body := map[string]any{
 		"instructions": "You are Codex",
 		"messages": []any{
@@ -1659,7 +1659,7 @@ func TestInjectCodexPowerShellRules(t *testing.T) {
 		t.Fatalf("non-codex polluted: %v", body2["instructions"])
 	}
 	// rules off
-	ConfigureCodexShellPolicy(false, false)
+	ConfigureCodexShellPolicy(false, false, false, false)
 	body3 := map[string]any{"instructions": "plain"}
 	InjectCodexPowerShellRules(body3, true)
 	if body3["instructions"] != "plain" {
@@ -1668,9 +1668,9 @@ func TestInjectCodexPowerShellRules(t *testing.T) {
 }
 
 func TestProjectShellArgsGuardRewrites(t *testing.T) {
-	prevR, prevG := CodexPowerShellRulesEnabled(), CodexPowerShellGuardEnabled()
-	t.Cleanup(func() { ConfigureCodexShellPolicy(prevR, prevG) })
-	ConfigureCodexShellPolicy(false, true)
+	prevR, prevG, prevU, prevW := CodexPowerShellRulesEnabled(), CodexPowerShellGuardEnabled(), CodexPowerShellUnwrapEnabled(), CodexPowerShellWriteSafeEnabled()
+	t.Cleanup(func() { ConfigureCodexShellPolicy(prevR, prevG, prevU, prevW) })
+	ConfigureCodexShellPolicy(false, true, false, false)
 	// Command value contains the literal bash quote-glue sequence: backslash-quote glue.
 	cmdIn := "python -c " + `'from pathlib import Path; p=Path(r'''G:/x''')'`
 	payload, err := json.Marshal(map[string]any{"command": cmdIn})
@@ -1685,5 +1685,204 @@ func TestProjectShellArgsGuardRewrites(t *testing.T) {
 	cmd, _ := obj["cmd"].(string)
 	if !strings.Contains(cmd, "Write-Output") || !strings.Contains(cmd, "blocked") {
 		t.Fatalf("expected guard rewrite, got %q (in=%q)", cmd, cmdIn)
+	}
+}
+
+func TestDetectBrokenPSLiterals(t *testing.T) {
+	cases := []struct {
+		cmd    string
+		reason string
+	}{
+		{`Set-Content -Path 'f.py' -Value '@('import sys','print(1)')'`, "overquoted_ps_array"},
+		{`Set-Content -Path 'f' -Value '@`, "broken_here_string"},
+		{"Set-Content -Path 'f' -Value 'line1`nline2'", "backtick_n_single"},
+		// valid double-quoted `n is not flagged by backtick_n_single
+		{"Set-Content -Path 'f' -Value \"line1`nline2\"", ""},
+		// full here-string is ok
+		{"Set-Content -Path 'f' -Value @'\nhello\n'@", ""},
+	}
+	for _, tc := range cases {
+		iss := DetectBashShellDialect(tc.cmd)
+		if tc.reason == "" {
+			if iss != nil {
+				t.Fatalf("cmd %q unexpected issue %#v", tc.cmd, iss)
+			}
+			continue
+		}
+		if iss == nil || iss.Reason != tc.reason {
+			t.Fatalf("cmd %q got %#v want reason %s", tc.cmd, iss, tc.reason)
+		}
+	}
+}
+
+func TestUnwrapOverquotedPSArray(t *testing.T) {
+	prevR, prevG, prevU, prevW := CodexPowerShellRulesEnabled(), CodexPowerShellGuardEnabled(), CodexPowerShellUnwrapEnabled(), CodexPowerShellWriteSafeEnabled()
+	t.Cleanup(func() { ConfigureCodexShellPolicy(prevR, prevG, prevU, prevW) })
+
+	// unwrap OFF — pass through
+	ConfigureCodexShellPolicy(false, false, false, false)
+	in := `Set-Content -Path 'f.py' -Value '@('import sys','print(1)')'`
+	payload, err := json.Marshal(map[string]any{"command": in})
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := ProjectShellArgsForClient(string(payload), "exec_command", "cmd")
+	var obj map[string]any
+	if err := json.Unmarshal([]byte(out), &obj); err != nil {
+		t.Fatal(err)
+	}
+	cmd, _ := obj["cmd"].(string)
+	if !strings.Contains(cmd, `'@(`) {
+		t.Fatalf("unwrap off should keep quotes: %q", cmd)
+	}
+
+	// unwrap ON — strip quotes around @()
+	ConfigureCodexShellPolicy(false, false, true, false)
+	out2 := ProjectShellArgsForClient(string(payload), "exec_command", "cmd")
+	var obj2 map[string]any
+	if err := json.Unmarshal([]byte(out2), &obj2); err != nil {
+		t.Fatal(err)
+	}
+	cmd2, _ := obj2["cmd"].(string)
+	if strings.Contains(cmd2, `'@(`) || strings.Contains(cmd2, `Value '@`) {
+		t.Fatalf("unwrap on should drop outer quotes: %q", cmd2)
+	}
+	if !strings.Contains(cmd2, "@(") {
+		t.Fatalf("expected unwrapped array: %q", cmd2)
+	}
+
+	// Linux / POSIX must not unwrap
+	ConfigureCodexShellPolicy(false, false, true, false)
+	out3 := ProjectShellArgsForClient(string(payload), "shell", "command")
+	var obj3 map[string]any
+	if err := json.Unmarshal([]byte(out3), &obj3); err != nil {
+		t.Fatal(err)
+	}
+	cmd3, _ := obj3["command"].(string)
+	if !strings.Contains(cmd3, `'@(`) {
+		t.Fatalf("POSIX must not unwrap: %q", cmd3)
+	}
+}
+
+func TestWriteSafePSRewrite(t *testing.T) {
+	prevR, prevG, prevU, prevW := CodexPowerShellRulesEnabled(), CodexPowerShellGuardEnabled(), CodexPowerShellUnwrapEnabled(), CodexPowerShellWriteSafeEnabled()
+	t.Cleanup(func() { ConfigureCodexShellPolicy(prevR, prevG, prevU, prevW) })
+
+	in := "Set-Content -Path 'f.txt' -Value \"line1`nline2`nline3\""
+	payload, err := json.Marshal(map[string]any{"command": in})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// write-safe OFF
+	ConfigureCodexShellPolicy(false, false, false, false)
+	out := ProjectShellArgsForClient(string(payload), "exec_command", "cmd")
+	var obj map[string]any
+	if err := json.Unmarshal([]byte(out), &obj); err != nil {
+		t.Fatal(err)
+	}
+	cmd, _ := obj["cmd"].(string)
+	if strings.Contains(cmd, "Add-Content") {
+		t.Fatalf("write-safe off should not rewrite: %q", cmd)
+	}
+
+	// write-safe ON
+	ConfigureCodexShellPolicy(false, false, false, true)
+	out2 := ProjectShellArgsForClient(string(payload), "exec_command", "cmd")
+	var obj2 map[string]any
+	if err := json.Unmarshal([]byte(out2), &obj2); err != nil {
+		t.Fatal(err)
+	}
+	cmd2, _ := obj2["cmd"].(string)
+	if !strings.Contains(cmd2, "Set-Content") || !strings.Contains(cmd2, "Add-Content") {
+		t.Fatalf("write-safe on should chain Add-Content: %q", cmd2)
+	}
+	if !strings.Contains(cmd2, "; ") {
+		t.Fatalf("expected ; join: %q", cmd2)
+	}
+
+	// POSIX unchanged even when write-safe ON
+	out3 := ProjectShellArgsForClient(string(payload), "shell", "command")
+	var obj3 map[string]any
+	if err := json.Unmarshal([]byte(out3), &obj3); err != nil {
+		t.Fatal(err)
+	}
+	cmd3, _ := obj3["command"].(string)
+	if strings.Contains(cmd3, "Add-Content") {
+		t.Fatalf("POSIX must not write-safe rewrite: %q", cmd3)
+	}
+}
+
+func TestHardRulesMentionArrayAndHereString(t *testing.T) {
+	if !strings.Contains(CodexPowerShellHardRules, "Arrays:") {
+		t.Fatalf("hard rules missing array guidance")
+	}
+	if !strings.Contains(CodexPowerShellHardRules, "here-string") {
+		t.Fatalf("hard rules missing here-string guidance")
+	}
+	if !strings.Contains(CodexPowerShellHardRules, "backtick-n") {
+		t.Fatalf("hard rules missing backtick-n guidance")
+	}
+}
+
+func TestStripFakePSArrayJoinPrefix(t *testing.T) {
+	// Live Codex Desktop failure: leading [ "stmts..." ] -join (backtick-n) | Out-Null; real_cmd
+	// causes ParserError: Missing type name after '['.
+	fake := `[ "$wt = 'G:/LLM/rehab/.claude/worktrees/ai-json-rehab-weekly'", "$f = Join-Path $wt 'ai-api.js'" ] -join "` + "`" + `n" | Out-Null; $wt = 'G:/LLM/rehab/.claude/worktrees/ai-json-rehab-weekly'; $f = Join-Path $wt 'ai-api.js'; Write-Output $wt`
+	got := sanitizeShellDialectArtifacts(fake)
+	if strings.HasPrefix(strings.TrimSpace(got), "[") {
+		t.Fatalf("fake array prefix not stripped: %q", got)
+	}
+	if !strings.Contains(got, "$wt = 'G:/LLM/rehab") {
+		t.Fatalf("real cmd lost: %q", got)
+	}
+	if strings.Contains(strings.ToLower(got), "out-null") {
+		t.Fatalf("Out-Null prefix should be gone: %q", got)
+	}
+
+	// Projection end-to-end (PowerShell dialect)
+	prevR, prevG, prevU, prevW := CodexPowerShellRulesEnabled(), CodexPowerShellGuardEnabled(), CodexPowerShellUnwrapEnabled(), CodexPowerShellWriteSafeEnabled()
+	t.Cleanup(func() { ConfigureCodexShellPolicy(prevR, prevG, prevU, prevW) })
+	ConfigureCodexShellPolicy(false, false, false, false)
+	payload, err := json.Marshal(map[string]any{"command": fake})
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := ProjectShellArgsForClient(string(payload), "exec_command", "cmd")
+	var obj map[string]any
+	if err := json.Unmarshal([]byte(out), &obj); err != nil {
+		t.Fatalf("json: %v %s", err, out)
+	}
+	cmd, _ := obj["cmd"].(string)
+	if strings.HasPrefix(strings.TrimSpace(cmd), "[") {
+		t.Fatalf("projected still has array junk: %q", cmd)
+	}
+	if !strings.Contains(cmd, "Write-Output $wt") {
+		t.Fatalf("projected missing real cmd: %q", cmd)
+	}
+
+	// POSIX must keep leading [ arrays that look like shell (no strip)
+	posixIn := `[ "$wt = 'x'", "echo hi" ] -join "` + "`" + `n" | Out-Null; echo hi`
+	payload2, _ := json.Marshal(map[string]any{"command": posixIn})
+	out2 := ProjectShellArgsForClient(string(payload2), "shell", "command")
+	var obj2 map[string]any
+	if err := json.Unmarshal([]byte(out2), &obj2); err != nil {
+		t.Fatal(err)
+	}
+	cmd2, _ := obj2["command"].(string)
+	if !strings.Contains(cmd2, "-join") {
+		t.Fatalf("POSIX must not strip fake join: %q", cmd2)
+	}
+
+	// Real PS type cast must not be stripped
+	cast := `[string]::IsNullOrEmpty('') ; Write-Output ok`
+	if g := sanitizeShellDialectArtifacts(cast); g != cast {
+		if !strings.Contains(g, "[string]") {
+			t.Fatalf("type cast damaged: %q", g)
+		}
+	}
+	cast2 := `[pscustomobject]@{a=1} | ConvertTo-Json`
+	if g := sanitizeShellDialectArtifacts(cast2); strings.TrimSpace(g) == "" || !strings.Contains(g, "pscustomobject") {
+		t.Fatalf("pscustomobject damaged: %q", g)
 	}
 }

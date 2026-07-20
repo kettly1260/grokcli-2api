@@ -359,7 +359,15 @@
     </div>
     <div class="g2a-actions" style="grid-column:1/-1">
       <label class="g2a-check"><input type="checkbox" id="set-codex-ps-guard" /> Codex Shell 方言拦截（可选，较强）</label>
-      <div class="g2a-muted" style="margin-top:4px;margin-left:1.6em">开启后：投影阶段拦截 bash 味 cmd（如 bash 单引号拼接转义、复杂 <code>python -c</code>、<code>$(...)</code>、<code>grep/sed</code>），替换为 PowerShell Write-Output 提示，避免 ParserError。可能增加一轮 tool 重试。</div>
+      <div class="g2a-muted" style="margin-top:4px;margin-left:1.6em">开启后：投影阶段拦截 bash 味 cmd 与破损 PowerShell 字面量（如 bash 单引号拼接、<code>python -c</code>、<code>$(...)</code>、<code>grep/sed</code>、过度引号 <code>@()</code>、残缺 here-string、单引号内 <code>`n</code>），替换为 PowerShell Write-Output 提示，避免 ParserError。可能增加一轮 tool 重试。</div>
+    </div>
+    <div class="g2a-actions" style="grid-column:1/-1">
+      <label class="g2a-check"><input type="checkbox" id="set-codex-ps-unwrap" /> Codex PowerShell 数组解包（可选）</label>
+      <div class="g2a-muted" style="margin-top:4px;margin-left:1.6em">开启后：仅在 PowerShell 投影路径把高置信的 <code>-Value '@(...)'</code> 改写为 <code>-Value @(...)</code>。默认关闭；不影响 Linux/bash CLI。</div>
+    </div>
+    <div class="g2a-actions" style="grid-column:1/-1">
+      <label class="g2a-check"><input type="checkbox" id="set-codex-ps-write-safe" /> Codex PowerShell 写文件安全改写（可选）</label>
+      <div class="g2a-muted" style="margin-top:4px;margin-left:1.6em">开启后：仅在 PowerShell 投影路径，把单条 <code>Set-Content/Out-File -Value "a`nb"</code> 改写为 Set-Content + Add-Content 链。默认关闭；不影响 Linux/bash CLI。</div>
     </div>
   </div>
   <div class="g2a-actions" style="margin-top:14px;justify-content:flex-end;gap:8px;flex-wrap:wrap">
@@ -572,6 +580,6 @@
   <script src="/static/dist/api.443dfc63c0.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
   <script src="/static/dist/state.5846ce62e4.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
   <script src="/static/dist/auth.539061a1a7.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
-  <script src="/static/dist/core.9ca8f8d744.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
+  <script src="/static/dist/core.a9cb0124a0.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
 </body>
 </html>

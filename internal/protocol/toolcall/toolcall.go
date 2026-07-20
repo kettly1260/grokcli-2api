@@ -1101,7 +1101,180 @@ func sanitizeShellDialectArtifacts(s string) string {
 		}
 		s = b.String()
 	}
+	s = stripFakePSArrayJoinPrefix(s)
 	return s
+}
+
+// stripFakePSArrayJoinPrefix removes a model anti-pattern seen in Codex Desktop
+// PowerShell logs:
+//
+//	[ "cmd1", "cmd2", ... ] -join "`n" | Out-Null; real_cmd
+//
+// PowerShell parses leading `[` as a type accelerator, so this always ParserErrors
+// with "Missing type name after '['". The real work is after `| Out-Null;` (or
+// `-join ...;`). Always-on for DialectPowerShell only (caller-gated).
+//
+// Also handles slight variants: -join "`n", -join "`r`n", -join [Environment]::NewLine
+// and optional Out-Null / Out-Default / $null = ... sink.
+func stripFakePSArrayJoinPrefix(s string) string {
+	trim := strings.TrimSpace(s)
+	if trim == "" || trim[0] != '[' {
+		return s
+	}
+	// Fast reject: must look like a string-array + -join, not a real cast [int] or [pscustomobject]
+	low := strings.ToLower(trim)
+	if !strings.Contains(low, "-join") {
+		return s
+	}
+	// Scan for matching ] that closes the outer [ ... ], respecting quotes.
+	depth := 0
+	inSingle, inDouble := false, false
+	closeIdx := -1
+	for i := 0; i < len(trim); i++ {
+		c := trim[i]
+		if inSingle {
+			if c == '\'' {
+				// PowerShell '' escape inside single quotes
+				if i+1 < len(trim) && trim[i+1] == '\'' {
+					i++
+					continue
+				}
+				inSingle = false
+			}
+			continue
+		}
+		if inDouble {
+			if c == '`' && i+1 < len(trim) {
+				i++ // skip escape
+				continue
+			}
+			if c == '"' {
+				inDouble = false
+			}
+			continue
+		}
+		switch c {
+		case '\'':
+			inSingle = true
+		case '"':
+			inDouble = true
+		case '[':
+			depth++
+		case ']':
+			depth--
+			if depth == 0 {
+				closeIdx = i
+				i = len(trim) // break
+			}
+		}
+	}
+	if closeIdx < 0 {
+		return s
+	}
+	rest := strings.TrimSpace(trim[closeIdx+1:])
+	// rest should start with -join ...
+	if !strings.HasPrefix(strings.ToLower(rest), "-join") {
+		return s
+	}
+	// Find the first top-level ';' after -join ... (statement separator before real cmd)
+	// or after | Out-Null
+	semi := -1
+	inSingle, inDouble = false, false
+	for i := 0; i < len(rest); i++ {
+		c := rest[i]
+		if inSingle {
+			if c == '\'' {
+				if i+1 < len(rest) && rest[i+1] == '\'' {
+					i++
+					continue
+				}
+				inSingle = false
+			}
+			continue
+		}
+		if inDouble {
+			if c == '`' && i+1 < len(rest) {
+				i++
+				continue
+			}
+			if c == '"' {
+				inDouble = false
+			}
+			continue
+		}
+		if c == '\'' {
+			inSingle = true
+			continue
+		}
+		if c == '"' {
+			inDouble = true
+			continue
+		}
+		if c == ';' {
+			semi = i
+			break
+		}
+	}
+	if semi < 0 {
+		// No real command after the join — drop the whole fake prefix (empty)
+		// but only if the bracket content looks like quoted strings (model junk).
+		if looksLikeFakePSStringArray(trim[:closeIdx+1]) {
+			return ""
+		}
+		return s
+	}
+	prefix := rest[:semi]
+	// Require -join in the prefix (already checked) and ideally a sink like Out-Null
+	// or at least -join. Model pattern almost always has | Out-Null.
+	plow := strings.ToLower(prefix)
+	if !strings.Contains(plow, "-join") {
+		return s
+	}
+	// Only strip when bracket body looks like a string array of commands, not [string[]] casts.
+	if !looksLikeFakePSStringArray(trim[:closeIdx+1]) {
+		return s
+	}
+	real := strings.TrimSpace(rest[semi+1:])
+	if real == "" {
+		return s
+	}
+	if real != s {
+		// keep original leading whitespace style minimal
+		return real
+	}
+	return s
+}
+
+// looksLikeFakePSStringArray reports whether [ ... ] body is mostly quoted strings
+// (the Codex model multi-cmd join pattern), not a type cast like [int] or [pscustomobject].
+func looksLikeFakePSStringArray(bracket string) bool {
+	body := strings.TrimSpace(bracket)
+	if len(body) < 2 || body[0] != '[' || body[len(body)-1] != ']' {
+		return false
+	}
+	inner := strings.TrimSpace(body[1 : len(body)-1])
+	if inner == "" {
+		return false
+	}
+	// Type casts: [int], [string], [System.IO.Path], [pscustomobject]{...}
+	// Fake arrays always start with a quote after [
+	first := inner[0]
+	if first != '\'' && first != '"' {
+		return false
+	}
+	// Must contain at least one comma-separated quoted element or a long quoted string
+	// with shell-ish content (assignment / cmdlet).
+	if strings.Contains(inner, ",") {
+		return true
+	}
+	// Single element: only strip if it looks like a shell statement, not a type.
+	low := strings.ToLower(inner)
+	if strings.Contains(low, "$") || strings.Contains(low, "join-path") ||
+		strings.Contains(low, "get-content") || strings.Contains(low, "select-string") ||
+		strings.Contains(low, "set-content") || strings.Contains(low, "write-output") {
+		return true
+	}
+	return len(inner) > 40
 }
 
 // shellCommandNonEmpty reports whether a normalized command value is usable.
@@ -3009,13 +3182,14 @@ func ProjectShellArgsForClient(argsJSON, toolName, preferredKey string) string {
 	if strVal == nil {
 		return normalized
 	}
-	// PowerShell (Codex cmd) only: strip bash quote-glue / lone-CR path damage.
+	// PowerShell (Codex cmd) only: strip bash quote-glue / lone-CR path damage,
+	// then optional unwrap / write-safe transforms, then optional guard.
 	// Linux bash/CLI (command key / non-exec_command): leave cmd untouched so
 	// legitimate bash quote-glue and paths keep working.
-	// Optional codex_powershell_guard may still rewrite remaining unfixable cmds.
 	if s, ok := strVal.(string); ok {
 		if shellDialectForClient(toolName, preferredKey) == DialectPowerShell {
 			s = sanitizeShellDialectArtifacts(s)
+			s = applyOptionalPowerShellTransforms(s)
 			strVal, _ = GuardShellCmdForClient(s)
 		} else {
 			strVal = s
@@ -3149,31 +3323,43 @@ func truncateForLog(s string, n int) string {
 // Codex / Windows PowerShell soft+hard helpers
 // ---------------------------------------------------------------------------
 //
-// B) codex_powershell_rules  — inject short hard rules into instructions when
+// B) codex_powershell_rules      — inject short hard rules into instructions when
 //    the request looks like Codex (historycompact.LooksLikeCodexRequest).
-// C) codex_powershell_guard  — optional reject of bash-ish shell cmd at the
-//    client projection boundary (python -c nested quotes, bash $(), bash quote escape).
+// C) codex_powershell_guard      — optional reject of bash-ish / broken-PS-literal
+//    shell cmd at the client projection boundary.
+// D) codex_powershell_unwrap     — optional high-confidence fix: -Value '@(...)' → @(...)
+// E) codex_powershell_write_safe — optional rewrite of multi-line file writes to
+//    Set-Content + Add-Content chains.
 //
-// Both are durable admin settings, hot-reloaded via ConfigureCodexShellPolicy.
+// All are durable admin settings, hot-reloaded via ConfigureCodexShellPolicy.
+// Transforms (D/E) and guard (C) run ONLY on DialectPowerShell projection —
+// Linux bash/CLI preferredKey=command is never rewritten.
 
 var (
-	codexShellMu         sync.RWMutex
-	codexPowerShellRules bool // default false until admin enables
-	codexPowerShellGuard bool // default false (optional hard reject)
+	codexShellMu             sync.RWMutex
+	codexPowerShellRules     bool // default false until admin enables
+	codexPowerShellGuard     bool // default false (optional hard reject)
+	codexPowerShellUnwrap    bool // default false (optional array unwrap)
+	codexPowerShellWriteSafe bool // default false (optional write rewrite)
 )
 
 // ConfigureCodexShellPolicy hot-applies WebUI settings:
 //   - rules: inject PowerShell hard rules into Codex instructions
-//   - guard: reject bash-dialect shell cmds at projection boundary
-func ConfigureCodexShellPolicy(rules, guard bool) {
+//   - guard: reject bash-dialect / broken-PS-literal shell cmds at projection boundary
+//   - unwrap: high-confidence -Value '@(...)' → -Value @(...)
+//   - writeSafe: rewrite multi-line writes to Set/Add-Content chains
+func ConfigureCodexShellPolicy(rules, guard, unwrap, writeSafe bool) {
 	codexShellMu.Lock()
-	prevR, prevG := codexPowerShellRules, codexPowerShellGuard
+	prevR, prevG, prevU, prevW := codexPowerShellRules, codexPowerShellGuard, codexPowerShellUnwrap, codexPowerShellWriteSafe
 	codexPowerShellRules, codexPowerShellGuard = rules, guard
+	codexPowerShellUnwrap, codexPowerShellWriteSafe = unwrap, writeSafe
 	codexShellMu.Unlock()
-	if rules != prevR || guard != prevG {
+	if rules != prevR || guard != prevG || unwrap != prevU || writeSafe != prevW {
 		slog.Info("codex shell policy updated",
 			"codex_powershell_rules", rules,
 			"codex_powershell_guard", guard,
+			"codex_powershell_unwrap", unwrap,
+			"codex_powershell_write_safe", writeSafe,
 			"source", "admin_settings",
 		)
 	}
@@ -3193,6 +3379,20 @@ func CodexPowerShellGuardEnabled() bool {
 	return codexPowerShellGuard
 }
 
+// CodexPowerShellUnwrapEnabled reports whether optional array unwrap is on.
+func CodexPowerShellUnwrapEnabled() bool {
+	codexShellMu.RLock()
+	defer codexShellMu.RUnlock()
+	return codexPowerShellUnwrap
+}
+
+// CodexPowerShellWriteSafeEnabled reports whether optional write-safe rewrite is on.
+func CodexPowerShellWriteSafeEnabled() bool {
+	codexShellMu.RLock()
+	defer codexShellMu.RUnlock()
+	return codexPowerShellWriteSafe
+}
+
 // CodexPowerShellHardRules is the short block injected into Codex instructions.
 // Keep it short: long AGENTS.md is soft; this is a high-signal reminder each turn.
 const CodexPowerShellHardRules = `[grokcli-2api / Windows PowerShell]
@@ -3202,12 +3402,20 @@ REQUIRED:
 - Prefer several short commands over one nested mega-command.
 - For non-trivial Python: write a temp .py under the repo .tmp, then: python path\to\script.py
 - Paths: use single quotes 'G:\LLM\rehab\...' so backslashes stay literal (never bash '\'' glue).
+- Multi-line file content: Set-Content first line, then Add-Content for each next line
+  (or use apply_patch). Do NOT put multi-line bodies in one -Value string.
+- Arrays: -Value @( 'a', 'b' ) - never quote the whole array: -Value '@(...)' is a STRING.
 FORBIDDEN:
 - bash-only: tail/grep/sed/awk/xargs/rm -rf / $(...) / bash && chains
-- bash quote escape sequences ('\'' or '"'"') anywhere in cmd — PowerShell uses '' inside '...'
+- bash quote escape sequences ('\'' or '"'"') anywhere in cmd - PowerShell uses '' inside '...'
 - multiline or heavily quoted python -c (one short expression max)
 - wrapping already-PowerShell cmd in another powershell -Command
-After one quoting failure: stop permuting quotes; write a temp script instead.
+- fake multi-cmd arrays: do NOT write [ "cmd1", "cmd2" ] -join (newline) | Out-Null; emit real PS statements separated by ;
+- over-quoted arrays: -Value '@('a','b')' or -Value "@(...)"  (quotes make a string, not @())
+- broken here-strings: -Value '@  or -Value "@ without a proper @'...'@ / @"..."@ pair
+- backtick-n escape (backtick then n) inside SINGLE quotes - single quotes are literal; use double quotes
+  for newline escapes, or prefer Set-Content + Add-Content lines instead
+After one quoting failure: stop permuting quotes; write a temp script or use apply_patch.
 `
 
 // InjectCodexPowerShellRules appends hard rules to OpenAI-style body messages
@@ -3322,6 +3530,8 @@ type ShellDialectIssue struct {
 
 // DetectBashShellDialect flags cmd strings that commonly explode under PowerShell.
 // Used by the optional codex_powershell_guard (reject path).
+// Includes bash-ish patterns AND common broken PowerShell literal shapes that
+// models emit (overquoted @(), broken here-string, `n in single quotes).
 func DetectBashShellDialect(cmd string) *ShellDialectIssue {
 	s := strings.TrimSpace(cmd)
 	if s == "" {
@@ -3340,6 +3550,18 @@ func DetectBashShellDialect(cmd string) *ShellDialectIssue {
 			Reason: "bash_quote_escape",
 			Hint:   "Do not use bash quote-glue. Write a temp .py with Set-Content / apply_patch, then: python path\\script.py",
 		}
+	}
+	// Over-quoted PowerShell array: -Value '@(...)' or -Value "@(...)" makes a STRING, not @().
+	if iss := detectOverquotedPSArray(s); iss != nil {
+		return iss
+	}
+	// Broken here-string opener without proper closer: -Value '@  or -Value "@
+	if iss := detectBrokenHereString(s); iss != nil {
+		return iss
+	}
+	// `n (backtick-n) inside single-quoted string — never expands in PS.
+	if iss := detectBacktickNInSingleQuotes(s); iss != nil {
+		return iss
 	}
 	// multiline python -c or very nested python -c with escaped newlines
 	low := strings.ToLower(s)
@@ -3382,6 +3604,97 @@ func DetectBashShellDialect(cmd string) *ShellDialectIssue {
 	return nil
 }
 
+// detectOverquotedPSArray finds -Value '@(...' / -Value "@(... patterns.
+func detectOverquotedPSArray(s string) *ShellDialectIssue {
+	// Common model mistakes: -Value '@('import sys',...')' or -Value "@( ... )"
+	if reOverquotedValueArray.MatchString(s) {
+		return &ShellDialectIssue{
+			Reason: "overquoted_ps_array",
+			Hint:   "Do not quote the whole array. Use -Value @( 'a', 'b' ) not -Value '@(...)'. Or Set-Content + Add-Content per line.",
+		}
+	}
+	return nil
+}
+
+// reOverquotedValueArray matches -Value '@(...' or -Value "@(... with optional spaces.
+var reOverquotedValueArray = regexp.MustCompile(`(?i)-Value\s+['"]@\(`)
+
+// detectBrokenHereString flags incomplete here-string openers.
+// Valid: @' ... '@ or @" ... "@
+// Broken (common model fail): -Value '@   or -Value "@ without matching closer.
+func detectBrokenHereString(s string) *ShellDialectIssue {
+	hasOpenSingle := strings.Contains(s, "@'")
+	hasCloseSingle := strings.Contains(s, "'@")
+	hasOpenDouble := strings.Contains(s, `@"`)
+	hasCloseDouble := strings.Contains(s, `"@`)
+	// Opener without closer
+	if hasOpenSingle && !hasCloseSingle {
+		return &ShellDialectIssue{
+			Reason: "broken_here_string",
+			Hint:   "Here-string needs @' ... '@ (or @\" ... \"@). Prefer Set-Content first line then Add-Content for each next line.",
+		}
+	}
+	if hasOpenDouble && !hasCloseDouble {
+		return &ShellDialectIssue{
+			Reason: "broken_here_string",
+			Hint:   "Here-string needs @\" ... \"@ (or @' ... '@). Prefer Set-Content + Add-Content lines instead.",
+		}
+	}
+	// -Value '@ or -Value "@ as truncated opener (common: -Value '@ alone)
+	if reBrokenHereValue.MatchString(s) {
+		if (hasOpenSingle && hasCloseSingle) || (hasOpenDouble && hasCloseDouble) {
+			return nil
+		}
+		return &ShellDialectIssue{
+			Reason: "broken_here_string",
+			Hint:   "Incomplete here-string after -Value. Use Set-Content + Add-Content, or a full @'...'@ block.",
+		}
+	}
+	return nil
+}
+
+// reBrokenHereValue: -Value '@  or -Value "@ with little/no body (truncated opener).
+var reBrokenHereValue = regexp.MustCompile(`(?i)-Value\s+(['"])@\s*($|['"]|;)`)
+
+// detectBacktickNInSingleQuotes finds `n inside single-quoted regions.
+// In PowerShell single quotes are literal — `n does not expand to newline.
+func detectBacktickNInSingleQuotes(s string) *ShellDialectIssue {
+	i := 0
+	for i < len(s) {
+		if s[i] != '\'' {
+			i++
+			continue
+		}
+		// start of single-quoted string; handle '' escapes inside
+		j := i + 1
+		for j < len(s) {
+			if s[j] == '\'' {
+				if j+1 < len(s) && s[j+1] == '\'' {
+					j += 2 // escaped ''
+					continue
+				}
+				break
+			}
+			j++
+		}
+		if j > i+1 {
+			region := s[i+1 : j]
+			if strings.Contains(region, "`n") || strings.Contains(region, "`N") {
+				return &ShellDialectIssue{
+					Reason: "backtick_n_single",
+					Hint:   "`n does not expand inside single quotes. Use double quotes for \"`n\", or write lines with Set-Content / Add-Content.",
+				}
+			}
+		}
+		if j < len(s) {
+			i = j + 1
+		} else {
+			break
+		}
+	}
+	return nil
+}
+
 // GuardShellCmdForClient applies optional dialect reject. When guard is off,
 // returns cmd unchanged and issue=nil. When on and issue found, returns a
 // PowerShell-safe Write-Output of the rejection so Codex does not ParserError.
@@ -3407,4 +3720,163 @@ func GuardShellCmdForClient(cmd string) (out string, issue *ShellDialectIssue) {
 		"cmd", truncateForLog(cmd, 240),
 	)
 	return msg, issue
+}
+
+// applyOptionalPowerShellTransforms runs optional P3 unwrap + P4 write-safe
+// rewrites. PowerShell dialect path only (caller already gated).
+func applyOptionalPowerShellTransforms(cmd string) string {
+	s := cmd
+	if CodexPowerShellUnwrapEnabled() {
+		if fixed, ok := unwrapOverquotedPSArray(s); ok {
+			slog.Info("codex powershell unwrap applied",
+				"before", truncateForLog(s, 160),
+				"after", truncateForLog(fixed, 160),
+			)
+			s = fixed
+		}
+	}
+	if CodexPowerShellWriteSafeEnabled() {
+		if fixed, ok := rewriteWriteSafePS(s); ok {
+			slog.Info("codex powershell write-safe applied",
+				"before", truncateForLog(s, 160),
+				"after", truncateForLog(fixed, 160),
+			)
+			s = fixed
+		}
+	}
+	return s
+}
+
+// unwrapOverquotedPSArray rewrites high-confidence -Value '@(...)' → -Value @(...)
+// and -Value "@(...)" → -Value @(...) when the quoted body is a PS array literal.
+// Uses a paren-balanced scan so nested single quotes inside array elements work.
+func unwrapOverquotedPSArray(cmd string) (string, bool) {
+	if !reOverquotedValueArray.MatchString(cmd) {
+		return cmd, false
+	}
+	out := cmd
+	changed := false
+	// Find each -Value '@( or -Value "@( and unwrap the matching quoted array.
+	for {
+		loc := reOverquotedValueArray.FindStringIndex(out)
+		if loc == nil {
+			break
+		}
+		// loc points at start of "-Value ... '@(" or "-Value ... "@("
+		// Find the quote char just before @
+		at := strings.Index(out[loc[0]:loc[1]], "@(")
+		if at < 0 {
+			break
+		}
+		quotePos := loc[0] + at - 1
+		if quotePos < 0 || (out[quotePos] != '\'' && out[quotePos] != '"') {
+			break
+		}
+		quote := out[quotePos]
+		// Scan from "@(" with paren depth; stop at matching ) then expect quote.
+		i := quotePos + 1 // at '@' of @(
+		if i >= len(out) || out[i] != '@' {
+			break
+		}
+		depth := 0
+		j := i
+		for j < len(out) {
+			c := out[j]
+			if c == '(' {
+				depth++
+			} else if c == ')' {
+				depth--
+				if depth == 0 {
+					j++ // past )
+					break
+				}
+			}
+			j++
+		}
+		if depth != 0 || j >= len(out) || out[j] != quote {
+			// incomplete — leave rest unchanged
+			break
+		}
+		// out[quotePos] is opening quote, out[j] is closing quote
+		// Replace out[quotePos:j+1] with out[quotePos+1:j] (drop quotes)
+		inner := out[quotePos+1 : j]
+		out = out[:quotePos] + inner + out[j+1:]
+		changed = true
+		// continue scanning after this replacement
+	}
+	if !changed {
+		return cmd, false
+	}
+	return out, true
+}
+
+// reUnwrap* kept for possible future use / tests; primary path is the scanner above.
+var reUnwrapSingleQuotedArray = regexp.MustCompile(`(?i)(-Value\s+)'@\(([^']*(?:''[^']*)*)\)'`)
+var reUnwrapDoubleQuotedArray = regexp.MustCompile(`(?i)(-Value\s+)"@\(([^"]*)\)"`)
+
+// rewriteWriteSafePS rewrites a multi-line Set-Content/Out-File -Value "..." body
+// into Set-Content first line + Add-Content subsequent lines, when high confidence.
+//
+// Handles:
+//
+//	Set-Content -Path 'f' -Value "line1`nline2`nline3"
+//	Set-Content -LiteralPath 'f' -Value "a`nb"
+//
+// when Value uses double quotes with `n separators (or real newlines).
+// Skips single-line / already-safe cmds / complex expressions.
+func rewriteWriteSafePS(cmd string) (string, bool) {
+	s := strings.TrimSpace(cmd)
+	if s == "" || strings.Contains(s, ";") {
+		// Multi-statement already — don't rewrite.
+		return cmd, false
+	}
+	m := reWriteSafeSetContent.FindStringSubmatch(s)
+	if m == nil {
+		return cmd, false
+	}
+	// m[1]=cmdlet, m[2]=path flag, m[3]=path, m[4]=value body (inside double quotes)
+	cmdlet, pathFlag, path, body := m[1], m[2], m[3], m[4]
+	// Split on `n (literal backtick-n) or real newlines
+	parts := splitPSNewlines(body)
+	if len(parts) < 2 {
+		return cmd, false
+	}
+	// Cap rewrite size — huge bodies should use apply_patch / temp file instead.
+	if len(parts) > 80 {
+		return cmd, false
+	}
+	var b strings.Builder
+	// First line: Set-Content
+	fmt.Fprintf(&b, "%s %s '%s' -Value %s",
+		cmdlet, pathFlag, escapePSSingle(path), shellQuoteToken(parts[0], DialectPowerShell))
+	for _, line := range parts[1:] {
+		fmt.Fprintf(&b, "; Add-Content %s '%s' -Value %s",
+			pathFlag, escapePSSingle(path), shellQuoteToken(line, DialectPowerShell))
+	}
+	return b.String(), true
+}
+
+// reWriteSafeSetContent matches a single Set-Content/Out-File with double-quoted -Value.
+// Groups: 1=cmdlet, 2=path switch (-Path|-LiteralPath), 3=path, 4=value body
+// Allows ` escapes inside the double-quoted body.
+var reWriteSafeSetContent = regexp.MustCompile(
+	`(?is)^\s*(Set-Content|Out-File)\s+(-(?:Literal)?Path)\s+'([^']+)'\s+-Value\s+"([^"]*)"\s*$`,
+)
+
+func splitPSNewlines(body string) []string {
+	// Prefer literal `n (backtick + n) as model-emitted separators.
+	if strings.Contains(body, "`n") {
+		return strings.Split(body, "`n")
+	}
+	if strings.Contains(body, "\n") {
+		// Normalize CRLF
+		body = strings.ReplaceAll(body, "\r\n", "\n")
+		body = strings.ReplaceAll(body, "\r", "\n")
+		return strings.Split(body, "\n")
+	}
+	return []string{body}
+}
+
+func escapePSSingle(s string) string {
+	return strings.ReplaceAll(s, "'", "''")
 }
