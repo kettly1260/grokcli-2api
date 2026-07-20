@@ -1241,8 +1241,16 @@ def _make_email_receiver(
     )
     from grok2api.config import MOEMAIL_API_KEY, MOEMAIL_BASE_URL, MOEMAIL_DOMAIN, MOEMAIL_EXPIRY_MS
 
-    base = (base_url or MOEMAIL_BASE_URL or "").rstrip("/")
-    prov = normalize_mail_provider(mail_provider, base_url=base)
+    # Provider first — never seed YYDS/GPTMail/CF base with MoeMail's default host.
+    prov = normalize_mail_provider(mail_provider, base_url=base_url)
+    if prov == "yyds":
+        base = (base_url or "").rstrip("/")  # empty → normalize_yyds_base_url pins maliapi
+    elif prov == "gptmail":
+        base = (base_url or "").rstrip("/")
+    elif prov == "cfmail":
+        base = (base_url or "").rstrip("/")
+    else:
+        base = (base_url or MOEMAIL_BASE_URL or "").rstrip("/")
     key = (api_key or MOEMAIL_API_KEY or "").strip()
     # GPTMail allows empty key (public gpt-test). YYDS/MoeMail/CF require a key.
     if not key and prov != "gptmail":
@@ -1271,13 +1279,12 @@ def _make_email_receiver(
     pre = secrets.token_hex(5).lower()
 
     mailbox = create_mailbox(
-
         provider=prov,
         name=pre,
         domain=dom or None,
         expiry_ms=expiry_ms if expiry_ms is not None else MOEMAIL_EXPIRY_MS,
         api_key=key,
-        base_url=base,
+        base_url=base or None,
     )
     email_id = mailbox["id"]
     address = mailbox["email"]

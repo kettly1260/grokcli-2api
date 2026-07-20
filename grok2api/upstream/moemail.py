@@ -114,30 +114,66 @@ def normalize_mail_provider(provider: str | None, *, base_url: str | None = None
 
 
 def normalize_yyds_base_url(base_url: str | None = None) -> str:
-    """Normalize user input (docs URL / trailing /v1) to API origin."""
+    """Normalize user input (docs URL / trailing /v1) to API origin.
+
+    Never inherit MoeMail's default ``MOEMAIL_BASE_URL`` (example.com placeholder)
+    — empty / foreign hosts always pin to the official YYDS API.
+    """
     raw = (base_url or "").strip()
     if not raw:
         return YYDS_DEFAULT_BASE_URL
-    # Common mistakes: paste docs portal or bare path.
     lower = raw.lower()
+    # Docs portal / bare brand paste → official API host.
     if "vip.215.im" in lower and "maliapi" not in lower:
+        return YYDS_DEFAULT_BASE_URL
+    if "maliapi.215.im" in lower or "215.im" in lower:
+        return YYDS_DEFAULT_BASE_URL
+    # Reject MoeMail / GPTMail / CF placeholders accidentally passed as base.
+    if any(
+        x in lower
+        for x in (
+            "moemail",
+            "example.com",
+            "chatgpt.org.uk",
+            "gptmail",
+            "temp-email",
+            "awsl.uk",
+            "521884.xyz",
+        )
+    ):
         return YYDS_DEFAULT_BASE_URL
     parsed = urlparse(raw if "://" in raw else f"https://{raw}")
     origin = f"{parsed.scheme or 'https'}://{parsed.netloc}".rstrip("/")
     if not parsed.netloc:
         return YYDS_DEFAULT_BASE_URL
-    # Strip accidental /v1 /docs suffixes from path-only pastes handled above.
     return origin or YYDS_DEFAULT_BASE_URL
 
 
 def normalize_gptmail_base_url(base_url: str | None = None) -> str:
-    """Normalize docs / language path pastes to GPTMail origin."""
+    """Normalize docs / language path pastes to GPTMail origin.
+
+    Empty or foreign (MoeMail/YYDS/CF) hosts pin to the official GPTMail origin.
+    """
     raw = (base_url or "").strip()
     if not raw:
         return GPTMAIL_DEFAULT_BASE_URL
     lower = raw.lower()
     if "chatgpt.org.uk" in lower or "gptmail" in lower:
         # Always pin to official origin (docs may be /zh/api, /api, etc.).
+        return GPTMAIL_DEFAULT_BASE_URL
+    if any(
+        x in lower
+        for x in (
+            "moemail",
+            "example.com",
+            "maliapi.215.im",
+            "vip.215.im",
+            "215.im",
+            "temp-email",
+            "awsl.uk",
+            "521884.xyz",
+        )
+    ):
         return GPTMAIL_DEFAULT_BASE_URL
     parsed = urlparse(raw if "://" in raw else f"https://{raw}")
     origin = f"{parsed.scheme or 'https'}://{parsed.netloc}".rstrip("/")
@@ -214,10 +250,25 @@ def normalize_cfmail_base_url(base_url: str | None = None) -> str:
     """Normalize Cloudflare Temp Email Workers / Pages URL to API origin.
 
     Accepts worker host, docs host, or accidental ``/api`` / ``/admin`` suffixes.
-    Users should deploy their own Workers URL; demo host is only a fallback.
+    Empty or foreign (MoeMail/YYDS/GPTMail) hosts fall back to the demo origin;
+    production users should set their own Workers URL.
     """
     raw = (base_url or "").strip()
     if not raw:
+        return CFMAIL_DEFAULT_BASE_URL
+    lower = raw.lower()
+    if any(
+        x in lower
+        for x in (
+            "moemail",
+            "example.com",
+            "maliapi.215.im",
+            "vip.215.im",
+            "chatgpt.org.uk",
+            "gptmail",
+            "521884.xyz",
+        )
+    ):
         return CFMAIL_DEFAULT_BASE_URL
     parsed = urlparse(raw if "://" in raw else f"https://{raw}")
     origin = f"{parsed.scheme or 'https'}://{parsed.netloc}".rstrip("/")
@@ -538,7 +589,8 @@ def yyds_create_mailbox(
             "YYDS Mail API key missing. Set GROK2API_MOEMAIL_API_KEY / api_key "
             "(X-API-Key, usually starts with AC-)."
         )
-    base = normalize_yyds_base_url(base_url or MOEMAIL_BASE_URL)
+    # Do NOT fall through to MOEMAIL_BASE_URL (MoeMail placeholder host).
+    base = normalize_yyds_base_url(base_url)
     # Never fall back to MOEMAIL_DOMAIN (MoeMail default / example.com). Empty
     # means auto: randomly pick a healthy public domain from GET /v1/domains.
     # Multi-domain config (newlines/commas) → pick one (random when no index).
@@ -546,11 +598,19 @@ def yyds_create_mailbox(
     if not dom:
         dom = (domain or "").strip().lstrip("@").strip(".")
     if not dom:
-        dom = yyds_pick_domain(api_key=key, base_url=base) or ""
+        try:
+            dom = yyds_pick_domain(api_key=key, base_url=base) or ""
+        except Exception as exc:  # noqa: BLE001
+            raise ValueError(
+                f"YYDS Mail domain auto-fetch failed ({base}): {exc}. "
+                "Leave domain empty for random public domain, or set an "
+                "explicit domain from GET /v1/domains."
+            ) from exc
     if not dom:
         raise ValueError(
-            "YYDS Mail domain auto-fetch failed. Leave domain empty for random "
-            "public domain, or set an explicit domain from GET /v1/domains."
+            f"YYDS Mail domain auto-fetch returned no usable domains "
+            f"(base={base}). Leave domain empty for random public domain, "
+            "or set an explicit domain from GET /v1/domains."
         )
     local = (name or "").strip().lower() or None
     payload: dict[str, Any] = {"domain": dom}
@@ -593,9 +653,13 @@ def yyds_list_domains(
     public_only: bool = True,
     ready_only: bool = True,
 ) -> list[str]:
-    """List usable domains from YYDS catalog (``GET /v1/domains``)."""
+    """List usable domains from YYDS catalog (``GET /v1/domains``).
+
+    YYDS nests readiness under ``dnsRecords`` (``receivingReady``,
+    ``wildcardMxValid``); top-level ``receivingReady`` is usually absent.
+    """
     key = (api_key or MOEMAIL_API_KEY or "").strip()
-    base = normalize_yyds_base_url(base_url or MOEMAIL_BASE_URL)
+    base = normalize_yyds_base_url(base_url)
     try:
         with httpx.Client(timeout=20.0) as client:
             resp = client.get(f"{base}/v1/domains", headers=_headers(key) if key else {})
@@ -623,12 +687,23 @@ def yyds_list_domains(
             continue
         if public_only and item.get("isPublic") is False:
             continue
-        if ready_only and (
-            item.get("receivingReady") is False or item.get("isMxValid") is False
-        ):
+        dns = item.get("dnsRecords") if isinstance(item.get("dnsRecords"), dict) else {}
+        # Prefer top-level flags when present; else read nested dnsRecords.
+        receiving_ready = item.get("receivingReady")
+        if receiving_ready is None:
+            receiving_ready = dns.get("receivingReady")
+        mx_valid = item.get("isMxValid")
+        if mx_valid is None:
+            mx_valid = dns.get("mxValid")
+        if ready_only and (receiving_ready is False or mx_valid is False):
             continue
         seen.add(name)
-        if item.get("wildcardMxValid") is True or item.get("wildcard_mx_valid") is True:
+        wildcard = (
+            item.get("wildcardMxValid")
+            if item.get("wildcardMxValid") is not None
+            else dns.get("wildcardMxValid")
+        )
+        if wildcard is True or item.get("wildcard_mx_valid") is True:
             preferred.append(name)
         else:
             fallback.append(name)
@@ -666,7 +741,7 @@ def yyds_fetch_messages(
     if not email_id and not address:
         return []
     key = (api_key or MOEMAIL_API_KEY or "").strip()
-    base = normalize_yyds_base_url(base_url or MOEMAIL_BASE_URL)
+    base = normalize_yyds_base_url(base_url)
     headers = _headers(key) if key else {}
     if token and not key:
         headers = {"Authorization": f"Bearer {token}"}
@@ -781,7 +856,7 @@ def gptmail_create_mailbox(
 ) -> dict[str, Any]:
     """Create a temporary inbox on GPTMail (https://mail.chatgpt.org.uk/zh/api/)."""
     key = (api_key or MOEMAIL_API_KEY or "").strip() or GPTMAIL_PUBLIC_TEST_KEY
-    base = normalize_gptmail_base_url(base_url or MOEMAIL_BASE_URL)
+    base = normalize_gptmail_base_url(base_url)
     # Never fall back to MOEMAIL_DOMAIN (MoeMail default). Empty => GPTMail
     # random generate / public domain pick.
     # Multi-domain config supported (pick one).
@@ -902,7 +977,7 @@ def gptmail_list_domains(
     base_url: str | None = None,
 ) -> list[str]:
     """List active public domains from GPTMail catalog (``GET /api/domains/public``)."""
-    base = normalize_gptmail_base_url(base_url or MOEMAIL_BASE_URL)
+    base = normalize_gptmail_base_url(base_url)
     key = (api_key or MOEMAIL_API_KEY or "").strip()
     try:
         with httpx.Client(timeout=20.0) as client:
@@ -972,7 +1047,7 @@ def gptmail_fetch_messages(
         else:
             return []
     key = (api_key or MOEMAIL_API_KEY or "").strip() or GPTMAIL_PUBLIC_TEST_KEY
-    base = normalize_gptmail_base_url(base_url or MOEMAIL_BASE_URL)
+    base = normalize_gptmail_base_url(base_url)
     headers = _headers(key)
 
     with httpx.Client(timeout=30.0) as client:
@@ -1050,7 +1125,7 @@ def cfmail_list_domains(
     site_password: str | None = None,
 ) -> list[str]:
     """List domains from CF Temp Email public settings (``GET /open_api/settings``)."""
-    base = normalize_cfmail_base_url(base_url or MOEMAIL_BASE_URL)
+    base = normalize_cfmail_base_url(base_url)
     headers = _cfmail_headers(api_key=api_key, site_password=site_password)
     try:
         with httpx.Client(timeout=20.0) as client:
@@ -1197,7 +1272,7 @@ def cfmail_create_mailbox(
     Docs: https://github.com/dreamhunter2333/cloudflare_temp_email
     """
     key = (api_key or MOEMAIL_API_KEY or "").strip()
-    base = normalize_cfmail_base_url(base_url or MOEMAIL_BASE_URL)
+    base = normalize_cfmail_base_url(base_url)
     # Never bleed MoeMail default domain into CF.
     dom = (domain or "").strip().lstrip("@").strip(".")
     if not dom:
@@ -1331,7 +1406,7 @@ def cfmail_fetch_messages(
     jwt = (token or api_key or MOEMAIL_API_KEY or "").strip()
     if not jwt:
         return []
-    base = normalize_cfmail_base_url(base_url or MOEMAIL_BASE_URL)
+    base = normalize_cfmail_base_url(base_url)
     headers = _cfmail_headers(api_key=jwt, site_password=site_password)
 
     with httpx.Client(timeout=30.0) as client:
