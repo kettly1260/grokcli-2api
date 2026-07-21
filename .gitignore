@@ -70,3 +70,11 @@ scripts/_fetch_*.py
 
 # CodeGraph local index (machine-specific; do not commit)
 .codegraph/
+
+# Unit/integration tests — keep local only; do not publish to this repo
+*_test.go
+**/*_test.go
+
+# Local patch/verify scratch
+.tmp/
+
