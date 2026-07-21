@@ -215,6 +215,9 @@ func main() {
 				unwrap, _ := settings["codex_powershell_unwrap"].(bool)
 				writeSafe, _ := settings["codex_powershell_write_safe"].(bool)
 				toolcall.ConfigureCodexShellPolicy(rules, guard, unwrap, writeSafe)
+				if v, ok := settings["codex_shell_target"].(string); ok {
+					toolcall.ConfigureCodexShellTarget(v)
+				}
 			}
 			snap := historycompact.Snapshot()
 			slog.Info("loaded durable settings into runtime config",
@@ -228,6 +231,7 @@ func main() {
 				"codex_powershell_guard", toolcall.CodexPowerShellGuardEnabled(),
 				"codex_powershell_unwrap", toolcall.CodexPowerShellUnwrapEnabled(),
 				"codex_powershell_write_safe", toolcall.CodexPowerShellWriteSafeEnabled(),
+				"codex_shell_target", toolcall.CodexShellTarget(),
 			)
 		} else {
 			slog.Warn("failed to load durable settings at boot", "error", err)

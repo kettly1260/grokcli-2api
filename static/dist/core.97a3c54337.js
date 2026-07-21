@@ -9566,6 +9566,7 @@ function fillSystemSettingsForm(s) {
     $("set-history-tool-max").value = s.history_max_tool_result_chars;
   }
   if ($("set-debug-shell-args")) $("set-debug-shell-args").checked = !!s.debug_shell_args;
+  if ($("set-codex-shell-target")) $("set-codex-shell-target").value = s.codex_shell_target || "auto";
   if ($("set-codex-ps-rules")) $("set-codex-ps-rules").checked = !!s.codex_powershell_rules;
   if ($("set-codex-ps-guard")) $("set-codex-ps-guard").checked = !!s.codex_powershell_guard;
   if ($("set-codex-ps-unwrap")) $("set-codex-ps-unwrap").checked = !!s.codex_powershell_unwrap;
@@ -9725,6 +9726,7 @@ function collectSystemSettingsPatch(groups) {
       patch.history_max_tool_result_chars = Number($("set-history-tool-max").value);
     }
     if ($("set-debug-shell-args")) patch.debug_shell_args = !!$("set-debug-shell-args").checked;
+    if ($("set-codex-shell-target")) patch.codex_shell_target = $("set-codex-shell-target").value || "auto";
     if ($("set-codex-ps-rules")) patch.codex_powershell_rules = !!$("set-codex-ps-rules").checked;
     if ($("set-codex-ps-guard")) patch.codex_powershell_guard = !!$("set-codex-ps-guard").checked;
     if ($("set-codex-ps-unwrap")) patch.codex_powershell_unwrap = !!$("set-codex-ps-unwrap").checked;
@@ -9948,6 +9950,7 @@ function settingsGroupDefaults(group) {
         history_keep_tool_rounds: 32,
         history_max_tool_result_chars: 48000,
         debug_shell_args: false,
+        codex_shell_target: "auto",
         codex_powershell_rules: false,
         codex_powershell_guard: false,
         codex_powershell_unwrap: false,
@@ -10027,6 +10030,7 @@ function applySettingsGroupDefaults(group) {
     if ($("set-history-keep-rounds")) $("set-history-keep-rounds").value = d.history_keep_tool_rounds;
     if ($("set-history-tool-max")) $("set-history-tool-max").value = d.history_max_tool_result_chars;
     if ($("set-debug-shell-args")) $("set-debug-shell-args").checked = !!d.debug_shell_args;
+    if ($("set-codex-shell-target")) $("set-codex-shell-target").value = d.codex_shell_target || "auto";
     if ($("set-codex-ps-rules")) $("set-codex-ps-rules").checked = !!d.codex_powershell_rules;
     if ($("set-codex-ps-guard")) $("set-codex-ps-guard").checked = !!d.codex_powershell_guard;
     if ($("set-codex-ps-unwrap")) $("set-codex-ps-unwrap").checked = !!d.codex_powershell_unwrap;

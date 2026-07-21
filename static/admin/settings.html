@@ -452,7 +452,16 @@
     </div>
     <div class="g2a-actions" style="grid-column:1/-1">
       <label class="g2a-check"><input type="checkbox" id="set-debug-shell-args" /> Shell 参数调试日志（记录 cmd 投影前后，排查 <code>[    ]</code> 前缀等问题）</label>
-      <div class="g2a-muted" style="margin-top:4px;margin-left:1.6em">开启后服务端日志会打印 raw_cmd / projected_cmd；定位 Codex/PowerShell 脏命令时使用，平时请关闭</div>
+      <div class="g2a-muted" style="margin-top:4px;margin-left:1.6em">开启后服务端日志会打印 preferred_key / dialect / shell_target / raw_cmd / projected_cmd，用来区分「方言未判为 PowerShell」与「修复盲区」；平时请关闭</div>
+    </div>
+    <div class="g2a-field" style="grid-column:1/-1;max-width:520px">
+      <label for="set-codex-shell-target">Codex 目标 Shell（部署级）</label>
+      <select id="set-codex-shell-target" class="g2a-input">
+        <option value="auto">auto（按 schema/工具名启发式）</option>
+        <option value="powershell">powershell（强制 PowerShell 修复链，推荐 Windows Codex Desktop）</option>
+        <option value="posix">posix（强制透传 bash，不做 PS 改写）</option>
+      </select>
+      <div class="g2a-muted" style="margin-top:4px">一个代理实例通常只服务一种 OS。Windows + Codex Desktop 若 schema 用 command 而非 cmd，请选 powershell；Linux CLI 保持 auto/posix。Hermes terminal 始终按 POSIX。</div>
     </div>
     <div class="g2a-actions" style="grid-column:1/-1">
       <label class="g2a-check"><input type="checkbox" id="set-codex-ps-rules" /> Codex PowerShell 硬规则注入（推荐）</label>

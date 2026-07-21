@@ -156,6 +156,9 @@ func (o Options) applySettingsToRuntime(settings map[string]any) {
 	if okR || okG || okU || okW {
 		toolcall.ConfigureCodexShellPolicy(rules, guard, unwrap, writeSafe)
 	}
+	if v, ok := settings["codex_shell_target"].(string); ok {
+		toolcall.ConfigureCodexShellTarget(v)
+	}
 }
 
 func applyHistoryCompactSettings(settings map[string]any) {

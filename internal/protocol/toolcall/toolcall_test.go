@@ -1600,6 +1600,101 @@ func TestProjectShellArgsRepairsMangledWindowsExecutablePath(t *testing.T) {
 	}
 }
 
+func TestRepairSingleQuotedExecutableMissingCallOperator(t *testing.T) {
+	prevR, prevG, prevU, prevW := CodexPowerShellRulesEnabled(), CodexPowerShellGuardEnabled(), CodexPowerShellUnwrapEnabled(), CodexPowerShellWriteSafeEnabled()
+	prevT := CodexShellTarget()
+	t.Cleanup(func() {
+		ConfigureCodexShellPolicy(prevR, prevG, prevU, prevW)
+		ConfigureCodexShellTarget(prevT)
+	})
+	ConfigureCodexShellPolicy(false, false, false, false)
+	ConfigureCodexShellTarget("auto")
+
+	// Live Codex Desktop transcript: single-quoted pwsh path without &.
+	raw := `'C:\Program Files\PowerShell\7\pwsh.exe' -NoProfile -Command 'Get-Date'`
+	payload, err := json.Marshal(map[string]any{"command": raw})
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := ProjectShellArgsForClient(string(payload), "exec_command", "cmd")
+	var obj map[string]any
+	if err := json.Unmarshal([]byte(out), &obj); err != nil {
+		t.Fatalf("json: %v %s", err, out)
+	}
+	cmd, _ := obj["cmd"].(string)
+	want := `& 'C:\Program Files\PowerShell\7\pwsh.exe' -NoProfile -Command 'Get-Date'`
+	if cmd != want {
+		t.Fatalf("single-quoted exe not repaired:\n got %q\nwant %q", cmd, want)
+	}
+
+	// Already has call operator — unchanged.
+	ok := `& 'C:\Program Files\PowerShell\7\pwsh.exe' -NoProfile`
+	got := sanitizeShellDialectArtifacts(ok)
+	if got != ok {
+		t.Fatalf("call-operator form changed: %q", got)
+	}
+
+	// String comparison must not gain &.
+	cmp := `'C:\tmp\a.exe' -eq $null`
+	if g := sanitizeShellDialectArtifacts(cmp); g != cmp {
+		t.Fatalf("comparison damaged: %q", g)
+	}
+}
+
+func TestShellDialectForcePowerShellForCommandKey(t *testing.T) {
+	prevR, prevG, prevU, prevW := CodexPowerShellRulesEnabled(), CodexPowerShellGuardEnabled(), CodexPowerShellUnwrapEnabled(), CodexPowerShellWriteSafeEnabled()
+	prevT := CodexShellTarget()
+	t.Cleanup(func() {
+		ConfigureCodexShellPolicy(prevR, prevG, prevU, prevW)
+		ConfigureCodexShellTarget(prevT)
+	})
+	ConfigureCodexShellPolicy(false, false, false, false)
+
+	// Without force: shell + command stays POSIX → bash glue preserved.
+	ConfigureCodexShellTarget("auto")
+	glue := `echo 'it'\''s fine'`
+	payload, _ := json.Marshal(map[string]any{"command": glue})
+	out := ProjectShellArgsForClient(string(payload), "shell", "command")
+	var obj map[string]any
+	_ = json.Unmarshal([]byte(out), &obj)
+	if cmd, _ := obj["command"].(string); !strings.Contains(cmd, `'\''`) {
+		t.Fatalf("auto+command should stay POSIX, got %q", cmd)
+	}
+
+	// Force powershell: same command key still runs sanitizer.
+	ConfigureCodexShellTarget("powershell")
+	out2 := ProjectShellArgsForClient(string(payload), "shell", "command")
+	var obj2 map[string]any
+	_ = json.Unmarshal([]byte(out2), &obj2)
+	if cmd, _ := obj2["command"].(string); strings.Contains(cmd, `'\''`) {
+		t.Fatalf("powershell target must strip bash glue, got %q", cmd)
+	}
+
+	// Soft force via rules: auto + rules on → PS for shell/command.
+	ConfigureCodexShellTarget("auto")
+	ConfigureCodexShellPolicy(true, false, false, false)
+	raw := `'C:\Program Files\PowerShell\7\pwsh.exe' -NoProfile -Command 'Get-Date'`
+	payload3, _ := json.Marshal(map[string]any{"command": raw})
+	out3 := ProjectShellArgsForClient(string(payload3), "shell", "command")
+	var obj3 map[string]any
+	_ = json.Unmarshal([]byte(out3), &obj3)
+	cmd3, _ := obj3["command"].(string)
+	if !strings.HasPrefix(strings.TrimSpace(cmd3), "& ") {
+		t.Fatalf("rules soft-force should repair single-quoted exe under command key, got %q", cmd3)
+	}
+
+	// Hermes terminal stays POSIX even under powershell target? Actually our force
+	// keeps terminal POSIX. Verify bash glue preserved for terminal.
+	ConfigureCodexShellTarget("powershell")
+	ConfigureCodexShellPolicy(false, false, false, false)
+	out4 := ProjectShellArgsForClient(string(payload), "terminal", "command")
+	var obj4 map[string]any
+	_ = json.Unmarshal([]byte(out4), &obj4)
+	if cmd, _ := obj4["command"].(string); !strings.Contains(cmd, `'\''`) {
+		t.Fatalf("terminal must stay POSIX under powershell target, got %q", cmd)
+	}
+}
+
 func TestProjectShellArgsRepairsJSONStylePowerShellArray(t *testing.T) {
 	broken := `[ "'.tmp", ".pytest_cache", "logs" ] | ForEach-Object { if (Test-Path -LiteralPath $_) { Remove-Item -LiteralPath $_ -Recurse -Force } }`
 	payload, err := json.Marshal(map[string]any{"command": broken})

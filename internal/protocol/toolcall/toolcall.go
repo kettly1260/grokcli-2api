@@ -857,6 +857,10 @@ func stripShellCommandJunk(s string) string {
 // Linux CLI / bash / zsh / Hermes terminal → DialectPOSIX.
 // Internal normalize (before client projection) uses DialectPOSIX so we never
 // destroy legitimate bash quote-glue that a Linux client needs.
+//
+// codex_shell_target (admin durable setting) can force PowerShell or POSIX when
+// schema heuristics alone are insufficient (e.g. Codex Desktop advertising
+// command-only shell schemas while the host still runs PowerShell).
 type shellDialect int
 
 const (
@@ -864,23 +868,61 @@ const (
 	DialectPowerShell
 )
 
-// shellDialectForClient picks dialect from client-facing preferred key / tool name.
-// preferredKey "cmd" is Codex schema; exec_command is the Codex tool family.
+// shellDialectForClient picks dialect from client-facing preferred key / tool name
+// and optional deployment-level codex_shell_target override.
+//
+// preferredKey "cmd" is the classic Codex schema; exec_command is the Codex tool
+// family. Hermes terminal stays POSIX unless the operator forces powershell.
 func shellDialectForClient(toolName, preferredKey string) shellDialect {
 	pk := strings.ToLower(strings.TrimSpace(preferredKey))
+	nk := nameKey(toolName)
+	low := strings.ToLower(strings.TrimSpace(toolName))
+	target := CodexShellTarget()
+
+	// Explicit deployment override (C/B): one proxy instance usually serves one OS.
+	switch target {
+	case "powershell":
+		// Never rewrite Hermes terminal unless the tool name is itself Codex-like.
+		if nk == "terminal" && !strings.Contains(low, "exec_command") {
+			return DialectPOSIX
+		}
+		if isShellTool(toolName) {
+			return DialectPowerShell
+		}
+	case "posix":
+		return DialectPOSIX
+	}
+
+	// auto: schema / tool-name heuristics.
+	// preferredKey "cmd" is classic Codex; keep bash clients (command + shell/terminal) POSIX
+	// unless admin already opted into Codex PowerShell policy (rules/guard) or forced target.
 	if pk == "cmd" {
 		return DialectPowerShell
 	}
-	nk := nameKey(toolName)
-	if nk == "exec_command" || strings.Contains(nk, "exec_command") {
+	if nk == "execcommand" || strings.Contains(nk, "execcommand") {
 		return DialectPowerShell
 	}
-	// Namespaced: default_api.exec_command
-	low := strings.ToLower(toolName)
-	if strings.Contains(low, "exec_command") {
+	// Namespaced: default_api.exec_command (raw name may still contain underscores).
+	if strings.Contains(low, "exec_command") || strings.Contains(low, "execcommand") {
+		return DialectPowerShell
+	}
+	// Soft decoupling: when the operator enabled Codex PS hard-rules or guard, this
+	// proxy is almost certainly serving Windows Codex. Project shell-family tools as
+	// PowerShell even if the client schema uses preferredKey=command (Desktop).
+	// Hermes terminal stays POSIX.
+	if (CodexPowerShellRulesEnabled() || CodexPowerShellGuardEnabled()) &&
+		isShellTool(toolName) && nk != "terminal" {
 		return DialectPowerShell
 	}
 	return DialectPOSIX
+}
+
+// shellDialectName returns a stable log label for a dialect.
+func shellDialectName(d shellDialect) string {
+	if d == DialectPowerShell {
+		return "powershell"
+	}
+	return "posix"
 }
 
 // joinShellArgv joins argv parts into one shell command string.
@@ -1176,7 +1218,31 @@ func repairMangledPSExecutablePrefix(s string) string {
 	if len(trimmed) < 6 {
 		return s
 	}
+	// Already a call-operator invocation — leave alone.
+	if strings.HasPrefix(trimmed, "& ") || strings.HasPrefix(trimmed, "&.") {
+		return s
+	}
 
+	// Case A: single-quoted path missing call operator.
+	// Live Codex Desktop: 'C:\Program Files\PowerShell\7\pwsh.exe' -NoProfile ...
+	// PowerShell parses this as a string expression + unexpected token '-NoProfile'.
+	if trimmed[0] == '\'' {
+		closeRel := strings.IndexByte(trimmed[1:], '\'')
+		if closeRel >= 0 {
+			closeIdx := 1 + closeRel
+			path := trimmed[1:closeIdx]
+			rest := strings.TrimLeft(trimmed[closeIdx+1:], " \t")
+			if pathLooksLikeInvokable(path) && restLooksLikeArgs(rest) {
+				fixed := "& '" + escapePSSingle(path) + "'"
+				if rest != "" {
+					fixed += " " + rest
+				}
+				return fixed
+			}
+		}
+	}
+
+	// Case B: mangled / bare / double-quoted drive path closed by '"' (legacy).
 	pathStart := -1
 	switch {
 	case trimmed[0] == '$' && len(trimmed) > 3 && trimmed[2] == ':' && trimmed[3] == '\\':
@@ -1195,7 +1261,7 @@ func repairMangledPSExecutablePrefix(s string) string {
 	}
 	closeIdx := pathStart + closeRel
 	path := trimmed[pathStart:closeIdx]
-	if !strings.HasSuffix(strings.ToLower(path), ".exe") {
+	if !pathLooksLikeInvokable(path) {
 		return s
 	}
 	rest := strings.TrimLeft(trimmed[closeIdx+1:], " \t")
@@ -1204,6 +1270,79 @@ func repairMangledPSExecutablePrefix(s string) string {
 		fixed += " " + rest
 	}
 	return fixed
+}
+
+// pathLooksLikeInvokable reports whether path is an executable / script that
+// needs the PowerShell call operator when quoted.
+func pathLooksLikeInvokable(path string) bool {
+	p := strings.TrimSpace(path)
+	if p == "" {
+		return false
+	}
+	low := strings.ToLower(p)
+	for _, suf := range []string{".exe", ".cmd", ".bat", ".ps1", ".com", ".msi"} {
+		if strings.HasSuffix(low, suf) {
+			return true
+		}
+	}
+	// Uncommon but legal: quoted bare path to a file with spaces and no extension
+	// is too ambiguous — only accept drive-letter Windows paths ending in known bins.
+	base := low
+	if i := strings.LastIndexAny(low, `\/`); i >= 0 {
+		base = low[i+1:]
+	}
+	switch base {
+	case "pwsh", "powershell", "node", "python", "python3", "py", "npm", "npx", "git":
+		return true
+	}
+	return false
+}
+
+// restLooksLikeArgs is true when the text after a quoted path looks like CLI flags
+// rather than PowerShell pipeline/operators that legitimately follow a string.
+func restLooksLikeArgs(rest string) bool {
+	rest = strings.TrimSpace(rest)
+	if rest == "" {
+		return false
+	}
+	// PowerShell operators / comparisons that may legitimately follow a string literal.
+	// Check these BEFORE treating a leading '-' as a CLI flag (e.g. -eq / -NoProfile).
+	low := strings.ToLower(rest)
+	for _, op := range []string{
+		"|", ";", "&&", "||",
+		"-and ", "-or ", "-not ", "-xor ",
+		"-eq ", "-ne ", "-gt ", "-ge ", "-lt ", "-le ",
+		"-like ", "-notlike ", "-match ", "-notmatch ",
+		"-contains ", "-notcontains ", "-in ", "-notin ",
+		"-is ", "-isnot ", "-as ",
+	} {
+		if strings.HasPrefix(low, strings.TrimSpace(op)) || strings.HasPrefix(low, op) {
+			// Accept exact operator token start (with or without trailing space).
+			tok := strings.TrimSpace(op)
+			if strings.HasPrefix(low, tok) {
+				if len(low) == len(tok) {
+					return false
+				}
+				n := low[len(tok)]
+				if n == ' ' || n == '\t' || n == '|' || n == ';' || n == '$' || n == '\'' || n == '"' {
+					return false
+				}
+			}
+		}
+	}
+	// Flag / second path / script arg.
+	c0 := rest[0]
+	if c0 == '-' || c0 == '/' || c0 == '\'' || c0 == '"' {
+		return true
+	}
+	// Bare token that is not a PS operator.
+	switch {
+	case strings.HasPrefix(rest, "|"), strings.HasPrefix(rest, ";"),
+		strings.HasPrefix(rest, "&&"), strings.HasPrefix(rest, "||"):
+		return false
+	}
+	// e.g. script.ps1 arg1
+	return true
 }
 
 // repairJSONStylePSArrayPipeline converts the common model mistake
@@ -3489,15 +3628,21 @@ func ProjectShellArgsForClient(argsJSON, toolName, preferredKey string) string {
 	if strVal == nil {
 		return normalized
 	}
-	// PowerShell (Codex cmd) only: strip bash quote-glue / lone-CR path damage,
+	// PowerShell only: strip bash quote-glue / lone-CR path damage,
 	// then optional unwrap / write-safe transforms, then optional guard.
-	// Linux bash/CLI (command key / non-exec_command): leave cmd untouched so
-	// legitimate bash quote-glue and paths keep working.
+	// Linux bash/CLI: leave cmd untouched so legitimate bash quote-glue and paths keep working.
+	sanitizerApplied := false
 	if s, ok := strVal.(string); ok {
-		if shellDialectForClient(toolName, preferredKey) == DialectPowerShell {
+		if dialect == DialectPowerShell {
+			before := s
 			s = sanitizeShellDialectArtifacts(s)
 			s = applyOptionalPowerShellTransforms(s)
 			strVal, _ = GuardShellCmdForClient(s)
+			if out, ok2 := strVal.(string); ok2 {
+				sanitizerApplied = out != before
+			} else {
+				sanitizerApplied = true
+			}
 		} else {
 			strVal = s
 		}
@@ -3515,10 +3660,10 @@ func ProjectShellArgsForClient(argsJSON, toolName, preferredKey string) string {
 	}
 	encoded, err := compactJSON(out)
 	if err != nil {
-		maybeLogShellArgsProjection(toolName, argsJSON, normalized)
+		maybeLogShellArgsProjection(toolName, preferredKey, dialect, sanitizerApplied, argsJSON, normalized)
 		return normalized
 	}
-	maybeLogShellArgsProjection(toolName, argsJSON, encoded)
+	maybeLogShellArgsProjection(toolName, preferredKey, dialect, sanitizerApplied, argsJSON, encoded)
 	return encoded
 }
 
@@ -3564,7 +3709,7 @@ func shellArgsDebugEnabled() bool {
 	return DebugShellArgsEnabled()
 }
 
-func maybeLogShellArgsProjection(toolName, raw, projected string) {
+func maybeLogShellArgsProjection(toolName, preferredKey string, dialect shellDialect, sanitizerApplied bool, raw, projected string) {
 	if !shellArgsDebugEnabled() {
 		return
 	}
@@ -3575,23 +3720,30 @@ func maybeLogShellArgsProjection(toolName, raw, projected string) {
 	outCmd := extractShellCmdValue(projected)
 	junkIn := strings.Contains(rawCmd, "[") && emptyArrayJunkPrefix.MatchString(rawCmd)
 	junkOut := strings.Contains(outCmd, "[") && emptyArrayJunkPrefix.MatchString(outCmd)
-	// Noise control: skip identical projections unless junk is present.
-	if !junkIn && !junkOut && rawCmd == outCmd {
+	changed := rawCmd != outCmd
+	// Always log when dialect is PowerShell or sanitizer ran; otherwise skip identical
+	// POSIX no-ops unless junk is present. This makes ① vs ③ diagnosis one glance.
+	if !junkIn && !junkOut && !changed && dialect != DialectPowerShell && !sanitizerApplied {
 		return
 	}
 	slog.Info("shell args projection",
 		"tool", toolName,
+		"preferred_key", preferredKey,
+		"dialect", shellDialectName(dialect),
+		"shell_target", CodexShellTarget(),
+		"sanitizer_applied", sanitizerApplied || (changed && dialect == DialectPowerShell),
 		"raw_cmd", truncateForLog(rawCmd, 240),
 		"projected_cmd", truncateForLog(outCmd, 240),
 		"junk_prefix_in_raw", junkIn,
 		"junk_prefix_in_projected", junkOut,
 		"raw_len", len(raw),
 		"projected_len", len(projected),
-		"changed", rawCmd != outCmd,
+		"changed", changed,
 	)
 	if junkIn || junkOut {
 		slog.Warn("shell empty-array junk detected",
 			"tool", toolName,
+			"dialect", shellDialectName(dialect),
 			"raw_cmd", truncateForLog(rawCmd, 320),
 			"projected_cmd", truncateForLog(outCmd, 320),
 		)
@@ -3637,10 +3789,11 @@ func truncateForLog(s string, n int) string {
 // D) codex_powershell_unwrap     — optional high-confidence fix: -Value '@(...)' → @(...)
 // E) codex_powershell_write_safe — optional rewrite of multi-line file writes to
 //    Set-Content + Add-Content chains.
+// F) codex_shell_target          — auto|powershell|posix dialect selection for shell tools.
 //
-// All are durable admin settings, hot-reloaded via ConfigureCodexShellPolicy.
-// Transforms (D/E) and guard (C) run ONLY on DialectPowerShell projection —
-// Linux bash/CLI preferredKey=command is never rewritten.
+// All are durable admin settings, hot-reloaded via ConfigureCodexShellPolicy /
+// ConfigureCodexShellTarget. Transforms (D/E) and guard (C) run ONLY on
+// DialectPowerShell projection.
 
 var (
 	codexShellMu             sync.RWMutex
@@ -3648,6 +3801,8 @@ var (
 	codexPowerShellGuard     bool // default false (optional hard reject)
 	codexPowerShellUnwrap    bool // default false (optional array unwrap)
 	codexPowerShellWriteSafe bool // default false (optional write rewrite)
+	// codexShellTarget: "auto" | "powershell" | "posix". Default "auto".
+	codexShellTarget string = "auto"
 )
 
 // ConfigureCodexShellPolicy hot-applies WebUI settings:
@@ -3667,9 +3822,47 @@ func ConfigureCodexShellPolicy(rules, guard, unwrap, writeSafe bool) {
 			"codex_powershell_guard", guard,
 			"codex_powershell_unwrap", unwrap,
 			"codex_powershell_write_safe", writeSafe,
+			"codex_shell_target", CodexShellTarget(),
 			"source", "admin_settings",
 		)
 	}
+}
+
+// ConfigureCodexShellTarget sets deployment-level shell dialect preference.
+// Valid values: auto, powershell, posix (empty / unknown → auto).
+func ConfigureCodexShellTarget(target string) {
+	t := strings.ToLower(strings.TrimSpace(target))
+	switch t {
+	case "powershell", "pwsh", "ps":
+		t = "powershell"
+	case "posix", "bash", "linux":
+		t = "posix"
+	default:
+		t = "auto"
+	}
+	codexShellMu.Lock()
+	prev := codexShellTarget
+	if prev == "" {
+		prev = "auto"
+	}
+	codexShellTarget = t
+	codexShellMu.Unlock()
+	if t != prev {
+		slog.Info("codex shell target updated",
+			"codex_shell_target", t,
+			"source", "admin_settings",
+		)
+	}
+}
+
+// CodexShellTarget returns auto|powershell|posix.
+func CodexShellTarget() string {
+	codexShellMu.RLock()
+	defer codexShellMu.RUnlock()
+	if codexShellTarget == "" {
+		return "auto"
+	}
+	return codexShellTarget
 }
 
 // CodexPowerShellRulesEnabled reports whether instruction injection is on.
