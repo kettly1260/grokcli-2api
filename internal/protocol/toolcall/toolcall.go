@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 )
@@ -2934,6 +2935,14 @@ func ProjectShellArgsForClient(argsJSON, toolName, preferredKey string) string {
 	// workdir/timeout/justification must survive — Codex App relies on workdir
 	// for project-root anchoring (relative paths).
 	sanitizerApplied := false
+	// Unwrap accidental nested shells: pwsh -Command '...' / powershell -Command "..."
+	// when the host executor is already PowerShell (common Codex Desktop waste).
+	if s, ok := strVal.(string); ok {
+		if unwrapped, ok := unwrapNestedPowerShellCommand(s); ok {
+			strVal = unwrapped
+			sanitizerApplied = true
+		}
+	}
 	// Rebuild: preferred key first, keep non-alias extras (workdir, timeout, ...).
 	out := map[string]any{preferredKey: strVal}
 	for k, v := range obj {
@@ -2942,7 +2951,7 @@ func ProjectShellArgsForClient(argsJSON, toolName, preferredKey string) string {
 		case "command", "cmd", "argv", "args", "shell_command", "cmdline", "command_line", "script", "bash", "line":
 			continue
 		default:
-			out[k] = v
+			out[k] = coerceShellNumericField(lk, v)
 		}
 	}
 	encoded, err := compactJSON(out)
@@ -2952,6 +2961,163 @@ func ProjectShellArgsForClient(argsJSON, toolName, preferredKey string) string {
 	}
 	maybeLogShellArgsProjection(toolName, preferredKey, dialect, sanitizerApplied, argsJSON, encoded)
 	return encoded
+}
+
+
+// coerceShellNumericField converts JSON float-looking numbers for Codex shell
+// integer fields (yield_time_ms, max_output_tokens, timeout, etc.) to int64.
+// Codex rejects float literals such as 10000.0 with "expected u64".
+func coerceShellNumericField(key string, value any) any {
+	lk := strings.ToLower(strings.TrimSpace(key))
+	switch lk {
+	case "yield_time_ms", "yield_ms", "timeout_ms", "timeout", "max_output_tokens", "max_tokens":
+		// coerce below
+	default:
+		if !strings.HasSuffix(lk, "_ms") && !strings.HasSuffix(lk, "_tokens") {
+			return value
+		}
+	}
+	switch v := value.(type) {
+	case float64:
+		if v == float64(int64(v)) {
+			return int64(v)
+		}
+	case json.Number:
+		if i, err := v.Int64(); err == nil {
+			return i
+		}
+		if f, err := v.Float64(); err == nil && f == float64(int64(f)) {
+			return int64(f)
+		}
+	case string:
+		s := strings.TrimSpace(v)
+		if s == "" {
+			return value
+		}
+		if i, err := strconv.ParseInt(s, 10, 64); err == nil {
+			return i
+		}
+		if f, err := strconv.ParseFloat(s, 64); err == nil && f == float64(int64(f)) {
+			return int64(f)
+		}
+	}
+	return value
+}
+
+// unwrapNestedPowerShellCommand strips a single redundant outer
+// pwsh/powershell -Command/-c wrapper when the payload is already a full
+// PowerShell script. Avoids "ScriptBlock should only be specified as a value
+// of the Command parameter" when host shell is already pwsh.
+func unwrapNestedPowerShellCommand(cmd string) (string, bool) {
+	s := strings.TrimSpace(cmd)
+	if s == "" {
+		return cmd, false
+	}
+
+	idx, flagLen := findPowerShellCommandFlag(s)
+	if idx < 0 {
+		return cmd, false
+	}
+
+	prefix := strings.TrimSpace(s[:idx])
+	if !isPowerShellLauncherPrefix(prefix) {
+		return cmd, false
+	}
+
+	body := strings.TrimSpace(s[idx+flagLen:])
+	if body == "" {
+		return cmd, false
+	}
+	if len(body) >= 2 {
+		q := body[0]
+		if (q == '\'' || q == '"') && body[len(body)-1] == q {
+			inner := body[1 : len(body)-1]
+			if q == '\'' {
+				inner = strings.ReplaceAll(inner, "''", "'")
+			}
+			body = inner
+		}
+	}
+	body = strings.TrimSpace(body)
+	if body == "" || body == s {
+		return cmd, false
+	}
+	return body, true
+}
+
+func findPowerShellCommandFlag(s string) (idx, flagLen int) {
+	for i := 0; i < len(s); i++ {
+		if s[i] != '-' {
+			continue
+		}
+		if i > 0 && s[i-1] != ' ' && s[i-1] != '\t' {
+			continue
+		}
+		rest := s[i+1:]
+		rl := strings.ToLower(rest)
+		if strings.HasPrefix(rl, "command") {
+			end := len("command")
+			if end < len(rest) && (rest[end] == ' ' || rest[end] == '\t' || rest[end] == '=') {
+				flagLen = 1 + end
+				if rest[end] == '=' {
+					flagLen++
+				}
+				return i, flagLen
+			}
+			continue
+		}
+		// Only bare -c (not -Confirm/-Configuration).
+		if strings.HasPrefix(rl, "c") && len(rest) >= 2 {
+			n := rest[1]
+			if n == ' ' || n == '\t' || n == '=' {
+				flagLen = 2
+				if n == '=' {
+					flagLen = 3
+				}
+				return i, flagLen
+			}
+		}
+	}
+	return -1, 0
+}
+
+// isPowerShellLauncherPrefix accepts only a pure pwsh/powershell executable
+// invocation with optional common switches (-NoProfile, -NonInteractive, ...).
+// It rejects prose such as: Write-Output 'pwsh -Command demo'
+func isPowerShellLauncherPrefix(prefix string) bool {
+	p := strings.TrimSpace(prefix)
+	if p == "" {
+		return false
+	}
+	if strings.ContainsAny(p, "|;") || strings.Contains(p, "\n") {
+		return false
+	}
+	fields := strings.Fields(p)
+	if len(fields) == 0 {
+		return false
+	}
+	exe := strings.Trim(fields[0], `"'`)
+	base := strings.ToLower(exe)
+	if i := strings.LastIndexAny(base, `/\`); i >= 0 {
+		base = base[i+1:]
+	}
+	if base != "pwsh" && base != "pwsh.exe" && base != "powershell" && base != "powershell.exe" {
+		return false
+	}
+	for _, f := range fields[1:] {
+		fl := strings.ToLower(strings.Trim(f, `"'`))
+		if fl == "" {
+			continue
+		}
+		if !strings.HasPrefix(fl, "-") {
+			return false
+		}
+		// Allow short launcher switches only.
+		if len(fl) > 24 || strings.ContainsAny(fl, "(){}") {
+			return false
+		}
+	}
+	return true
 }
 
 func firstNonNil(values ...any) any {

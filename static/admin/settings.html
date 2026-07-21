@@ -454,11 +454,12 @@
       <label class="g2a-check"><input type="checkbox" id="set-debug-shell-args" /> Shell 参数调试日志（记录 cmd 投影前后，排查 <code>[    ]</code> 前缀等问题）</label>
       <div class="g2a-muted" style="margin-top:4px;margin-left:1.6em">开启后服务端日志会打印 preferred_key / has_workdir / raw_cmd / projected_cmd（仅出站投影诊断，不改上游 prompt/cache）；平时请关闭</div>
     </div>
-</div>
-</div>
-</div>
-</div>
-</div>
+    <div class="g2a-field" style="grid-column:1/-1">
+      <div class="g2a-muted" style="padding:10px 12px;border:1px solid var(--g2a-border, #333);border-radius:8px;line-height:1.55">
+        <strong>Codex App Shell 透传（已内置，无需开关）</strong><br />
+        自动识别 Codex App / CLI 的 <code>exec_command</code>/<code>local_shell</code>（支持 <code>cmd</code> 与 <code>command</code>）。出站仅做 <code>command↔cmd</code> 键名对齐与 argv 扁平化，并保留 <code>workdir</code>/timeout；不注入 PowerShell 规则、不改写命令正文，避免破坏 prompt cache。Windows Codex Desktop 请直接使用透传后的相对路径 + workdir。
+      </div>
+    </div>
   </div>
   <div class="g2a-actions" style="margin-top:14px;justify-content:flex-end;gap:8px;flex-wrap:wrap">
     <button type="button" class="g2a-btn g2a-btn-default" id="btn-reset-settings-relay">重置默认</button>

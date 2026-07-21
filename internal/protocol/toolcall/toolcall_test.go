@@ -1514,3 +1514,65 @@ func TestProjectShellArgsPassthroughNoBashRewrite(t *testing.T) {
 	}
 }
 
+func TestProjectShellArgsCoercesYieldTimeMsFloat(t *testing.T) {
+	payload, err := json.Marshal(map[string]any{
+		"command":           "rg -n timer workout-core.js",
+		"workdir":           `G:\LLM\rehab`,
+		"yield_time_ms":     10000.0,
+		"max_output_tokens": 2000.0,
+		"timeout_ms":        15000.0,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := ProjectShellArgsForClient(string(payload), "exec_command", "cmd")
+	var obj map[string]any
+	if err := json.Unmarshal([]byte(out), &obj); err != nil {
+		t.Fatal(err)
+	}
+	// Ensure encoded JSON has no ".0" float leftovers that Codex rejects as u64.
+	if strings.Contains(out, "10000.0") || strings.Contains(out, "2000.0") || strings.Contains(out, "15000.0") {
+		t.Fatalf("float leftovers in projection: %s", out)
+	}
+	for _, key := range []string{"yield_time_ms", "max_output_tokens", "timeout_ms"} {
+		if _, ok := obj[key]; !ok {
+			t.Fatalf("missing %s in %s", key, out)
+		}
+	}
+	if obj["workdir"] != `G:\LLM\rehab` {
+		t.Fatalf("workdir lost: %v", obj["workdir"])
+	}
+	if obj["cmd"] != "rg -n timer workout-core.js" {
+		t.Fatalf("cmd changed: %v", obj["cmd"])
+	}
+}
+
+func TestProjectShellArgsUnwrapsNestedPwshCommand(t *testing.T) {
+	inner := `$p='app-update.js'; Get-Content -LiteralPath $p | Select-Object -First 5`
+	outer := "pwsh -NoProfile -Command '" + strings.ReplaceAll(inner, "'", "''") + "'"
+	payload, _ := json.Marshal(map[string]any{
+		"command": outer,
+		"workdir": `G:\LLM\rehab`,
+	})
+	out := ProjectShellArgsForClient(string(payload), "exec_command", "cmd")
+	var obj map[string]any
+	_ = json.Unmarshal([]byte(out), &obj)
+	if obj["cmd"] != inner {
+		t.Fatalf("unwrap failed:\n got: %q\nwant: %q\nraw out: %s", obj["cmd"], inner, out)
+	}
+	if obj["workdir"] != `G:\LLM\rehab` {
+		t.Fatalf("workdir lost: %v", obj["workdir"])
+	}
+}
+
+func TestProjectShellArgsDoesNotUnwrapNonLauncher(t *testing.T) {
+	cmdIn := `Write-Output 'pwsh -Command demo'; Get-Date`
+	payload, _ := json.Marshal(map[string]any{"command": cmdIn})
+	out := ProjectShellArgsForClient(string(payload), "exec_command", "cmd")
+	var obj map[string]any
+	_ = json.Unmarshal([]byte(out), &obj)
+	if obj["cmd"] != cmdIn {
+		t.Fatalf("should not unwrap prose containing pwsh: %q", obj["cmd"])
+	}
+}
+
