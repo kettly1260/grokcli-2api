@@ -402,6 +402,15 @@ def _resolve_mail_credentials(
         if cfg.get("cfmail_domain") not in (None, ""):
             dom = str(cfg.get("cfmail_domain") or "").strip()
         base = str(cfg.get("cfmail_base_url") or base).strip()
+    elif prov == "cloudmail":
+        # Cloud Mail (maillab/cloud-mail): admin_email:password credential +
+        # self-hosted Worker origin. The active key/base were mirrored into
+        # moemail_* slots by registration_service.start_job; on resume, also
+        # consult the dedicated cloudmail_* slots in the reg_config snapshot.
+        key = str(cfg.get("cloudmail_api_key") or key).strip()
+        if cfg.get("cloudmail_domain") not in (None, ""):
+            dom = str(cfg.get("cloudmail_domain") or "").strip()
+        base = str(cfg.get("cloudmail_base_url") or base).strip()
     elif prov == "tempmail":
         # Free tier: no key. Optional Bearer key for Plus/Ultra.
         key = str(cfg.get("tempmail_api_key") or key).strip()
@@ -1336,7 +1345,7 @@ def _make_email_receiver(
             "Save the key in 协议注册配置 (each provider keeps its own key; TempMail.lol free needs none)."
         )
     # Multi-domain config (newlines/commas): rotate by domain_index in batch jobs.
-    # Empty list => provider auto-pick (YYDS/GPTMail/CF) or MOEMAIL_DOMAIN fallback.
+    # Empty list => provider auto-pick (YYDS/GPTMail/CF/Cloud Mail) or MOEMAIL_DOMAIN fallback.
     domains = parse_domain_list(domain)
     if domains:
         if domain_index is not None:
@@ -1344,9 +1353,11 @@ def _make_email_receiver(
         else:
             dom = pick_domain_from_list(domain, strategy="random")
     else:
-        # YYDS/GPTMail/CFMail: empty domain means provider-side auto/random pick.
-        # Never bleed MoeMail's MOEMAIL_DOMAIN (default example.com) into them.
-        if prov in {"yyds", "gptmail", "cfmail", "tempmail"}:
+        # YYDS/GPTMail/CFMail/Cloud Mail: empty domain means provider-side
+        # auto/random pick (Cloud Mail calls /setting/websiteConfig inside
+        # cloudmail_create_mailbox). Never bleed MoeMail's MOEMAIL_DOMAIN
+        # (default example.com) into them.
+        if prov in {"yyds", "gptmail", "cfmail", "tempmail", "cloudmail"}:
             dom = ""
         else:
             dom = (domain or MOEMAIL_DOMAIN or "").strip().lstrip("@").strip(".")
@@ -1390,6 +1401,12 @@ def _make_email_receiver(
                 default_base = "https://temp-email-api.awsl.uk"
             elif provider == "tempmail":
                 default_base = "https://api.tempmail.lol"
+            elif provider == "cloudmail":
+                # Cloud Mail is self-hosted; base_url is required and validated
+                # upstream. Empty default here keeps the receiver honest if the
+                # caller forgot to pass base_url (will surface as a network error
+                # rather than silently hitting the wrong host).
+                default_base = ""
             else:
                 default_base = "https://moemail.521884.xyz"
             self.base_url = base_url or default_base

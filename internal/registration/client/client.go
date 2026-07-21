@@ -20,6 +20,10 @@ type Client struct {
 	BaseURL string
 	Token   string
 	HTTP    *http.Client
+	// HTTPLong is used for long-running POST operations (job creation,
+	// device login, SSO import) that may take ~30s+ due to turnstile
+	// solving and email roundtrips. If nil, falls back to HTTP.
+	HTTPLong *http.Client
 }
 
 type Error struct {
@@ -147,6 +151,13 @@ func (c *Client) doAbsolute(ctx context.Context, method, absPath string, body an
 				ForceAttemptHTTP2:     true,
 			},
 		}
+	}
+	// Long-running POST operations (job creation, device login, SSO import)
+	// can take ~30s+ due to turnstile solving + email roundtrips. Use a
+	// dedicated long-timeout client so the default short-timeout client
+	// (tuned for fast polling) doesn't prematurely abort them.
+	if method == http.MethodPost && c.HTTPLong != nil {
+		httpClient = c.HTTPLong
 	}
 	response, err := httpClient.Do(request)
 	if err != nil {

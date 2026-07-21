@@ -50,6 +50,11 @@ CFMAIL_DEFAULT_BASE_URL = "https://temp-email-api.awsl.uk"
 # TempMail.lol (https://tempmail.lol/zh/api) — free tier needs no API key.
 TEMPMAIL_LOL_DEFAULT_BASE_URL = "https://api.tempmail.lol"
 
+# Cloud Mail (https://github.com/maillab/cloud-mail) — Cloudflare Workers +
+# Vue3 self-hosted mailbox service. Open API: /api/public/genToken | /api/public/emailList
+# | /api/public/addUser. Admin email + password exchanged for an Authorization token.
+CLOUDMAIL_DEFAULT_BASE_URL = ""  # no official demo host (self-host only)
+
 
 def _headers(api_key: str | None = None) -> dict[str, str]:
     key = api_key or MOEMAIL_API_KEY
@@ -59,7 +64,7 @@ def _headers(api_key: str | None = None) -> dict[str, str]:
 
 
 def normalize_mail_provider(provider: str | None, *, base_url: str | None = None) -> str:
-    """Return ``moemail`` | ``yyds`` | ``gptmail`` | ``cfmail`` | ``tempmail``.
+    """Return ``moemail`` | ``yyds`` | ``gptmail`` | ``cfmail`` | ``tempmail`` | ``cloudmail``.
 
     Infer from base_url when provider is empty.
     """
@@ -97,6 +102,15 @@ def normalize_mail_provider(provider: str | None, *, base_url: str | None = None
         "tmlol",
     }:
         return "tempmail"
+    if p in {
+        "cloudmail",
+        "cloud-mail",
+        "cloud_mail",
+        "cloud mail",
+        "skymail",
+        "maillab",
+    }:
+        return "cloudmail"
     if p in {"tempmail", "tempmail.lol", "tempmaillol", "tempmail_lol", "lol", "tmlol"}:
         return "tempmail"
     if p in {"moemail", "moe", "moe-mail"}:
@@ -127,6 +141,18 @@ def normalize_mail_provider(provider: str | None, *, base_url: str | None = None
         return "cfmail"
     if any(x in base for x in ("tempmail.lol", "api.tempmail.lol")):
         return "tempmail"
+    # Cloud Mail self-host detection: presence of /public/genToken is unique.
+    if any(
+        x in base
+        for x in (
+            "skymail",
+            "cloud-mail",
+            "/public/genToken",
+            "/public/emailList",
+            "/public/addUser",
+        )
+    ):
+        return "cloudmail"
     return "moemail"
 
 
@@ -1798,6 +1824,413 @@ def tempmail_list_domains(
     return []
 
 
+# ── Cloud Mail (maillab/cloud-mail) ────────────────────────────────────────
+# Cloud Mail is a user-account mailbox service (not a temp inbox). Admin email
+# + password authenticate via POST /api/public/genToken → KV-cached UUID token.
+# The token is then sent as `Authorization: <token>` header on subsequent
+# /api/public/* calls. Mailboxes are created via /api/public/addUser with a list of
+# {email, password} and read via /api/public/emailList filtering by toEmail.
+#
+# The adapter api_key slot stores `admin_email:admin_password` (plain). We
+# parse it here so users only manage a single field in the admin UI.
+
+# Process-local token cache: (token, expires_at). Token lives in Cloudflare KV
+# with no documented TTL, but re-running genToken invalidates the previous one.
+# We cache for 25 minutes and refresh on 401.
+_CLOUDMAIL_TOKEN_CACHE: dict[str, tuple[str, float]] = {}
+_CLOUDMAIL_TOKEN_TTL_SEC = 1500.0  # 25 min
+
+
+def normalize_cloudmail_base_url(base_url: str | None = None) -> str:
+    """Normalize Cloud Mail Worker origin. Self-hosted only — no default host.
+
+    Accepts ``https://skymail.example.com`` or ``skymail.example.com`` and
+    strips trailing ``/``, ``/api``, ``/#/`` paths pasted from the browser.
+    """
+    raw = (base_url or "").strip()
+    if not raw:
+        return ""
+    lower = raw.lower()
+    # Reject accidental other-provider pastes.
+    if any(
+        x in lower
+        for x in (
+            "moemail.example.com",
+            "moemail.521884.xyz",
+            "maliapi.215.im",
+            "vip.215.im",
+            "chatgpt.org.uk",
+            "temp-email-api.awsl.uk",
+            "api.tempmail.lol",
+        )
+    ):
+        return ""
+    parsed = urlparse(raw if "://" in raw else f"https://{raw}")
+    if not parsed.netloc:
+        return ""
+    origin = f"{parsed.scheme or 'https'}://{parsed.netloc}".rstrip("/")
+    return origin
+
+
+def _cloudmail_parse_credential(api_key: str | None) -> tuple[str, str]:
+    """Split ``admin_email:password`` into (email, password).
+
+    Email is the part before the last ``:`` so passwords containing ``:`` work.
+    """
+    raw = (api_key or "").strip()
+    if not raw:
+        return "", ""
+    # base64 fallback: if no ':' present, try decoding base64(email:password).
+    if ":" not in raw:
+        import base64 as _b64
+
+        try:
+            decoded = _b64.urlsafe_b64decode(raw + "=" * (-len(raw) % 4)).decode(
+                "utf-8", errors="replace"
+            )
+            if ":" in decoded:
+                raw = decoded
+        except Exception:
+            pass
+    if ":" not in raw:
+        return "", ""
+    email, _, password = raw.rpartition(":")
+    return email.strip(), password.strip()
+
+
+def _cloudmail_get_token(
+    *,
+    base: str,
+    admin_email: str,
+    admin_password: str,
+) -> str:
+    """Obtain (and cache) a Cloud Mail public API token via /public/genToken."""
+    cache_key = base
+    cached = _CLOUDMAIL_TOKEN_CACHE.get(cache_key)
+    now = time.time()
+    if cached and cached[1] > now:
+        return cached[0]
+    with httpx.Client(timeout=30.0) as client:
+        resp = client.post(
+            f"{base}/api/public/genToken",
+            json={"email": admin_email, "password": admin_password},
+            headers={"Content-Type": "application/json"},
+        )
+        if resp.status_code >= 400:
+            raise RuntimeError(
+                f"Cloud Mail genToken failed {resp.status_code}: {resp.text[:500]}"
+            )
+        data = resp.json() if resp.content else {}
+    # Envelope: { code: 200, message: "success", data: { token: "uuid" } }
+    body = data.get("data") if isinstance(data, dict) else None
+    token = ""
+    if isinstance(body, dict):
+        token = str(body.get("token") or "").strip()
+    if not token:
+        raise RuntimeError(f"Cloud Mail genToken returned no token: {data}")
+    _CLOUDMAIL_TOKEN_CACHE[cache_key] = (token, now + _CLOUDMAIL_TOKEN_TTL_SEC)
+    return token
+
+
+def _cloudmail_invalidate_token(base: str) -> None:
+    _CLOUDMAIL_TOKEN_CACHE.pop(base, None)
+
+
+def cloudmail_list_domains(
+    *,
+    api_key: str | None = None,
+    base_url: str | None = None,
+) -> list[str]:
+    """Fetch domain list from Cloud Mail public website config.
+
+    GET /api/setting/websiteConfig is excluded from auth and returns site config
+    including the configured ``domain`` array. Empty list when unreachable.
+    """
+    base = normalize_cloudmail_base_url(base_url)
+    if not base:
+        return []
+    try:
+        with httpx.Client(timeout=20.0) as client:
+            resp = client.get(f"{base}/api/setting/websiteConfig")
+            if resp.status_code >= 400:
+                return []
+            data = resp.json() if resp.content else {}
+    except Exception:
+        return []
+    body = data.get("data") if isinstance(data, dict) and "data" in data else data
+    if not isinstance(body, dict):
+        return []
+    raw_domains = body.get("domainList") or body.get("domain") or body.get("domains") or []
+    if isinstance(raw_domains, str):
+        raw_domains = [x.strip() for x in raw_domains.split(",") if x.strip()]
+    if not isinstance(raw_domains, list):
+        return []
+    out: list[str] = []
+    seen: set[str] = set()
+    for item in raw_domains:
+        if isinstance(item, dict):
+            name = item.get("domain") or item.get("name") or item.get("value")
+        else:
+            name = item
+        if not isinstance(name, str) or not name.strip():
+            continue
+        name = name.strip().lstrip("@").strip(".").lower()
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        out.append(name)
+    return out
+
+
+def cloudmail_pick_domain(
+    *,
+    api_key: str | None = None,
+    base_url: str | None = None,
+) -> str | None:
+    """Randomly pick a domain from Cloud Mail website config."""
+    domains = cloudmail_list_domains(api_key=api_key, base_url=base_url)
+    if not domains:
+        return None
+    return random.choice(domains)
+
+
+def cloudmail_create_mailbox(
+    *,
+    name: str | None = None,
+    domain: str | None = None,
+    expiry_ms: int | None = None,  # accepted for API compat; Cloud Mail accounts are durable
+    api_key: str | None = None,
+    base_url: str | None = None,
+    proxy: str | None = None,
+    proxy_username: str | None = None,
+    proxy_password: str | None = None,
+) -> dict[str, Any]:
+    """Create a mailbox user on Cloud Mail (maillab/cloud-mail).
+
+    Requires admin credentials in ``api_key`` as ``admin_email:password`` and
+    the self-hosted Worker origin in ``base_url``. Calls:
+      1. POST /api/public/genToken  → Authorization token
+      2. POST /api/public/addUser   → create the user/mailbox
+    The new account's password is randomly generated and returned for callers
+    that may need to log in to the mailbox UI.
+    """
+    admin_email, admin_password = _cloudmail_parse_credential(api_key)
+    if not admin_email or not admin_password:
+        raise ValueError(
+            "Cloud Mail admin credentials missing. Fill 协议注册 → Cloud Mail "
+            "API Key as `admin_email:password`. Repo: "
+            "https://github.com/maillab/cloud-mail"
+        )
+    base = normalize_cloudmail_base_url(base_url)
+    if not base:
+        raise ValueError(
+            "Cloud Mail Base URL missing. Fill 协议注册 → Cloud Mail Base URL "
+            "(self-hosted Worker origin, e.g. https://skymail.example.com)."
+        )
+
+    # Resolve target domain: explicit > config list > /setting/websiteConfig.
+    dom = pick_domain_from_list(domain) if domain else ""
+    if not dom:
+        dom = (domain or "").strip().lstrip("@").strip(".")
+    if not dom:
+        dom = cloudmail_pick_domain(api_key=api_key, base_url=base) or ""
+    if not dom:
+        raise ValueError(
+            "Cloud Mail domain missing. Fill Cloud Mail 域名 in 协议注册, or "
+            f"ensure GET {base}/api/setting/websiteConfig returns a domain list."
+        )
+
+    # Local-part: explicit name > random hex. Cloud Mail accepts standard
+    # email name chars; strip anything else.
+    local = (name or "").strip().lower()
+    if not local:
+        import secrets as _s
+
+        local = _s.token_hex(5)
+    local = re.sub(r"[^a-z0-9._+-]", "", local) or secrets_token_hex_local()
+    address = f"{local}@{dom}"
+
+    # Random password for the new mailbox account (returned to caller).
+    import secrets as _s
+
+    mailbox_password = _s.token_urlsafe(12)
+
+    token = _cloudmail_get_token(
+        base=base, admin_email=admin_email, admin_password=admin_password
+    )
+    payload = {
+        "list": [
+            {"email": address, "password": mailbox_password},
+        ]
+    }
+    with httpx.Client(timeout=30.0) as client:
+        resp = client.post(
+            f"{base}/api/public/addUser",
+            json=payload,
+            headers={
+                "Authorization": token,
+                "Content-Type": "application/json",
+            },
+        )
+        # 401 → token expired/invalidated; refresh once and retry.
+        if resp.status_code == 401:
+            _cloudmail_invalidate_token(base)
+            token = _cloudmail_get_token(
+                base=base, admin_email=admin_email, admin_password=admin_password
+            )
+            resp = client.post(
+                f"{base}/api/public/addUser",
+                json=payload,
+                headers={
+                    "Authorization": token,
+                    "Content-Type": "application/json",
+                },
+            )
+        if resp.status_code >= 400:
+            raise RuntimeError(
+                f"Cloud Mail addUser failed {resp.status_code}: {resp.text[:500]}"
+            )
+        data = resp.json() if resp.content else {}
+
+    # Cloud Mail addUser returns {code:200, message:"success", data:null} on OK.
+    code = data.get("code") if isinstance(data, dict) else None
+    if isinstance(code, int) and code != 200:
+        raise RuntimeError(
+            f"Cloud Mail addUser failed: {data.get('message') or data}"
+        )
+
+    return {
+        # Cloud Mail has no per-mailbox numeric id; the address is the identity.
+        "id": address,
+        "email": address,
+        # Reuse `token` slot to carry admin token so callers can poll without
+        # re-running genToken (fetch_messages will refresh on 401 anyway).
+        "token": token,
+        "password": mailbox_password,
+        "provider": "cloudmail",
+        "raw": data,
+        "expiry_ms": 86_400_000 if expiry_ms is None else int(expiry_ms),
+    }
+
+
+def cloudmail_fetch_messages(
+    email_id: str,
+    *,
+    api_key: str | None = None,
+    base_url: str | None = None,
+    include_details: bool = True,
+    address: str | None = None,
+    token: str | None = None,
+) -> list[dict[str, Any]]:
+    """List messages for a Cloud Mail inbox via POST /public/emailList.
+
+    ``email_id`` / ``address`` is the full mailbox address (Cloud Mail has no
+    numeric mailbox id). Filtering uses ``toEmail`` LIKE match (server-side).
+    """
+    addr = (address or email_id or "").strip()
+    if not addr or "@" not in addr:
+        return []
+    admin_email, admin_password = _cloudmail_parse_credential(api_key)
+    if not admin_email or not admin_password:
+        return []
+    base = normalize_cloudmail_base_url(base_url)
+    if not base:
+        return []
+
+    # Reuse cached admin token when caller did not pass one.
+    tok = (token or "").strip()
+    if not tok:
+        try:
+            tok = _cloudmail_get_token(
+                base=base, admin_email=admin_email, admin_password=admin_password
+            )
+        except Exception:
+            return []
+
+    payload: dict[str, Any] = {
+        "toEmail": addr,
+        "num": 1,
+        "size": 20,
+        "timeSort": "desc",
+        "isDel": 0,
+    }
+    with httpx.Client(timeout=30.0) as client:
+        resp = client.post(
+            f"{base}/api/public/emailList",
+            json=payload,
+            headers={
+                "Authorization": tok,
+                "Content-Type": "application/json",
+            },
+        )
+        if resp.status_code == 401:
+            _cloudmail_invalidate_token(base)
+            try:
+                tok = _cloudmail_get_token(
+                    base=base, admin_email=admin_email, admin_password=admin_password
+                )
+            except Exception:
+                return []
+            resp = client.post(
+                f"{base}/api/public/emailList",
+                json=payload,
+                headers={
+                    "Authorization": tok,
+                    "Content-Type": "application/json",
+                },
+            )
+        if resp.status_code >= 400:
+            raise RuntimeError(
+                f"Cloud Mail emailList failed {resp.status_code}: {resp.text[:500]}"
+            )
+        data = resp.json() if resp.content else {}
+
+    # Envelope: { code:200, data: [{...email rows...}] }
+    body = data.get("data") if isinstance(data, dict) and "data" in data else data
+    messages: list[Any] = []
+    if isinstance(body, list):
+        messages = body
+    elif isinstance(body, dict):
+        messages = body.get("list") or body.get("emails") or body.get("items") or []
+    if not isinstance(messages, list):
+        return []
+
+    out: list[dict[str, Any]] = []
+    for raw in messages[:20]:
+        if not isinstance(raw, dict):
+            continue
+        item = dict(raw)
+        # Normalize field names so shared extractors work.
+        if item.get("sendEmail") and not item.get("from"):
+            item["from"] = item.get("sendEmail")
+        if item.get("sendEmail") and not item.get("from_address"):
+            item["from_address"] = item.get("sendEmail")
+        if item.get("sendName") and not item.get("from_name"):
+            item["from_name"] = item.get("sendName")
+        if item.get("createTime") and not item.get("date"):
+            item["date"] = item.get("createTime")
+        if item.get("emailId") and not item.get("id"):
+            item["id"] = str(item.get("emailId"))
+        # Cloud Mail already stores content + text on each row, so detail
+        # fetch is unnecessary. include_details kept for API compat only.
+        text_blob = "\n".join(
+            str(item.get(k) or "")
+            for k in (
+                "subject",
+                "content",
+                "text",
+                "html",
+                "from",
+                "from_address",
+                "sendEmail",
+                "sendName",
+            )
+        )
+        item["extracted"] = _extract_codes_and_links(text_blob)
+        out.append(item)
+    return out
+
+
 def create_mailbox(
     *,
     provider: str | None = None,
@@ -1810,8 +2243,19 @@ def create_mailbox(
     proxy_username: str | None = None,
     proxy_password: str | None = None,
 ) -> dict[str, Any]:
-    """Provider-aware mailbox create (``moemail`` | ``yyds`` | ``gptmail`` | ``cfmail`` | ``tempmail``)."""
+    """Provider-aware mailbox create (``moemail`` | ``yyds`` | ``gptmail`` | ``cfmail`` | ``tempmail`` | ``cloudmail``)."""
     prov = normalize_mail_provider(provider, base_url=base_url)
+    if prov == "cloudmail":
+        return cloudmail_create_mailbox(
+            name=name,
+            domain=domain,
+            expiry_ms=expiry_ms,
+            api_key=api_key,
+            base_url=base_url,
+            proxy=proxy,
+            proxy_username=proxy_username,
+            proxy_password=proxy_password,
+        )
     if prov == "yyds":
         return yyds_create_mailbox(
             name=name,
@@ -1883,6 +2327,15 @@ def fetch_messages(
 ) -> list[dict[str, Any]]:
     """Provider-aware message list."""
     prov = normalize_mail_provider(provider, base_url=base_url)
+    if prov == "cloudmail":
+        return cloudmail_fetch_messages(
+            email_id,
+            api_key=api_key,
+            base_url=base_url,
+            include_details=include_details,
+            address=address,
+            token=token,
+        )
     if prov == "yyds":
         return yyds_fetch_messages(
             email_id,

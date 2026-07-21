@@ -96,7 +96,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" media="print" onload="this.media='all'" />
-  <link rel="stylesheet" href="/static/dist/admin-antd.289114c3f5.css" />
+  <link rel="stylesheet" href="/static/dist/admin-antd.74245c11e2.css" />
   <link rel="icon" href="/static/favicon.ico" type="image/x-icon" />
 
 </head>
@@ -310,6 +310,7 @@
         <option value="gptmail">GPTMail（mail.chatgpt.org.uk）</option>
         <option value="cfmail">Cloudflare Temp Email</option>
         <option value="tempmail">TempMail.lol（免费无需 Key）</option>
+        <option value="cloudmail">Cloud Mail（maillab/cloud-mail）</option>
       </select>
     </div>
     <div class="g2a-field" style="grid-column:1/-1">
@@ -377,6 +378,21 @@
       <label for="reg-tempmail-domain">TempMail.lol 自定义域名（可选，付费）</label>
       <textarea id="reg-tempmail-domain" class="g2a-input" rows="2" placeholder="免费层级请留空（系统随机域名）；自定义域名需 Plus/Ultra" autocomplete="off" name="reg-tempmail-domain" spellcheck="false"></textarea>
       <div class="g2a-muted" style="margin-top:4px;font-size:12px">API：api.tempmail.lol · 文档 <a href="https://tempmail.lol/zh/api" target="_blank" rel="noopener">tempmail.lol/zh/api</a>。免费：POST /v2/inbox/create（无需 Key），收信 GET /v2/inbox?token=…</div>
+    </div>
+
+    <!-- Cloud Mail (maillab/cloud-mail): self-hosted Worker origin + admin_email:password + domains -->
+    <div class="g2a-field reg-mail-panel" data-mail="cloudmail" id="reg-panel-cloudmail-base" style="grid-column:1/-1;display:none">
+      <label for="reg-cloudmail-base-url">Cloud Mail Base URL</label>
+      <input id="reg-cloudmail-base-url" placeholder="https://skymail.example.com（自托管 Worker 源）" autocomplete="off" name="reg-cloudmail-base-url" />
+    </div>
+    <div class="g2a-field reg-mail-panel" data-mail="cloudmail" id="reg-panel-cloudmail-key" style="grid-column:1/-1;display:none">
+      <label for="reg-cloudmail-api-key">Cloud Mail 管理员凭据</label>
+      <input id="reg-cloudmail-api-key" placeholder="admin_email:password（POST /api/public/genToken）" autocomplete="off" name="reg-cloudmail-api-key" />
+    </div>
+    <div class="g2a-field reg-mail-panel" data-mail="cloudmail" id="reg-panel-cloudmail-domain" style="grid-column:1/-1;display:none">
+      <label for="reg-cloudmail-domain">Cloud Mail 域名（可多个）</label>
+      <textarea id="reg-cloudmail-domain" class="g2a-input" rows="3" placeholder="一行一个；留空=GET /api/setting/websiteConfig 自动选" autocomplete="off" name="reg-cloudmail-domain" spellcheck="false"></textarea>
+      <div class="g2a-muted" style="margin-top:4px;font-size:12px">仓库 <a href="https://github.com/maillab/cloud-mail" target="_blank" rel="noopener">maillab/cloud-mail</a>。Key 填 <code>admin_email:password</code>，系统调用 <code>/api/public/genToken</code> 拿 token（缓存 25 分钟，401 自动刷新）。建邮箱 <code>/api/public/addUser</code>，收信 <code>/api/public/emailList</code>。与 MoeMail / CF Temp Email 的 Base URL / Key / 域名完全独立。</div>
     </div>
     <div class="g2a-field">
       <label for="reg-captcha-provider">过盾方式</label>
@@ -543,10 +559,10 @@
       </div>
     </div>
   </div>
-  <script src="/static/dist/utils.ac10ff3b58.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
-  <script src="/static/dist/api.9ac71f7ed9.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
-  <script src="/static/dist/state.da9974e23b.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
-  <script src="/static/dist/auth.fa7b1e0e4d.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
-  <script src="/static/dist/core.0ab07681e5.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
+  <script src="/static/dist/utils.9e4e4c63cb.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
+  <script src="/static/dist/api.443dfc63c0.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
+  <script src="/static/dist/state.5846ce62e4.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
+  <script src="/static/dist/auth.539061a1a7.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
+  <script src="/static/dist/core.760b4bf86c.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
 </body>
 </html>

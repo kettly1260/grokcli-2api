@@ -5729,13 +5729,14 @@ function syncRegCaptchaProviderUI() {
 
 // Per-provider mail fields: each provider has dedicated DOM inputs + DB slots.
 // Switching the dropdown only toggles visibility; values never share one input.
-const REG_MAIL_PROVIDERS = ["moemail", "yyds", "gptmail", "cfmail", "tempmail"];
+const REG_MAIL_PROVIDERS = ["moemail", "yyds", "gptmail", "cfmail", "tempmail", "cloudmail"];
 const REG_MAIL_KEY_SLOTS = {
   moemail: "moemail_api_key",
   yyds: "yyds_api_key",
   gptmail: "gptmail_api_key",
   cfmail: "cfmail_api_key",
   tempmail: "tempmail_api_key",
+  cloudmail: "cloudmail_api_key",
 };
 const REG_MAIL_DOMAIN_SLOTS = {
   moemail: "moemail_domain",
@@ -5743,10 +5744,12 @@ const REG_MAIL_DOMAIN_SLOTS = {
   gptmail: "gptmail_domain",
   cfmail: "cfmail_domain",
   tempmail: "tempmail_domain",
+  cloudmail: "cloudmail_domain",
 };
 const REG_MAIL_BASE_SLOTS = {
   moemail: "moemail_base_url",
   cfmail: "cfmail_base_url",
+  cloudmail: "cloudmail_base_url",
 };
 const REG_MAIL_INPUT_IDS = {
   moemail: { key: "reg-moemail-api-key", domain: "reg-moemail-domain", base: "reg-moemail-base-url" },
@@ -5754,11 +5757,12 @@ const REG_MAIL_INPUT_IDS = {
   gptmail: { key: "reg-gptmail-api-key", domain: "reg-gptmail-domain", base: null },
   cfmail: { key: "reg-cfmail-api-key", domain: "reg-cfmail-domain", base: "reg-cfmail-base-url" },
   tempmail: { key: "reg-tempmail-api-key", domain: "reg-tempmail-domain", base: null },
+  cloudmail: { key: "reg-cloudmail-api-key", domain: "reg-cloudmail-domain", base: "reg-cloudmail-base-url" },
 };
 // In-memory cache (mirrors dedicated inputs / DB). Empty string = cleared.
-let regMailKeys = { moemail: "", yyds: "", gptmail: "", cfmail: "", tempmail: "" };
-let regMailDomains = { moemail: "", yyds: "", gptmail: "", cfmail: "", tempmail: "" };
-let regMailBaseUrls = { moemail: "", cfmail: "" };
+let regMailKeys = { moemail: "", yyds: "", gptmail: "", cfmail: "", tempmail: "", cloudmail: "" };
+let regMailDomains = { moemail: "", yyds: "", gptmail: "", cfmail: "", tempmail: "", cloudmail: "" };
+let regMailBaseUrls = { moemail: "", cfmail: "", cloudmail: "" };
 let regMailProviderPrev = "moemail";
 
 function currentRegMailProvider() {
@@ -5769,6 +5773,7 @@ function currentRegMailProvider() {
   if (mail === "gptmail") return "gptmail";
   if (mail === "cfmail") return "cfmail";
   if (mail === "tempmail" || mail === "tempmail.lol" || mail === "lol") return "tempmail";
+  if (mail === "cloudmail" || mail === "cloud-mail" || mail === "skymail" || mail === "maillab") return "cloudmail";
   return "moemail";
 }
 
@@ -5854,6 +5859,7 @@ function regMailProviderMeta(mail) {
     gptmail: { title: "GPTMail", help: "X-API-Key: sk-… · https://mail.chatgpt.org.uk/zh/api/", temp24h: true },
     cfmail: { title: "Cloudflare Temp Email", help: "Worker API + ADMIN_PASSWORDS(x-admin-auth) · github.com/dreamhunter2333/cloudflare_temp_email", temp24h: false },
     tempmail: { title: "TempMail.lol", help: "免费无需 Key · api.tempmail.lol · 文档 tempmail.lol/zh/api", temp24h: true },
+    cloudmail: { title: "Cloud Mail", help: "自托管 Worker · admin_email:password → /public/genToken · github.com/maillab/cloud-mail", temp24h: false },
   };
   return table[m] || table.moemail;
 }
@@ -6004,7 +6010,7 @@ function readRegConfig() {
   const activeKey = regMailKeys[mailProvider] || "";
   const activeDomain = regMailDomains[mailProvider] || "";
   const activeBase =
-    mailProvider === "moemail" || mailProvider === "cfmail"
+    mailProvider === "moemail" || mailProvider === "cfmail" || mailProvider === "cloudmail"
       ? (regMailBaseUrls[mailProvider] || "")
       : "";
   // Always persist ALL provider slots so switching never loses another service's config.
@@ -6014,12 +6020,14 @@ function readRegConfig() {
     base_url: activeBase,
     moemail_base_url: regMailBaseUrls.moemail || "",
     cfmail_base_url: regMailBaseUrls.cfmail || "",
+    cloudmail_base_url: regMailBaseUrls.cloudmail || "",
     domain: activeDomain,
     moemail_domain: regMailDomains.moemail || "",
     yyds_domain: regMailDomains.yyds || "",
     gptmail_domain: regMailDomains.gptmail || "",
     cfmail_domain: regMailDomains.cfmail || "",
     tempmail_domain: regMailDomains.tempmail || "",
+    cloudmail_domain: regMailDomains.cloudmail || "",
     expiry_ms: $("reg-expiry-ms") ? $("reg-expiry-ms").value.trim() : "",
     // Active key + all per-provider keys (empty keeps previous secret server-side on save,
     // except TempMail.lol free tier which intentionally uses empty key/domain).
@@ -6029,6 +6037,7 @@ function readRegConfig() {
     gptmail_api_key: regMailKeys.gptmail || "",
     cfmail_api_key: regMailKeys.cfmail || "",
     tempmail_api_key: regMailKeys.tempmail || "",
+    cloudmail_api_key: regMailKeys.cloudmail || "",
     captcha_provider: isLocal ? "local" : "yescaptcha",
     // Inline local solver is fixed; do not accept/show custom URL.
     local_solver_url: isLocal ? "http://127.0.0.1:5072" : "",
@@ -6075,7 +6084,7 @@ function normalizeRegExpiryMs(value) {
 function applyRegConfig(cfg) {
   if (!cfg || typeof cfg !== "object") return;
   const mail = String(cfg.mail_provider || cfg.provider || "moemail").trim().toLowerCase();
-  const mailProv = mail === "yyds" ? "yyds" : mail === "gptmail" ? "gptmail" : mail === "cfmail" ? "cfmail" : mail === "tempmail" ? "tempmail" : "moemail";
+  const mailProv = mail === "yyds" ? "yyds" : mail === "gptmail" ? "gptmail" : mail === "cfmail" ? "cfmail" : mail === "tempmail" ? "tempmail" : mail === "cloudmail" || mail === "cloud-mail" || mail === "skymail" || mail === "maillab" ? "cloudmail" : "moemail";
   if ($("reg-mail-provider")) {
     $("reg-mail-provider").value = mailProv;
   }
@@ -6116,6 +6125,7 @@ function applyRegConfig(cfg) {
     gptmail: pickKey(cfg.gptmail_api_key, mailProv === "gptmail", regMailKeys.gptmail || "", cfg.gptmail_api_key_set),
     cfmail: pickKey(cfg.cfmail_api_key, mailProv === "cfmail", regMailKeys.cfmail || "", cfg.cfmail_api_key_set),
     tempmail: pickKey(cfg.tempmail_api_key, mailProv === "tempmail", regMailKeys.tempmail || "", cfg.tempmail_api_key_set),
+    cloudmail: pickKey(cfg.cloudmail_api_key, mailProv === "cloudmail", regMailKeys.cloudmail || "", cfg.cloudmail_api_key_set),
   };
   // Dedicated DB slots always win when present (independent of active provider).
   // Empty string clears that provider only — never restore from prev/local cache.
@@ -6149,6 +6159,7 @@ function applyRegConfig(cfg) {
     gptmail: pickDomain("gptmail_domain", mailProv === "gptmail"),
     cfmail: pickDomain("cfmail_domain", mailProv === "cfmail"),
     tempmail: pickDomain("tempmail_domain", mailProv === "tempmail"),
+    cloudmail: pickDomain("cloudmail_domain", mailProv === "cloudmail"),
   };
   // If server returned empty dedicated slot for active provider, force empty.
   if (mailProv === "yyds" && Object.prototype.hasOwnProperty.call(cfg, "yyds_domain")) {
@@ -6162,6 +6173,9 @@ function applyRegConfig(cfg) {
   }
   if (mailProv === "tempmail" && Object.prototype.hasOwnProperty.call(cfg, "tempmail_domain")) {
     regMailDomains.tempmail = cfg.tempmail_domain == null ? "" : String(cfg.tempmail_domain);
+  }
+  if (mailProv === "cloudmail" && Object.prototype.hasOwnProperty.call(cfg, "cloudmail_domain")) {
+    regMailDomains.cloudmail = cfg.cloudmail_domain == null ? "" : String(cfg.cloudmail_domain);
   }
   if (mailProv === "moemail" && Object.prototype.hasOwnProperty.call(cfg, "moemail_domain")) {
     regMailDomains.moemail = cfg.moemail_domain == null ? "" : String(cfg.moemail_domain);
@@ -6180,12 +6194,16 @@ function applyRegConfig(cfg) {
   regMailBaseUrls = {
     moemail: pickBase("moemail_base_url", mailProv === "moemail"),
     cfmail: pickBase("cfmail_base_url", mailProv === "cfmail"),
+    cloudmail: pickBase("cloudmail_base_url", mailProv === "cloudmail"),
   };
   if (mailProv === "moemail" && Object.prototype.hasOwnProperty.call(cfg, "moemail_base_url")) {
     regMailBaseUrls.moemail = cfg.moemail_base_url == null ? "" : String(cfg.moemail_base_url);
   }
   if (mailProv === "cfmail" && Object.prototype.hasOwnProperty.call(cfg, "cfmail_base_url")) {
     regMailBaseUrls.cfmail = cfg.cfmail_base_url == null ? "" : String(cfg.cfmail_base_url);
+  }
+  if (mailProv === "cloudmail" && Object.prototype.hasOwnProperty.call(cfg, "cloudmail_base_url")) {
+    regMailBaseUrls.cloudmail = cfg.cloudmail_base_url == null ? "" : String(cfg.cloudmail_base_url);
   }
   // Paint dedicated per-provider inputs (and show only the active panel).
   paintRegMailFieldsToInput();
@@ -6253,9 +6271,9 @@ async function saveRegConfig() {
     // Always keep every provider's dedicated slots (key/domain/base) so a save
     // for one service never blanks another in the UI.
     for (const k of [
-      "moemail_api_key", "yyds_api_key", "gptmail_api_key", "cfmail_api_key", "tempmail_api_key",
-      "moemail_domain", "yyds_domain", "gptmail_domain", "cfmail_domain", "tempmail_domain",
-      "moemail_base_url", "cfmail_base_url", "domain", "api_key", "base_url",
+      "moemail_api_key", "yyds_api_key", "gptmail_api_key", "cfmail_api_key", "tempmail_api_key", "cloudmail_api_key",
+      "moemail_domain", "yyds_domain", "gptmail_domain", "cfmail_domain", "tempmail_domain", "cloudmail_domain",
+      "moemail_base_url", "cfmail_base_url", "cloudmail_base_url", "domain", "api_key", "base_url",
     ]) {
       if (!Object.prototype.hasOwnProperty.call(saved, k)) {
         saved[k] = cfg[k] != null ? cfg[k] : "";
@@ -6265,8 +6283,8 @@ async function saveRegConfig() {
     // so "delete + save" does not restore the previous value.
     for (const k of [
       "tempmail_api_key", "tempmail_domain",
-      "moemail_domain", "yyds_domain", "gptmail_domain", "cfmail_domain",
-      "moemail_base_url", "cfmail_base_url",
+      "moemail_domain", "yyds_domain", "gptmail_domain", "cfmail_domain", "cloudmail_domain",
+      "moemail_base_url", "cfmail_base_url", "cloudmail_base_url",
     ]) {
       if (Object.prototype.hasOwnProperty.call(cfg, k)) {
         const submitted = cfg[k] == null ? "" : String(cfg[k]);
@@ -6317,6 +6335,14 @@ async function saveRegConfig() {
       saved.domain = saved.tempmail_domain;
       saved.api_key = saved.tempmail_api_key;
       saved.base_url = "";
+    } else if (mail === "cloudmail") {
+      saved.domain = Object.prototype.hasOwnProperty.call(cfg, "cloudmail_domain")
+        ? (cfg.cloudmail_domain || "")
+        : (saved.cloudmail_domain || saved.domain || "");
+      saved.api_key = Object.prototype.hasOwnProperty.call(cfg, "cloudmail_api_key")
+        ? (cfg.cloudmail_api_key || "")
+        : (saved.cloudmail_api_key || saved.api_key || "");
+      if (!saved.base_url) saved.base_url = saved.cloudmail_base_url || cfg.base_url || "";
     } else {
       saved.domain = Object.prototype.hasOwnProperty.call(cfg, "moemail_domain")
         ? (cfg.moemail_domain || "")
@@ -6330,8 +6356,8 @@ async function saveRegConfig() {
     // Secrets: keep clean submitted keys if server returns masked.
     for (const k of ["count", "concurrency", "stagger_ms", "probe_delay_sec", "proxy",
       "proxy_username", "proxy_strategy", "captcha_provider", "expiry_ms",
-      "moemail_domain", "yyds_domain", "gptmail_domain", "cfmail_domain", "tempmail_domain",
-      "moemail_base_url", "cfmail_base_url", "domain", "base_url", "mail_provider"]) {
+      "moemail_domain", "yyds_domain", "gptmail_domain", "cfmail_domain", "tempmail_domain", "cloudmail_domain",
+      "moemail_base_url", "cfmail_base_url", "cloudmail_base_url", "domain", "base_url", "mail_provider"]) {
       if (Object.prototype.hasOwnProperty.call(cfg, k) && cfg[k] != null && cfg[k] !== "") {
         // Keep user-submitted value authoritative after save.
         if (saved[k] == null || saved[k] === "" || String(saved[k]) !== String(cfg[k])) {
@@ -6346,8 +6372,8 @@ async function saveRegConfig() {
     for (const k of ["count", "concurrency", "stagger_ms", "probe_delay_sec"]) {
       if (cfg[k] != null && cfg[k] !== "") saved[k] = cfg[k];
     }
-    for (const k of ["moemail_domain", "yyds_domain", "gptmail_domain", "cfmail_domain", "tempmail_domain",
-      "moemail_base_url", "cfmail_base_url", "domain", "base_url", "proxy", "proxy_username", "proxy_strategy"]) {
+    for (const k of ["moemail_domain", "yyds_domain", "gptmail_domain", "cfmail_domain", "tempmail_domain", "cloudmail_domain",
+      "moemail_base_url", "cfmail_base_url", "cloudmail_base_url", "domain", "base_url", "proxy", "proxy_username", "proxy_strategy"]) {
       if (Object.prototype.hasOwnProperty.call(cfg, k)) saved[k] = cfg[k];
     }
     applyRegConfig(saved);
@@ -6440,19 +6466,25 @@ function buildRegBody(config) {
           ? "cfmail"
           : mailProvider === "tempmail" || mailProvider === "tempmail.lol" || mailProvider === "lol"
             ? "tempmail"
-            : "moemail";
+            : mailProvider === "cloudmail" || mailProvider === "cloud-mail" || mailProvider === "skymail" || mailProvider === "maillab"
+              ? "cloudmail"
+              : "moemail";
   // Keep legacy field for older backends.
   body.provider = body.mail_provider;
-  // MoeMail + CF Temp Email need base_url; YYDS/GPTMail/TempMail.lol use fixed hosts.
+  // MoeMail + CF Temp Email + Cloud Mail need base_url; YYDS/GPTMail/TempMail.lol use fixed hosts.
   // Always send dedicated host slots (including empty) so saves stay isolated.
   body.moemail_base_url = config.moemail_base_url == null ? "" : String(config.moemail_base_url);
   body.cfmail_base_url = config.cfmail_base_url == null ? "" : String(config.cfmail_base_url);
+  body.cloudmail_base_url = config.cloudmail_base_url == null ? "" : String(config.cloudmail_base_url);
   if (body.mail_provider === "moemail") {
     body.base_url = body.moemail_base_url || (config.base_url == null ? "" : String(config.base_url));
     body.moemail_base_url = body.base_url;
   } else if (body.mail_provider === "cfmail") {
     body.base_url = body.cfmail_base_url || (config.base_url == null ? "" : String(config.base_url));
     body.cfmail_base_url = body.base_url;
+  } else if (body.mail_provider === "cloudmail") {
+    body.base_url = body.cloudmail_base_url || (config.base_url == null ? "" : String(config.base_url));
+    body.cloudmail_base_url = body.base_url;
   }
   // Always send domain for the active provider (empty clears/auto).
   body.domain = config.domain == null ? "" : String(config.domain);
@@ -6516,6 +6548,22 @@ function buildRegBody(config) {
     body.api_key = body.tempmail_api_key;
     body.moemail_base_url = "";
     body.base_url = "";
+  } else if (body.mail_provider === "cloudmail") {
+    // Cloud Mail (maillab/cloud-mail): admin_email:password + self-hosted Worker origin.
+    // Adapter reads moemail_api_key / moemail_base_url as the active mail slots.
+    body.cloudmail_api_key =
+      config.cloudmail_api_key == null ? (body.api_key || "") : String(config.cloudmail_api_key || "");
+    body.cloudmail_domain =
+      config.cloudmail_domain == null ? (body.domain || "") : String(config.cloudmail_domain || "");
+    body.domain = body.cloudmail_domain;
+    body.moemail_api_key = body.cloudmail_api_key;
+    body.api_key = body.cloudmail_api_key;
+    const cmBase = config.cloudmail_base_url != null
+      ? String(config.cloudmail_base_url)
+      : (config.base_url != null ? String(config.base_url) : "");
+    body.cloudmail_base_url = cmBase;
+    body.moemail_base_url = cmBase;
+    body.base_url = cmBase;
   }
   const provider = String(config.captcha_provider || "local").trim().toLowerCase();
   body.captcha_provider = provider === "yescaptcha" ? "yescaptcha" : "local";
