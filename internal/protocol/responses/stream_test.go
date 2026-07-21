@@ -147,6 +147,33 @@ func TestCompletedIncludesFunctionCallOutput(t *testing.T) {
 	}
 }
 
+func TestCustomToolStreamUsesCustomEventsAndRawInput(t *testing.T) {
+	s := NewLiveStreamerWithMaxTools("resp_patch", "grok", []string{"apply_patch"}, 0)
+	s.SetCustomToolNames(map[string]bool{"apply_patch": true})
+	frames := s.ToolDeltas([]ToolDelta{{
+		Index:     0,
+		ID:        "call_patch",
+		Name:      "apply_patch",
+		Arguments: `{"input":"*** Begin Patch\n*** End Patch\n"}`,
+	}})
+	frames = append(frames, s.Complete(&Usage{InputTokens: 1, OutputTokens: 1})...)
+	joined := strings.Join(frames, "\n")
+	for _, want := range []string{
+		`"type":"custom_tool_call"`,
+		`response.custom_tool_call_input.delta`,
+		`response.custom_tool_call_input.done`,
+		`"name":"apply_patch"`,
+		`"input":"*** Begin Patch`,
+	} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("missing %q in custom tool stream:\n%s", want, joined)
+		}
+	}
+	if strings.Contains(joined, `"name":"apply_patch","arguments"`) {
+		t.Fatalf("custom tool leaked as function_call arguments:\n%s", joined)
+	}
+}
+
 func TestCompletedDropsNestedEmptyShell(t *testing.T) {
 	s := NewLiveStreamerWithMaxTools("resp_y", "grok", []string{"shell"}, 0)
 	_ = s.ToolDeltas([]ToolDelta{{Index: 0, ID: "call_bad", Name: "shell", Arguments: `{"command":[[""]]}`}})

@@ -1891,6 +1891,7 @@ func serveResponses(w http.ResponseWriter, r *http.Request, options Options) {
 	}
 	stream, _ := raw["stream"].(bool)
 	model := modelCatalog(options).Resolve(stringValue(raw["model"]))
+	customToolNames := responses.CustomToolNameSet(raw["tools"])
 	body := responses.BuildChatBody(raw, model)
 	// Codex shell schema uses "cmd"; remember preferred keys from the *client* tools
 	// before sanitize rewrites them to "command" for upstream Grok.
@@ -2026,6 +2027,7 @@ func serveResponses(w http.ResponseWriter, r *http.Request, options Options) {
 		w.WriteHeader(http.StatusOK)
 		early := responses.NewLiveStreamerWithMaxTools(responseID, model, allowedResponsesToolNames(body), respPolicy.MaxTools)
 		early.SetShellArgKeys(shellArgKeysFrom(r.Context()))
+		early.SetCustomToolNames(customToolNames)
 		for _, frame := range early.Start() {
 			_, _ = w.Write([]byte(frame))
 		}
@@ -2101,7 +2103,7 @@ func serveResponses(w http.ResponseWriter, r *http.Request, options Options) {
 	if pck != "" {
 		w.Header().Set("X-Grok2API-Prompt-Cache-Key", pck)
 	}
-	writeJSON(w, http.StatusOK, responses.BuildObject(responseID, result.Model, content, reasoning, responseToolCalls(toolCalls, shellArgKeysFrom(r.Context())), usageMap(result.Usage), time.Now().Unix(), stringValue(raw["previous_response_id"]), metadataMap(raw["metadata"])))
+	writeJSON(w, http.StatusOK, responses.BuildObject(responseID, result.Model, content, reasoning, responseToolCalls(toolCalls, shellArgKeysFrom(r.Context()), customToolNames), usageMap(result.Usage), time.Now().Unix(), stringValue(raw["previous_response_id"]), metadataMap(raw["metadata"])))
 }
 
 // effectiveResponsesKeepalive tightens SSE keepalive for tool-heavy Codex turns
@@ -2356,10 +2358,9 @@ func recordResponsesUsage(r *http.Request, options Options, apiKey *auth.APIKeyR
 	}()
 }
 
-func responseToolCalls(calls []anthropic.ToolCall, shellArgKeys ...map[string]string) []map[string]any {
-	keys := map[string]string{}
-	if len(shellArgKeys) > 0 && shellArgKeys[0] != nil {
-		keys = shellArgKeys[0]
+func responseToolCalls(calls []anthropic.ToolCall, keys map[string]string, customToolNames map[string]bool) []map[string]any {
+	if keys == nil {
+		keys = map[string]string{}
 	}
 	out := make([]map[string]any, 0, len(calls))
 	for _, call := range calls {
@@ -2380,14 +2381,18 @@ func responseToolCalls(calls []anthropic.ToolCall, shellArgKeys ...map[string]st
 			}
 			args = toolcall.ProjectShellArgsForClient(args, name, preferred)
 		}
-		out = append(out, map[string]any{
+		item := map[string]any{
 			"id":   call.ID,
 			"type": "function",
 			"function": map[string]any{
 				"name":      name,
 				"arguments": args,
 			},
-		})
+		}
+		if customToolNames[name] || customToolNames[strings.ToLower(name)] || customToolNames[toolcall.NameKey(name)] {
+			item["type"] = "custom"
+		}
+		out = append(out, item)
 	}
 	return out
 }

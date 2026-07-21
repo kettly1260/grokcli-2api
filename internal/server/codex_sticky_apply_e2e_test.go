@@ -205,8 +205,12 @@ func TestCodexPreviousResponseIDSticky(t *testing.T) {
 	}
 }
 
-func TestCodexApplyPatchProjectsInput(t *testing.T) {
+func TestCodexCustomApplyPatchRoundTrips(t *testing.T) {
+	var upstreamBody map[string]any
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&upstreamBody); err != nil {
+			t.Errorf("decode upstream body: %v", err)
+		}
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.WriteHeader(http.StatusOK)
 		// Upstream emits patch alias; client should see input after normalize.
@@ -240,7 +244,7 @@ func TestCodexApplyPatchProjectsInput(t *testing.T) {
 	body := `{
 		"model":"grok-4.5",
 		"stream":true,
-		"tools":[{"type":"function","name":"apply_patch","parameters":{"type":"object","properties":{"input":{"type":"string"}},"required":["input"]}}],
+		"tools":[{"type":"custom","name":"apply_patch","description":"Apply a patch.","format":{"type":"grammar","syntax":"lark","definition":"start: /[\\s\\S]+/"}}],
 		"input":[{"role":"user","content":"apply a patch"}]
 	}`
 	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(body))
@@ -252,39 +256,30 @@ func TestCodexApplyPatchProjectsInput(t *testing.T) {
 	if rec.Code != 200 {
 		t.Fatalf("status=%d body=%s", rec.Code, out)
 	}
-	// Must project to input for apply_patch.
-	if !strings.Contains(out, `"input"`) && !strings.Contains(out, `\"input\"`) {
-		t.Fatalf("expected input key in stream, body=%s", out)
-	}
-	// Completed args should not leave only patch alias without input.
-	for _, line := range strings.Split(out, "\n") {
-		if !strings.Contains(line, "function_call_arguments.done") && !strings.Contains(line, `"status":"completed"`) {
-			continue
-		}
-		if strings.Contains(line, `"patch"`) && !strings.Contains(line, `"input"`) {
-			t.Fatalf("patch leaked without input: %s", line)
+	tools, _ := upstreamBody["tools"].([]any)
+	var fn map[string]any
+	for _, item := range tools {
+		tool, _ := item.(map[string]any)
+		if tool["name"] == "apply_patch" {
+			fn = tool
+			break
 		}
 	}
-	found := false
-	for _, line := range strings.Split(out, "\n") {
-		if !strings.Contains(line, "function_call_arguments.done") {
-			continue
-		}
-		idx := strings.Index(line, "{")
-		if idx < 0 {
-			continue
-		}
-		var obj map[string]any
-		if json.Unmarshal([]byte(line[idx:]), &obj) != nil {
-			continue
-		}
-		args := fmtSprint(obj["arguments"])
-		if strings.Contains(args, "input") {
-			found = true
+	if fn == nil || fn["type"] != "function" {
+		t.Fatalf("custom apply_patch was dropped or not converted upstream: %#v", tools)
+	}
+	for _, want := range []string{
+		`"type":"custom_tool_call"`,
+		`response.custom_tool_call_input.done`,
+		`"name":"apply_patch"`,
+		`"input":"*** Begin Patch`,
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("missing %q in custom apply_patch response:\n%s", want, out)
 		}
 	}
-	if !found {
-		t.Fatalf("no function_call_arguments.done with input; body=\n%s", out)
+	if strings.Contains(out, `"name":"apply_patch","arguments"`) {
+		t.Fatalf("custom apply_patch leaked as function_call: %s", out)
 	}
 }
 

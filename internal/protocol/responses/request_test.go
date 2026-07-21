@@ -1,6 +1,9 @@
 package responses
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestBuildChatBodyConvertsResponsesInput(t *testing.T) {
 	body := BuildChatBody(map[string]any{
@@ -30,6 +33,67 @@ func TestBuildChatBodyConvertsResponsesInput(t *testing.T) {
 	}
 }
 
+func TestBuildChatBodyConvertsCustomToolToUpstreamFunction(t *testing.T) {
+	body := BuildChatBody(map[string]any{
+		"input": []any{map[string]any{"role": "user", "content": "patch the file"}},
+		"tools": []any{map[string]any{
+			"type":        "custom",
+			"name":        "apply_patch",
+			"description": "Apply a patch to files.",
+			"format":      map[string]any{"type": "grammar", "syntax": "lark", "definition": "start: /[\\s\\S]+/"},
+		}},
+	}, "grok")
+
+	tools, ok := body["tools"].([]any)
+	if !ok || len(tools) != 1 {
+		t.Fatalf("custom tool was dropped: %#v", body["tools"])
+	}
+	fn, _ := tools[0].(map[string]any)["function"].(map[string]any)
+	if fn == nil || fn["name"] != "apply_patch" {
+		t.Fatalf("unexpected upstream tool: %#v", tools[0])
+	}
+	if !strings.Contains(stringValue(fn["description"]), "start: /[\\s\\S]+/") {
+		t.Fatalf("custom grammar was not preserved for upstream: %#v", fn["description"])
+	}
+	params, _ := fn["parameters"].(map[string]any)
+	props, _ := params["properties"].(map[string]any)
+	input, _ := props["input"].(map[string]any)
+	if input["type"] != "string" {
+		t.Fatalf("custom input schema not converted to a string: %#v", params)
+	}
+}
+
+func TestInputToMessagesConvertsCustomToolHistory(t *testing.T) {
+	messages := InputToMessages([]any{
+		map[string]any{
+			"type":    "custom_tool_call",
+			"call_id": "call_patch",
+			"name":    "apply_patch",
+			"input":   "*** Begin Patch\n*** End Patch\n",
+		},
+		map[string]any{
+			"type":    "custom_tool_call_output",
+			"call_id": "call_patch",
+			"output":  "Success",
+		},
+	}, "")
+
+	if len(messages) != 2 {
+		t.Fatalf("custom tool history was dropped: %#v", messages)
+	}
+	calls, _ := messages[0]["tool_calls"].([]any)
+	if len(calls) != 1 {
+		t.Fatalf("custom call not converted: %#v", messages[0])
+	}
+	fn, _ := calls[0].(map[string]any)["function"].(map[string]any)
+	if fn["name"] != "apply_patch" || !strings.Contains(stringValue(fn["arguments"]), `"input"`) {
+		t.Fatalf("unexpected custom call conversion: %#v", fn)
+	}
+	if messages[1]["role"] != "tool" || messages[1]["tool_call_id"] != "call_patch" {
+		t.Fatalf("unexpected custom output conversion: %#v", messages[1])
+	}
+}
+
 func TestBuildObjectConvertsChatResult(t *testing.T) {
 	obj := BuildObject("resp_1", "grok", "hello", "plan", []map[string]any{{"id": "call_1", "function": map[string]any{"name": "Edit", "arguments": "{\"file_path\":\"/x\"}"}}}, map[string]any{"prompt_tokens": 2, "completion_tokens": 3, "total_tokens": 5}, 123, "resp_0", map[string]any{"a": "b"})
 	if obj["id"] != "resp_1" || obj["status"] != "completed" || obj["previous_response_id"] != "resp_0" {
@@ -47,6 +111,38 @@ func TestBuildObjectConvertsChatResult(t *testing.T) {
 	usage := obj["usage"].(map[string]any)
 	if usage["input_tokens"] != 2 || usage["output_tokens"] != 3 || usage["total_tokens"] != 5 {
 		t.Fatalf("usage = %#v", usage)
+	}
+}
+
+func TestBuildObjectRestoresCustomToolCall(t *testing.T) {
+	obj := BuildObject(
+		"resp_custom",
+		"grok",
+		"",
+		"",
+		[]map[string]any{{
+			"id":   "call_patch",
+			"type": "custom",
+			"function": map[string]any{
+				"name":      "apply_patch",
+				"arguments": `{"input":"*** Begin Patch\n*** End Patch\n"}`,
+			},
+		}},
+		map[string]any{},
+		123,
+		"",
+		nil,
+	)
+	output := obj["output"].([]any)
+	if len(output) != 1 {
+		t.Fatalf("unexpected custom output: %#v", output)
+	}
+	call := output[0].(map[string]any)
+	if call["type"] != "custom_tool_call" || call["name"] != "apply_patch" || call["input"] != "*** Begin Patch\n*** End Patch\n" {
+		t.Fatalf("custom tool was not restored: %#v", call)
+	}
+	if call["arguments"] != nil {
+		t.Fatalf("custom tool leaked function arguments: %#v", call)
 	}
 }
 
