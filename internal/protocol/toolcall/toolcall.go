@@ -972,8 +972,13 @@ func shellQuoteToken(s string, dialect shellDialect) string {
 		return s
 	}
 	_ = dialect
-	// Passthrough quoting: do not rewrite for PowerShell.
-	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
+	// Prefer double-quote with "" escape. Bash-style '\'' around tokens like
+	// 'rg -n' makes PowerShell treat the first token as a string literal (not a
+	// command) and then ParserError on the next quoted fragment.
+	if !strings.Contains(s, "\"") {
+		return "\"" + s + "\""
+	}
+	return "\"" + strings.ReplaceAll(s, "\"", "\"\"") + "\""
 }
 
 func flattenCommandParts(parts []any) []string {
@@ -3174,10 +3179,11 @@ func maybeLogShellArgsProjection(toolName, preferredKey string, dialect shellDia
 	})
 	rawCmd := extractShellCmdValue(raw)
 	outCmd := extractShellCmdValue(projected)
+	inputKind := classifyShellCommandInputKind(raw)
 	changed := rawCmd != outCmd
-	// Dedup stream spam; always log key remap / workdir presence for Codex diagnosis.
+	// Dedup stream spam; include input_kind so array residual is visible once.
 	shellArgsDebugMu.Lock()
-	sig := toolName + "|" + preferredKey + "|" + rawCmd + "|" + outCmd
+	sig := toolName + "|" + preferredKey + "|" + inputKind + "|" + rawCmd + "|" + outCmd
 	same := sig == shellArgsLastSig && !changed
 	if !same {
 		shellArgsLastSig = sig
@@ -3201,6 +3207,7 @@ func maybeLogShellArgsProjection(toolName, preferredKey string, dialect shellDia
 		"tool", toolName,
 		"preferred_key", preferredKey,
 		"dialect", shellDialectName(dialect),
+		"input_kind", inputKind,
 		"changed", changed,
 		"has_workdir", hasWorkdir,
 		"raw_cmd", truncateForLog(rawCmd, 240),
@@ -3208,6 +3215,44 @@ func maybeLogShellArgsProjection(toolName, preferredKey string, dialect shellDia
 		"raw_len", len(raw),
 		"projected_len", len(projected),
 	)
+}
+
+// classifyShellCommandInputKind reports how the shell command was encoded in
+// the raw tool arguments (before projection). Used only for debug logs.
+func classifyShellCommandInputKind(argsJSON string) string {
+	text := strings.TrimSpace(argsJSON)
+	if text == "" {
+		return "empty"
+	}
+	var obj map[string]any
+	if json.Unmarshal([]byte(text), &obj) != nil {
+		return "invalid"
+	}
+	for _, k := range []string{"cmd", "command", "argv", "args", "shell_command", "cmdline", "command_line", "script", "bash", "line"} {
+		v, ok := obj[k]
+		if !ok || empty(v) {
+			continue
+		}
+		switch t := v.(type) {
+		case []any, []string:
+			return "array"
+		case string:
+			s := strings.TrimSpace(t)
+			if strings.HasPrefix(s, "[") && strings.HasSuffix(s, "]") {
+				var arr []any
+				if json.Unmarshal([]byte(s), &arr) == nil {
+					return "array"
+				}
+			}
+			return "string"
+		default:
+			if encoded, err := compactJSON(t); err == nil && strings.HasPrefix(encoded, "[") {
+				return "array"
+			}
+			return "other"
+		}
+	}
+	return "none"
 }
 
 func extractShellCmdValue(argsJSON string) string {
@@ -3244,4 +3289,5 @@ func truncateForLog(s string, n int) string {
 // - Preserve workdir/timeout and other non-command fields.
 // - Do NOT inject PowerShell instructions into the prompt (would bust cache).
 // - Do NOT rewrite command text (bash↔PS heuristics removed).
+// - Upstream shell schema is string-only; residual arrays are flattened without bash-style single quotes.
 

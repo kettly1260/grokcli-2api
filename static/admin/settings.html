@@ -457,7 +457,7 @@
     <div class="g2a-field" style="grid-column:1/-1">
       <div class="g2a-muted" style="padding:10px 12px;border:1px solid var(--g2a-border, #333);border-radius:8px;line-height:1.55">
         <strong>Codex App Shell 透传（已内置，无需开关）</strong><br />
-        自动识别 Codex App / CLI 的 <code>exec_command</code>/<code>local_shell</code>（支持 <code>cmd</code> 与 <code>command</code>）。出站仅做 <code>command↔cmd</code> 键名对齐与 argv 扁平化，并保留 <code>workdir</code>/timeout；不注入 PowerShell 规则、不改写命令正文，避免破坏 prompt cache。Windows Codex Desktop 请直接使用透传后的相对路径 + workdir。
+        自动识别 Codex App / CLI 的 <code>exec_command</code>/<code>local_shell</code>（支持 <code>cmd</code> 与 <code>command</code>）。进站 shell schema 仅允许单字符串 <code>command</code>（不再广告 argv 数组）；出站做 <code>command</code>/<code>cmd</code> 键名映射、残留数组扁平化（含空格 token 用双引号，避免 bash 单引号导致 PowerShell ParserError），并保留 <code>workdir</code>/timeout。不注入 PowerShell 规则、不改写命令正文。调试请用上方「Shell 参数调试日志」（默认关，含 <code>input_kind</code>）。
       </div>
     </div>
   </div>

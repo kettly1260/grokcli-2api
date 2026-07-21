@@ -647,7 +647,7 @@ func TestShellArgvBecomesString(t *testing.T) {
 		{`{"command":["ls","-la"]}`, "ls -la"},
 		{`{"cmd":["echo","hi"]}`, "echo hi"},
 		{`{"command":[["pwd"]]}`, "pwd"},
-		{`{"command":["git","commit","-m","hello world"]}`, "git commit -m 'hello world'"},
+		{`{"command":["git","commit","-m","hello world"]}`, `git commit -m "hello world"`},
 		{`{"command":"echo hi"}`, "echo hi"},
 	}
 	for _, tc := range cases {
@@ -700,7 +700,7 @@ func TestShellArgvForcedToString(t *testing.T) {
 		{"nested_array", `{"command":[["echo","hi"]]}`, "echo hi"},
 		{"cmd_array", `{"cmd":["pwd"]}`, "pwd"},
 		{"string_ok", `{"command":"echo hi"}`, "echo hi"},
-		{"space_quote", `{"command":["echo","hello world"]}`, "echo 'hello world'"},
+		{"space_quote", `{"command":["echo","hello world"]}`, `echo "hello world"`},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -768,7 +768,7 @@ func TestShellArgvAlwaysString(t *testing.T) {
 		{"array", `{"command":["ls","-la"]}`, "ls -la"},
 		{"nested", `{"command":[["echo","hi"]]}`, "echo hi"},
 		{"cmd array", `{"cmd":["pwd"]}`, "pwd"},
-		{"space token", `{"command":["echo","hello world"]}`, "echo 'hello world'"},
+		{"space token", `{"command":["echo","hello world"]}`, `echo "hello world"`},
 		{"string ok", `{"command":"date"}`, "date"},
 		{"json encoded argv string", `{"command":"[\"ls\",\"-la\"]"}`, "ls -la"},
 	}
@@ -893,7 +893,7 @@ func TestShellArgvArrayBecomesString(t *testing.T) {
 		{"array two", `{"command":["echo","hi"]}`, "echo hi"},
 		{"nested empty junk", `{"command":[["ls","-la"]]}`, "ls -la"},
 		{"cmd array", `{"cmd":["pwd"]}`, "pwd"},
-		{"json string argv", `{"command":"[\"echo\",\"x y\"]"}`, "echo 'x y'"},
+		{"json string argv", `{"command":"[\"echo\",\"x y\"]"}`, `echo "x y"`},
 		{"already string", `{"command":"date"}`, "date"},
 	}
 	for _, tc := range cases {
@@ -911,13 +911,8 @@ func TestShellArgvArrayBecomesString(t *testing.T) {
 			if !ok {
 				t.Fatalf("command not string: %T %v in %s", obj["command"], obj["command"], got)
 			}
-			if cmd != tc.want && !strings.Contains(cmd, strings.Trim(tc.want, "'")) {
-				// allow quoting variants
-				if tc.want == "echo 'x y'" && (cmd == "echo 'x y'" || cmd == `echo "x y"` || strings.Contains(cmd, "x y")) {
-					// ok
-				} else if cmd != tc.want {
-					t.Fatalf("command=%q want %q full=%s", cmd, tc.want, got)
-				}
+			if cmd != tc.want && !strings.Contains(cmd, "x y") && !strings.Contains(cmd, strings.Trim(tc.want, `"'`)) {
+				t.Fatalf("command=%q want %q full=%s", cmd, tc.want, got)
 			}
 			// Project to Codex cmd key — still string.
 			out := ProjectShellArgsForClient(got, "exec_command", "cmd")
@@ -946,7 +941,7 @@ func TestShellArgvAlwaysStringForCodex(t *testing.T) {
 		{`{"command":["ls","-la"]}`, "ls -la"},
 		{`{"cmd":["echo","hi"]}`, "echo hi"},
 		{`{"command":[["pwd"]]}`, "pwd"},
-		{`{"command":["git","commit","-m","hello world"]}`, "git commit -m 'hello world'"},
+		{`{"command":["git","commit","-m","hello world"]}`, `git commit -m "hello world"`},
 		{`{"command":"already string"}`, "already string"},
 	}
 	for _, tc := range cases {
@@ -1467,8 +1462,12 @@ func TestJoinShellArgvMultiStatement(t *testing.T) {
 		t.Fatalf("single re-quoted: %q", joinShellArgv([]string{one}, DialectPOSIX))
 	}
 	pq := shellQuoteToken("a b'c", DialectPOSIX)
-	if pq != `'a b'\''c'` {
+	if pq != "\"a b'c\"" {
 		t.Fatalf("quote: %q", pq)
+	}
+	pq2 := shellQuoteToken(`say "hi"`, DialectPOSIX)
+	if pq2 != "\"say \"\"hi\"\"\"" {
+		t.Fatalf("quote with embedded double: %q", pq2)
 	}
 }
 
@@ -1576,3 +1575,40 @@ func TestProjectShellArgsDoesNotUnwrapNonLauncher(t *testing.T) {
 	}
 }
 
+
+
+func TestClassifyShellCommandInputKind(t *testing.T) {
+	cases := []struct {
+		raw  string
+		want string
+	}{
+		{`{"command":"echo hi"}`, "string"},
+		{`{"cmd":"pwd"}`, "string"},
+		{`{"command":["ls","-la"]}`, "array"},
+		{`{"command":"[\"echo\",\"hi\"]"}`, "array"},
+		{`{"workdir":"x"}`, "none"},
+		{``, "empty"},
+	}
+	for _, tc := range cases {
+		got := classifyShellCommandInputKind(tc.raw)
+		if got != tc.want {
+			t.Fatalf("raw=%q kind=%q want=%q", tc.raw, got, tc.want)
+		}
+	}
+}
+
+func TestShellArgvSpaceUsesDoubleQuotes(t *testing.T) {
+	// Residual arrays must not become bash-style 'token' (PowerShell ParserError).
+	out := ProjectShellArgsForClient(`{"command":["Select-String","-Path","a b.js"]}`, "exec_command", "cmd")
+	var obj map[string]any
+	if err := json.Unmarshal([]byte(out), &obj); err != nil {
+		t.Fatal(err)
+	}
+	cmd, _ := obj["cmd"].(string)
+	if strings.Contains(cmd, "'a b.js'") || strings.Contains(cmd, `'\''`) {
+		t.Fatalf("must not use bash single-quote join: %q", cmd)
+	}
+	if !strings.Contains(cmd, `"a b.js"`) {
+		t.Fatalf("expected double-quoted path token: %q", cmd)
+	}
+}

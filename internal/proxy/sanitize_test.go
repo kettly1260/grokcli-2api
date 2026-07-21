@@ -194,6 +194,27 @@ func TestNormalizeFunctionToolHardensShellSchema(t *testing.T) {
 	if _, ok := props["workdir"]; !ok {
 		t.Fatalf("workdir should remain: %#v", props)
 	}
+	cmdProp, _ := props["command"].(map[string]any)
+	if cmdProp == nil {
+		t.Fatalf("command schema missing: %#v", props)
+	}
+	switch typ := cmdProp["type"].(type) {
+	case string:
+		if typ != "string" {
+			t.Fatalf("command.type must be string, got %q", typ)
+		}
+	case []any:
+		t.Fatalf("command.type must not be union/array, got %#v", typ)
+	default:
+		t.Fatalf("command.type unexpected: %#v", cmdProp["type"])
+	}
+	if _, hasItems := cmdProp["items"]; hasItems {
+		t.Fatalf("command.items must be removed for string-only schema: %#v", cmdProp)
+	}
+	cmdDesc := strings.ToLower(fmt.Sprint(cmdProp["description"]))
+	if strings.Contains(cmdDesc, "argv") || strings.Contains(cmdDesc, "array") {
+		t.Fatalf("command description must not advertise argv/array: %q", cmdProp["description"])
+	}
 	req, _ := params["required"].([]any)
 	joined := fmt.Sprint(req)
 	if !strings.Contains(joined, "command") {
@@ -202,9 +223,12 @@ func TestNormalizeFunctionToolHardensShellSchema(t *testing.T) {
 	if strings.Contains(joined, "cmd") {
 		t.Fatalf("required must not include cmd: %#v", req)
 	}
-	desc := fmt.Sprint(fn["description"])
-	if !strings.Contains(strings.ToLower(desc), "command") {
-		t.Fatalf("description should mention command: %q", desc)
+	fnDesc := fmt.Sprint(fn["description"])
+	if !strings.Contains(strings.ToLower(fnDesc), "command") {
+		t.Fatalf("description should mention command: %q", fnDesc)
+	}
+	if strings.Contains(strings.ToLower(fnDesc), "argv array") {
+		t.Fatalf("function description must not advertise argv array: %q", fnDesc)
 	}
 }
 
