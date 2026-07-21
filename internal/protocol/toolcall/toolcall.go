@@ -3682,6 +3682,9 @@ var (
 	debugShellArgsMu      sync.RWMutex
 	debugShellArgsEnabled bool
 	shellArgsDebugOnce    sync.Once
+	// shellArgsLastSig dedups identical projection log lines from stream reassembly.
+	shellArgsDebugMu sync.Mutex
+	shellArgsLastSig string
 )
 
 // ConfigureDebugShellArgs turns on/off shell cmd projection logging from
@@ -3721,10 +3724,29 @@ func maybeLogShellArgsProjection(toolName, preferredKey string, dialect shellDia
 	junkIn := strings.Contains(rawCmd, "[") && emptyArrayJunkPrefix.MatchString(rawCmd)
 	junkOut := strings.Contains(outCmd, "[") && emptyArrayJunkPrefix.MatchString(outCmd)
 	changed := rawCmd != outCmd
-	// Always log when dialect is PowerShell or sanitizer ran; otherwise skip identical
-	// POSIX no-ops unless junk is present. This makes ① vs ③ diagnosis one glance.
-	if !junkIn && !junkOut && !changed && dialect != DialectPowerShell && !sanitizerApplied {
-		return
+	// Interesting: sanitizer/guard changed cmd, junk prefix, or tiny/orphan fragments.
+	// Skip pure no-op spam from streaming deltas replaying the same Select-String.
+	interesting := junkIn || junkOut || changed || sanitizerApplied ||
+		len(strings.TrimSpace(rawCmd)) <= 4 ||
+		(dialect == DialectPowerShell && DetectBashShellDialect(rawCmd) != nil)
+	if !interesting {
+		// Dedup identical consecutive projections (stream assembler re-projects).
+		shellArgsDebugMu.Lock()
+		sig := toolName + "|" + preferredKey + "|" + shellDialectName(dialect) + "|" + rawCmd + "|" + outCmd
+		same := sig == shellArgsLastSig
+		if !same {
+			shellArgsLastSig = sig
+		}
+		shellArgsDebugMu.Unlock()
+		if same {
+			return
+		}
+		// Still log first occurrence of a clean PS cmd once (dialect diagnosis),
+		// but not every identical stream tick.
+	} else {
+		shellArgsDebugMu.Lock()
+		shellArgsLastSig = toolName + "|" + preferredKey + "|" + shellDialectName(dialect) + "|" + rawCmd + "|" + outCmd
+		shellArgsDebugMu.Unlock()
 	}
 	slog.Info("shell args projection",
 		"tool", toolName,
@@ -4127,6 +4149,16 @@ var reOverquotedValueArray = regexp.MustCompile(`(?i)-Value\s+['"]@\(`)
 // Valid: @' ... '@ or @" ... "@
 // Broken (common model fail): -Value '@   or -Value "@ without matching closer.
 func detectBrokenHereString(s string) *ShellDialectIssue {
+	trim := strings.TrimSpace(s)
+	// Live stream fragment: Grok emits a lone here-string closer/opener as the
+	// entire cmd (often as a streaming delta or split argv slot). Always reject.
+	// Examples: "@  '"@  "@'  '@  @'  @"
+	if reOrphanHereStringToken.MatchString(trim) {
+		return &ShellDialectIssue{
+			Reason: "broken_here_string",
+			Hint:   "Do not emit bare here-string markers. Prefer Set-Content + Add-Content; if you need a here-string, emit a complete @'...'@ or @\"...\"@ pair in one cmd.",
+		}
+	}
 	hasOpenSingle := strings.Contains(s, "@'")
 	hasCloseSingle := strings.Contains(s, "'@")
 	hasOpenDouble := strings.Contains(s, `@"`)
@@ -4144,6 +4176,19 @@ func detectBrokenHereString(s string) *ShellDialectIssue {
 			Hint:   "Here-string needs @\" ... \"@ (or @' ... '@). Prefer Set-Content + Add-Content lines instead.",
 		}
 	}
+	// Closer without opener (split across tool_calls / argv slots).
+	if hasCloseSingle && !hasOpenSingle {
+		return &ShellDialectIssue{
+			Reason: "broken_here_string",
+			Hint:   "Here-string closer without matching opener. Emit one complete command, or use Set-Content + Add-Content.",
+		}
+	}
+	if hasCloseDouble && !hasOpenDouble {
+		return &ShellDialectIssue{
+			Reason: "broken_here_string",
+			Hint:   "Here-string closer without matching opener. Emit one complete command, or use Set-Content + Add-Content.",
+		}
+	}
 	// -Value '@ or -Value "@ as truncated opener (common: -Value '@ alone)
 	if reBrokenHereValue.MatchString(s) {
 		if (hasOpenSingle && hasCloseSingle) || (hasOpenDouble && hasCloseDouble) {
@@ -4159,6 +4204,10 @@ func detectBrokenHereString(s string) *ShellDialectIssue {
 
 // reBrokenHereValue: -Value '@  or -Value "@ with little/no body (truncated opener).
 var reBrokenHereValue = regexp.MustCompile(`(?i)-Value\s+(['"])@\s*($|['"]|;)`)
+
+// reOrphanHereStringToken matches a cmd that is ONLY a here-string marker/fragment.
+// Captured live: cmd == `"@` (JSON-escaped as "\"@") from streaming Grok tool_calls.
+var reOrphanHereStringToken = regexp.MustCompile(`^['"]?@['"]?$|^['"]@$|^@['"]$`)
 
 // detectBacktickNInSingleQuotes finds `n inside single-quoted regions.
 // In PowerShell single quotes are literal — `n does not expand to newline.

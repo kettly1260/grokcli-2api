@@ -1600,6 +1600,45 @@ func TestProjectShellArgsRepairsMangledWindowsExecutablePath(t *testing.T) {
 	}
 }
 
+func TestOrphanHereStringFragmentBlocked(t *testing.T) {
+	prevR, prevG, prevU, prevW := CodexPowerShellRulesEnabled(), CodexPowerShellGuardEnabled(), CodexPowerShellUnwrapEnabled(), CodexPowerShellWriteSafeEnabled()
+	t.Cleanup(func() { ConfigureCodexShellPolicy(prevR, prevG, prevU, prevW) })
+	ConfigureCodexShellPolicy(false, true, false, false) // guard on
+
+	// Live log fragment: entire cmd is a here-string closer.
+	for _, frag := range []string{`"@`, `'@`, `@'`, `@"`} {
+		iss := DetectBashShellDialect(frag)
+		if iss == nil || iss.Reason != "broken_here_string" {
+			t.Fatalf("fragment %q not flagged: %+v", frag, iss)
+		}
+		out, blocked := GuardShellCmdForClient(frag)
+		if blocked == nil {
+			t.Fatalf("guard did not block %q", frag)
+		}
+		if !strings.Contains(out, "Write-Output") || !strings.Contains(out, "broken_here_string") {
+			t.Fatalf("guard rewrite unexpected for %q: %q", frag, out)
+		}
+	}
+
+	// Closer without opener in a longer fragment.
+	iss := DetectBashShellDialect(`something "@`)
+	if iss == nil || iss.Reason != "broken_here_string" {
+		t.Fatalf("orphan closer not flagged: %+v", iss)
+	}
+
+	// Complete here-string must pass.
+	ok := "Set-Content -Path x.txt -Value @'\nline\n'@"
+	if DetectBashShellDialect(ok) != nil {
+		t.Fatalf("complete here-string wrongly flagged: %+v", DetectBashShellDialect(ok))
+	}
+
+	// Clean Select-String must pass (the other live log line).
+	clean := `Select-String -LiteralPath 'G:\tmp\routine-plan.js' -Pattern 'lastActionDraft' | ForEach-Object { '{0}:{1}' -f $_.LineNumber, $_.Line.Trim() }`
+	if DetectBashShellDialect(clean) != nil {
+		t.Fatalf("clean Select-String wrongly flagged: %+v", DetectBashShellDialect(clean))
+	}
+}
+
 func TestRepairSingleQuotedExecutableMissingCallOperator(t *testing.T) {
 	prevR, prevG, prevU, prevW := CodexPowerShellRulesEnabled(), CodexPowerShellGuardEnabled(), CodexPowerShellUnwrapEnabled(), CodexPowerShellWriteSafeEnabled()
 	prevT := CodexShellTarget()
