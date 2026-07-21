@@ -131,34 +131,8 @@ func (o Options) applySettingsToRuntime(settings map[string]any) {
 	if v, ok := settings["debug_shell_args"].(bool); ok {
 		toolcall.ConfigureDebugShellArgs(v)
 	}
-	// Codex PowerShell rules inject + optional guard / unwrap / write-safe.
-	// Missing keys leave the previous runtime value (hot-reload patches are partial).
-	rules := toolcall.CodexPowerShellRulesEnabled()
-	guard := toolcall.CodexPowerShellGuardEnabled()
-	unwrap := toolcall.CodexPowerShellUnwrapEnabled()
-	writeSafe := toolcall.CodexPowerShellWriteSafeEnabled()
-	if v, ok := settings["codex_powershell_rules"].(bool); ok {
-		rules = v
-	}
-	if v, ok := settings["codex_powershell_guard"].(bool); ok {
-		guard = v
-	}
-	if v, ok := settings["codex_powershell_unwrap"].(bool); ok {
-		unwrap = v
-	}
-	if v, ok := settings["codex_powershell_write_safe"].(bool); ok {
-		writeSafe = v
-	}
-	_, okR := settings["codex_powershell_rules"].(bool)
-	_, okG := settings["codex_powershell_guard"].(bool)
-	_, okU := settings["codex_powershell_unwrap"].(bool)
-	_, okW := settings["codex_powershell_write_safe"].(bool)
-	if okR || okG || okU || okW {
-		toolcall.ConfigureCodexShellPolicy(rules, guard, unwrap, writeSafe)
-	}
-	if v, ok := settings["codex_shell_target"].(string); ok {
-		toolcall.ConfigureCodexShellTarget(v)
-	}
+	// PowerShell special policy removed: Codex is auto-detected for outbound
+	// cmd/workdir projection only (cache-safe; no prompt injection).
 }
 
 func applyHistoryCompactSettings(settings map[string]any) {

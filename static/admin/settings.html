@@ -452,33 +452,13 @@
     </div>
     <div class="g2a-actions" style="grid-column:1/-1">
       <label class="g2a-check"><input type="checkbox" id="set-debug-shell-args" /> Shell 参数调试日志（记录 cmd 投影前后，排查 <code>[    ]</code> 前缀等问题）</label>
-      <div class="g2a-muted" style="margin-top:4px;margin-left:1.6em">开启后服务端日志会打印 preferred_key / dialect / shell_target / raw_cmd / projected_cmd，用来区分「方言未判为 PowerShell」与「修复盲区」；平时请关闭</div>
+      <div class="g2a-muted" style="margin-top:4px;margin-left:1.6em">开启后服务端日志会打印 preferred_key / has_workdir / raw_cmd / projected_cmd（仅出站投影诊断，不改上游 prompt/cache）；平时请关闭</div>
     </div>
-    <div class="g2a-field" style="grid-column:1/-1;max-width:520px">
-      <label for="set-codex-shell-target">Codex 目标 Shell（部署级）</label>
-      <select id="set-codex-shell-target" class="g2a-input">
-        <option value="auto">auto（按 schema/工具名启发式）</option>
-        <option value="powershell">powershell（强制 PowerShell 修复链，推荐 Windows Codex Desktop）</option>
-        <option value="posix">posix（强制透传 bash，不做 PS 改写）</option>
-      </select>
-      <div class="g2a-muted" style="margin-top:4px">一个代理实例通常只服务一种 OS。Windows + Codex Desktop 若 schema 用 command 而非 cmd，请选 powershell；Linux CLI 保持 auto/posix。Hermes terminal 始终按 POSIX。</div>
-    </div>
-    <div class="g2a-actions" style="grid-column:1/-1">
-      <label class="g2a-check"><input type="checkbox" id="set-codex-ps-rules" /> Codex PowerShell 硬规则注入（推荐）</label>
-      <div class="g2a-muted" style="margin-top:4px;margin-left:1.6em">检测到 Codex 请求时，向 instructions/system 追加短硬规则：只用 PowerShell、禁止 bash 引号与复杂 python -c。不改变非 Codex 客户端。</div>
-    </div>
-    <div class="g2a-actions" style="grid-column:1/-1">
-      <label class="g2a-check"><input type="checkbox" id="set-codex-ps-guard" /> Codex Shell 方言拦截（可选，较强）</label>
-      <div class="g2a-muted" style="margin-top:4px;margin-left:1.6em">开启后：投影阶段拦截 bash 味 cmd 与破损 PowerShell 字面量（如 bash 单引号拼接、<code>python -c</code>、<code>$(...)</code>、<code>grep/sed</code>、过度引号 <code>@()</code>、残缺 here-string、单引号内 <code>`n</code>），替换为 PowerShell Write-Output 提示，避免 ParserError。可能增加一轮 tool 重试。</div>
-    </div>
-    <div class="g2a-actions" style="grid-column:1/-1">
-      <label class="g2a-check"><input type="checkbox" id="set-codex-ps-unwrap" /> Codex PowerShell 数组解包（可选）</label>
-      <div class="g2a-muted" style="margin-top:4px;margin-left:1.6em">开启后：仅在 PowerShell 投影路径把高置信的 <code>-Value '@(...)'</code> 改写为 <code>-Value @(...)</code>。默认关闭；不影响 Linux/bash CLI。</div>
-    </div>
-    <div class="g2a-actions" style="grid-column:1/-1">
-      <label class="g2a-check"><input type="checkbox" id="set-codex-ps-write-safe" /> Codex PowerShell 写文件安全改写（可选）</label>
-      <div class="g2a-muted" style="margin-top:4px;margin-left:1.6em">开启后：仅在 PowerShell 投影路径，把单条 <code>Set-Content/Out-File -Value "a`nb"</code> 改写为 Set-Content + Add-Content 链。默认关闭；不影响 Linux/bash CLI。</div>
-    </div>
+</div>
+</div>
+</div>
+</div>
+</div>
   </div>
   <div class="g2a-actions" style="margin-top:14px;justify-content:flex-end;gap:8px;flex-wrap:wrap">
     <button type="button" class="g2a-btn g2a-btn-default" id="btn-reset-settings-relay">重置默认</button>

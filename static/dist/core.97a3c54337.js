@@ -9566,11 +9566,6 @@ function fillSystemSettingsForm(s) {
     $("set-history-tool-max").value = s.history_max_tool_result_chars;
   }
   if ($("set-debug-shell-args")) $("set-debug-shell-args").checked = !!s.debug_shell_args;
-  if ($("set-codex-shell-target")) $("set-codex-shell-target").value = s.codex_shell_target || "auto";
-  if ($("set-codex-ps-rules")) $("set-codex-ps-rules").checked = !!s.codex_powershell_rules;
-  if ($("set-codex-ps-guard")) $("set-codex-ps-guard").checked = !!s.codex_powershell_guard;
-  if ($("set-codex-ps-unwrap")) $("set-codex-ps-unwrap").checked = !!s.codex_powershell_unwrap;
-  if ($("set-codex-ps-write-safe")) $("set-codex-ps-write-safe").checked = !!s.codex_powershell_write_safe;
   // Pool / kick policy — fill with effective values (server defaults when DB
   // has none). Cooldown itself is a sticky status (no duration knobs).
   const polDefaults = {
@@ -9726,11 +9721,6 @@ function collectSystemSettingsPatch(groups) {
       patch.history_max_tool_result_chars = Number($("set-history-tool-max").value);
     }
     if ($("set-debug-shell-args")) patch.debug_shell_args = !!$("set-debug-shell-args").checked;
-    if ($("set-codex-shell-target")) patch.codex_shell_target = $("set-codex-shell-target").value || "auto";
-    if ($("set-codex-ps-rules")) patch.codex_powershell_rules = !!$("set-codex-ps-rules").checked;
-    if ($("set-codex-ps-guard")) patch.codex_powershell_guard = !!$("set-codex-ps-guard").checked;
-    if ($("set-codex-ps-unwrap")) patch.codex_powershell_unwrap = !!$("set-codex-ps-unwrap").checked;
-    if ($("set-codex-ps-write-safe")) patch.codex_powershell_write_safe = !!$("set-codex-ps-write-safe").checked;
   }
   if (want("cooldown")) {
     if ($("set-soft-ttl") && $("set-soft-ttl").value !== "") patch.soft_model_block_ttl_sec = Number($("set-soft-ttl").value);
@@ -9950,11 +9940,6 @@ function settingsGroupDefaults(group) {
         history_keep_tool_rounds: 32,
         history_max_tool_result_chars: 48000,
         debug_shell_args: false,
-        codex_shell_target: "auto",
-        codex_powershell_rules: false,
-        codex_powershell_guard: false,
-        codex_powershell_unwrap: false,
-        codex_powershell_write_safe: false,
       };
     case "cooldown":
       return {
@@ -10030,11 +10015,6 @@ function applySettingsGroupDefaults(group) {
     if ($("set-history-keep-rounds")) $("set-history-keep-rounds").value = d.history_keep_tool_rounds;
     if ($("set-history-tool-max")) $("set-history-tool-max").value = d.history_max_tool_result_chars;
     if ($("set-debug-shell-args")) $("set-debug-shell-args").checked = !!d.debug_shell_args;
-    if ($("set-codex-shell-target")) $("set-codex-shell-target").value = d.codex_shell_target || "auto";
-    if ($("set-codex-ps-rules")) $("set-codex-ps-rules").checked = !!d.codex_powershell_rules;
-    if ($("set-codex-ps-guard")) $("set-codex-ps-guard").checked = !!d.codex_powershell_guard;
-    if ($("set-codex-ps-unwrap")) $("set-codex-ps-unwrap").checked = !!d.codex_powershell_unwrap;
-    if ($("set-codex-ps-write-safe")) $("set-codex-ps-write-safe").checked = !!d.codex_powershell_write_safe;
   } else if (group === "cooldown") {
     if ($("set-soft-ttl")) $("set-soft-ttl").value = d.soft_model_block_ttl_sec;
     if ($("set-durable-ttl")) $("set-durable-ttl").value = d.durable_model_block_ttl_sec;
