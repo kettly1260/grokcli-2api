@@ -308,6 +308,15 @@ func NewMux(options Options) http.Handler {
 	mux.HandleFunc("POST /responses", func(w http.ResponseWriter, r *http.Request) {
 		serveResponses(w, r, options)
 	})
+	mux.HandleFunc("GET /admin/api/version", func(w http.ResponseWriter, r *http.Request) {
+		serveVersionInfo(w, r, options)
+	})
+	mux.HandleFunc("GET /admin/api/version/check", func(w http.ResponseWriter, r *http.Request) {
+		serveVersionCheck(w, r, options)
+	})
+	mux.HandleFunc("POST /admin/api/version/update", func(w http.ResponseWriter, r *http.Request) {
+		serveVersionUpdate(w, r, options)
+	})
 	mux.HandleFunc("GET /admin/api/status", func(w http.ResponseWriter, r *http.Request) {
 		serveAdminStatus(w, r, options, false)
 	})
@@ -685,40 +694,113 @@ func serveChatCompletions(w http.ResponseWriter, r *http.Request, options Option
 	if allowed := allowedAnthropicToolNames(chatReq.Raw); len(allowed) > 0 {
 		r = r.WithContext(withAllowedTools(r.Context(), allowed))
 	}
+	// Mint/recover a stable prompt_cache_key before affinity lookup so multi-turn
+	// OpenAI chat sticks to one account (prefix cache). Without this, clients that
+	// omit pck fall back to per-turn fingerprints and hop accounts → cache miss.
+	pck := ensureOpenAIChatPromptCacheKey(r, &chatReq)
 	candidates, err := listCandidatesForRequest(r.Context(), options, chatReq, r.Header)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"detail": err.Error()})
 		return
 	}
 	service := newChatService(options)
+	// Always sticky-first for multi-turn cache warmth (config default is on; force when
+	// we have any stable key so least_used never races ahead of a pinned account).
+	if pck != "" || proxy.ChatFingerprint(chatReq) != "" {
+		service.StickyFirstOnly = true
+	}
 	started := time.Now()
 	if chatReq.Stream {
-		opened, err := service.OpenStreamWithResult(r.Context(), chatReq, candidates, resolvePickMode(options))
-		if err != nil {
-			// Intermediate + final open failures are already classified into the
-			// cooldown pool via ChatService.FailureReporter (text-based 额度用完).
-			recordChatUsage(r, options, apiKey, opened.AccountID, chatReq.Model, chatReq.Stream, false, http.StatusBadGateway, started, nil, err, 0, chatReq.Raw)
-			writeProxyError(w, err)
+		// Match serveMessages: OpenStream already failovers inside one call, but
+		// open-time empty storms still benefit from a fresh candidate window (exclude
+		// just-failed accounts) before HTTP 200 is committed by streamChatCompletions.
+		var (
+			opened      proxy.StreamOpen
+			err         error
+			stats       proxy.StreamStats
+			lastAccount string
+			lastModel   = chatReq.Model
+			exclude     = map[string]struct{}{}
+		)
+		maxOpenAttempts := 4
+		candPool := candidates
+		for attempt := 0; attempt < maxOpenAttempts; attempt++ {
+			if attempt > 0 && lastAccount != "" {
+				exclude[lastAccount] = struct{}{}
+				filtered := make([]pool.Candidate, 0, len(candPool))
+				for _, c := range candPool {
+					if _, bad := exclude[c.ID]; bad {
+						continue
+					}
+					filtered = append(filtered, c)
+				}
+				if len(filtered) == 0 {
+					break
+				}
+				candPool = filtered
+			}
+			opened, err = service.OpenStreamWithResult(r.Context(), chatReq, candPool, resolvePickMode(options))
+			openElapsed := time.Since(started)
+			if err != nil {
+				lastAccount = strings.TrimSpace(opened.AccountID)
+				if lastAccount == "" {
+					recordChatUsage(r, options, apiKey, opened.AccountID, chatReq.Model, chatReq.Stream, false, http.StatusBadGateway, started, nil, err, 0, chatReq.Raw)
+					writeProxyError(w, err)
+					return
+				}
+				reportChatPool(r, options, lastAccount, false, err, http.StatusBadGateway, lastModel)
+				if attempt+1 >= maxOpenAttempts || !isRetryableUpstreamOpenErr(err) {
+					recordChatUsage(r, options, apiKey, lastAccount, chatReq.Model, chatReq.Stream, false, http.StatusBadGateway, started, nil, err, 0, chatReq.Raw)
+					writeProxyError(w, err)
+					return
+				}
+				continue
+			}
+			lastAccount = opened.AccountID
+			lastModel = opened.Model
+			req := r
+			if options.runtimeConfig().SSEKeepalive > 0 {
+				req = r.WithContext(withAnthropicKeepalive(r.Context(), options.runtimeConfig().SSEKeepalive))
+			}
+			setProtocolObservationHeaders(w, protocolObservation{
+				Protocol: "openai_chat", AccountID: opened.AccountID, PreferAccount: opened.PreferAccount,
+				Failover: opened.Failover || attempt > 0, Fingerprint: opened.Fingerprint, Accounts: opened.Accounts, Prep: opened.Prep,
+			})
+			if pck != "" {
+				w.Header().Set("X-Grok2API-Prompt-Cache-Key", pck)
+			}
+			stats, err = streamChatCompletions(w, req, opened.Body, optionsFromRequest(req).Keepalive)
+			_ = opened.Body.Close()
+			releaseServerPick(options, opened.AccountID)
+			// Wall-clock TTFT: open/pick + first real payload (stream clock starts after headers).
+			if stats.FirstTokenMS > 0 {
+				wall := int(openElapsed.Milliseconds()) + stats.FirstTokenMS
+				if wall <= 0 {
+					wall = 1
+				}
+				stats.FirstTokenMS = wall
+			}
+			ok := err == nil || errors.Is(err, r.Context().Err())
+			// Headers commit on first stream write; only rotate when nothing was delivered.
+			if !ok && stats.FirstTokenMS == 0 && isRetryableUpstreamOpenErr(err) && attempt+1 < maxOpenAttempts {
+				reportChatPool(r, options, opened.AccountID, false, err, http.StatusBadGateway, opened.Model)
+				lastAccount = opened.AccountID
+				lastModel = opened.Model
+				continue
+			}
+			status := http.StatusOK
+			if !ok {
+				status = http.StatusBadGateway
+			}
+			recordChatUsageWithHint(r, options, apiKey, opened.AccountID, opened.Model, chatReq.Stream, ok, status, started, stats.Usage, err, stats.FirstTokenMS, chatReq.Raw, stats.CompletionHint)
+			reportChatPool(r, options, opened.AccountID, ok, err, status, opened.Model)
 			return
 		}
-		defer opened.Body.Close()
-		defer releaseServerPick(options, opened.AccountID)
-		req := r
-		if options.runtimeConfig().SSEKeepalive > 0 {
-			req = r.WithContext(withAnthropicKeepalive(r.Context(), options.runtimeConfig().SSEKeepalive))
+		if err == nil {
+			err = errors.New("Upstream returned HTTP 200 with empty model output (no content/tool_calls)")
 		}
-		setProtocolObservationHeaders(w, protocolObservation{
-			Protocol: "openai_chat", AccountID: opened.AccountID, PreferAccount: opened.PreferAccount,
-			Failover: opened.Failover, Fingerprint: opened.Fingerprint, Accounts: opened.Accounts, Prep: opened.Prep,
-		})
-		stats, err := streamChatCompletions(w, req, opened.Body, optionsFromRequest(req).Keepalive)
-		ok := err == nil || errors.Is(err, r.Context().Err())
-		status := http.StatusOK
-		if !ok {
-			status = http.StatusBadGateway
-		}
-		recordChatUsage(r, options, apiKey, opened.AccountID, opened.Model, chatReq.Stream, ok, status, started, stats.Usage, err, stats.FirstTokenMS, chatReq.Raw)
-		reportChatPool(r, options, opened.AccountID, ok, err, status, opened.Model)
+		recordChatUsage(r, options, apiKey, lastAccount, chatReq.Model, true, false, http.StatusBadGateway, started, nil, err, 0, chatReq.Raw)
+		writeProxyError(w, err)
 		return
 	}
 	result, err := service.CompleteWithResult(r.Context(), chatReq, candidates, resolvePickMode(options))
@@ -744,6 +826,14 @@ func serveChatCompletions(w http.ResponseWriter, r *http.Request, options Option
 		Protocol: "openai_chat", AccountID: result.AccountID, PreferAccount: result.PreferAccount,
 		Failover: result.Failover, Fingerprint: result.Fingerprint, Accounts: result.Accounts, Prep: result.Prep,
 	})
+	if pck != "" {
+		w.Header().Set("X-Grok2API-Prompt-Cache-Key", pck)
+		if result.Payload != nil {
+			if _, has := result.Payload["prompt_cache_key"]; !has {
+				result.Payload["prompt_cache_key"] = pck
+			}
+		}
+	}
 	writeJSON(w, http.StatusOK, result.Payload)
 }
 
@@ -846,7 +936,16 @@ func streamChatCompletions(w http.ResponseWriter, r *http.Request, body io.Reade
 	w.Header().Set("Cache-Control", "no-cache, no-transform")
 	w.Header().Set("Connection", "keep-alive")
 	w.Header().Set("X-Accel-Buffering", "no")
-	w.WriteHeader(http.StatusOK)
+	// Delay WriteHeader until first real SSE write so serveChatCompletions multi-open
+	// can rotate accounts on open-time empty without committing HTTP 200.
+	headersWritten := false
+	ensureHeaders := func() {
+		if headersWritten {
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		headersWritten = true
+	}
 	var stats proxy.StreamStats
 	started := time.Now()
 	// Assemble tool_calls across chunks so we can emit normalized args once complete
@@ -881,6 +980,7 @@ func streamChatCompletions(w http.ResponseWriter, r *http.Request, body io.Reade
 			}
 			payload := pending
 			streamCoalesceFlush.Add(1)
+			ensureHeaders()
 			lastErr = sw.WriteBytes(payload, force || sw.SoftGone())
 			if lastErr != nil {
 				return lastErr
@@ -917,6 +1017,7 @@ func streamChatCompletions(w http.ResponseWriter, r *http.Request, body io.Reade
 		frame = append(frame, "data: "...)
 		frame = append(frame, encoded...)
 		frame = append(frame, '\n', '\n')
+		ensureHeaders()
 		if err := sw.WriteBytes(frame, force); err != nil {
 			return err
 		}
@@ -935,6 +1036,15 @@ func streamChatCompletions(w http.ResponseWriter, r *http.Request, body io.Reade
 	sawFinishReason := false
 	streamID := ""
 	streamModel := ""
+	// Track streamed output size so admin usage can estimate completion_tokens when
+	// xAI omits the final usage frame (admin would otherwise show completion=0).
+	outputRunes := 0
+	noteOutput := func(s string) {
+		if s == "" {
+			return
+		}
+		outputRunes += len([]rune(s))
+	}
 	flushAssemblerTerminal := func() error {
 		_ = flushPending(true)
 		if terminalFlushed && !assembler.NeedsFinishRetry() {
@@ -984,15 +1094,29 @@ func streamChatCompletions(w http.ResponseWriter, r *http.Request, body io.Reade
 				break
 			}
 		}
+		ensureHeaders()
 		return sw.WriteBytes([]byte("data: [DONE]\n\n"), true)
 	}
 	err := grok.ReadSSEWithIdle(body, keepalive, func(event grok.Event) error {
 		if event.Done {
+			// No client-visible payload → leave headers uncommitted for multi-open.
+			if !sawRealPayload && !assembler.Holding() && !assembler.EmittedAny() {
+				return nil
+			}
 			return flushAssemblerTerminal()
 		}
 		delta, err := proxy.ParseChatDelta(event.Data)
 		if err == nil && delta.Usage != nil {
-			stats.Usage = delta.Usage
+			// Merge partial usage frames — final frame often has completion only.
+			if prev, ok := stats.Usage.(map[string]any); ok {
+				if next, ok2 := delta.Usage.(map[string]any); ok2 {
+					stats.Usage = mergeUsageMaps(prev, next)
+				} else {
+					stats.Usage = delta.Usage
+				}
+			} else {
+				stats.Usage = delta.Usage
+			}
 		}
 		if err == nil {
 			if delta.ID != "" {
@@ -1005,6 +1129,19 @@ func streamChatCompletions(w http.ResponseWriter, r *http.Request, body io.Reade
 			hasTools := len(delta.ToolCalls) > 0 || delta.FunctionCall != nil
 			if hasContent || hasTools {
 				sawRealPayload = true
+				// Accumulate streamed text/reasoning/tools for completion estimate.
+				noteOutput(delta.Content)
+				noteOutput(delta.Reasoning)
+				for _, call := range delta.ToolCalls {
+					if fn, ok := call["function"].(map[string]any); ok {
+						noteOutput(proxyStringAny(fn["name"]))
+						noteOutput(proxyStringAny(fn["arguments"]))
+					}
+				}
+				if delta.FunctionCall != nil {
+					noteOutput(proxyStringAny(delta.FunctionCall["name"]))
+					noteOutput(proxyStringAny(delta.FunctionCall["arguments"]))
+				}
 				// TTFT = first real model payload, not hollow role/usage SSE.
 				if stats.FirstTokenMS == 0 {
 					stats.FirstTokenMS = int(time.Since(started).Milliseconds())
@@ -1016,6 +1153,11 @@ func streamChatCompletions(w http.ResponseWriter, r *http.Request, body io.Reade
 			if delta.FinishReason != nil {
 				sawFinishReason = true
 			}
+		}
+		// Defer client writes until first real model payload so multi-open can still
+		// rotate on hollow/empty streams (headers not committed).
+		if err == nil && !sawRealPayload && !(len(delta.ToolCalls) > 0 || delta.FunctionCall != nil || assembler.Holding()) {
+			return nil
 		}
 		// When tool deltas present (or assembler is already buffering tools), rewrite
 		// through assembler; pure text/finish frames passthrough with coalesce.
@@ -1051,6 +1193,7 @@ func streamChatCompletions(w http.ResponseWriter, r *http.Request, body io.Reade
 		if err := flushPending(true); err != nil {
 			return err
 		}
+		ensureHeaders()
 		if err := sw.WriteBytes(frame, true); err != nil {
 			return err
 		}
@@ -1071,6 +1214,11 @@ func streamChatCompletions(w http.ResponseWriter, r *http.Request, body io.Reade
 		return nil
 	}, func() error {
 		_ = flushPending(true)
+		// Do not write keepalive before first payload — would auto-commit HTTP 200
+		// and block multi-open empty failover.
+		if !headersWritten {
+			return nil
+		}
 		select {
 		case <-r.Context().Done():
 			sw.MarkSoftGone()
@@ -1096,15 +1244,42 @@ func streamChatCompletions(w http.ResponseWriter, r *http.Request, body io.Reade
 		if err == nil || clientSoft || upstreamMid {
 			_ = flushAssemblerTerminal()
 			if clientSoft || upstreamMid {
+				// Soft-close after payload: still attach completion estimate.
+				if outputRunes > 0 {
+					tok := outputRunes / 4
+					if tok < 1 {
+						tok = 1
+					}
+					stats.CompletionHint = tok
+				} else {
+					stats.CompletionHint = 1
+				}
 				return stats, nil
 			}
 		}
 	}
+	if !hasStreamPayload && !clientSoft {
+		// Hollow / empty / mid-drop with no client-visible content: treat as empty
+		// model output so multi-open can rotate and pool classifiers soft-block.
+		// Prefer empty classification over raw EOF so multi-open / model soft-block fire.
+		empty := errors.New("Upstream returned HTTP 200 with empty model output (no content/tool_calls)")
+		if !headersWritten {
+			return stats, empty
+		}
+		msg, errType := openAIErrorFromCause(empty)
+		encoded, _ := json.Marshal(map[string]any{"error": map[string]any{"message": msg, "type": errType}})
+		ensureHeaders()
+		_ = sw.WriteBytes(append(append([]byte("data: "), encoded...), '\n', '\n'), true)
+		_ = sw.WriteBytes([]byte("data: [DONE]\n\n"), true)
+		return stats, empty
+	}
 	if err != nil && !errors.Is(err, r.Context().Err()) && !hasStreamPayload {
 		msg, errType := openAIErrorFromCause(err)
 		encoded, _ := json.Marshal(map[string]any{"error": map[string]any{"message": msg, "type": errType}})
+		ensureHeaders()
 		_ = sw.WriteBytes(append(append([]byte("data: "), encoded...), '\n', '\n'), true)
 		_ = sw.WriteBytes([]byte("data: [DONE]\n\n"), true)
+		return stats, err
 	}
 	return stats, err
 }
@@ -1118,17 +1293,38 @@ func releaseServerPick(options Options, accountID string) {
 	options.PickObserver.ReleasePick(ctx, accountID)
 }
 
+func proxyStringAny(v any) string {
+	s, _ := v.(string)
+	return s
+}
+
 func recordChatUsage(r *http.Request, options Options, apiKey *auth.APIKeyRecord, accountID, model string, stream bool, ok bool, status int, started time.Time, usage any, cause error, ttftMS int, requestBody map[string]any) {
+	recordChatUsageWithHint(r, options, apiKey, accountID, model, stream, ok, status, started, usage, cause, ttftMS, requestBody, 0)
+}
+
+// recordChatUsageWithHint is like recordChatUsage but accepts a streamer-derived
+// completion token estimate when upstream omits the final usage frame.
+func recordChatUsageWithHint(r *http.Request, options Options, apiKey *auth.APIKeyRecord, accountID, model string, stream bool, ok bool, status int, started time.Time, usage any, cause error, ttftMS int, requestBody map[string]any, completionHint int) {
 	usageMap, _ := usage.(map[string]any)
-	// Soft-close / omitted upstream usage: fill from request body so admin does not
-	// show ok=true with all-zero tokens (hollow success with TTFT>0).
-	filled, flags := fillMissingUsage(usageMap, requestBody, 0)
+	// Soft-close / omitted upstream usage: fill from request body + streamer hint
+	// so admin does not show ok=true with completion_tokens=0 after a real stream.
+	hint := completionHint
+	if hint < 0 {
+		hint = 0
+	}
+	filled, flags := fillMissingUsage(usageMap, requestBody, hint)
 	// Only apply fill on successful deliveries; failures stay zero unless upstream sent real usage.
 	if ok {
 		usageMap = filled
-		p, c, t, _, _, _ := postgres.UsageFromOpenAI(usageMap)
-		if p == 0 && c == 0 && t == 0 && ttftMS > 0 {
-			filled2, flags2 := fillMissingUsage(usageMap, requestBody, 1)
+		_, c, _, _, _, _ := postgres.UsageFromOpenAI(usageMap)
+		// Real stream (TTFT>0) with still-zero completion: force at least 1 so
+		// usage rows match what the client actually received. Prefer streamer hint.
+		if c == 0 && ttftMS > 0 {
+			forceHint := hint
+			if forceHint < 1 {
+				forceHint = 1
+			}
+			filled2, flags2 := fillMissingUsage(usageMap, requestBody, forceHint)
 			usageMap = filled2
 			flags = flags2
 			flags.EstimatedCompletion = true
@@ -1155,6 +1351,13 @@ func recordChatUsage(r *http.Request, options Options, apiKey *auth.APIKeyRecord
 		ttftPtr = &v
 	}
 	detail := usageDetail("go_chat", requestBody, ttftMS, latency)
+	if completionHint > 0 {
+		detail["streamer_estimate_tokens"] = completionHint
+		// Ensure admin surfaces completion as estimated when only streamer/hint filled it.
+		if flags.EstimatedCompletion || flags.Missing {
+			flags.EstimatedCompletion = true
+		}
+	}
 	if ok {
 		flags.apply(detail)
 	}
@@ -1278,6 +1481,10 @@ func reportChatPool(r *http.Request, options Options, accountID string, ok bool,
 			// Only record durable failure/cooldown when classifier says so.
 			// Still bump fail stats for non-cooldown errors without setting until.
 			_ = options.Store.ReportPoolFailure(ctx, failure)
+			// Drop hot candidate cache so next pick skips just-cooled / model-blocked accounts.
+			if decision.ShouldCooldown || decision.BlockModel {
+				postgres.InvalidatePoolCandidateCache()
+			}
 		}
 		touchRedisPool(options, accountID, false, errText, cooldown, status)
 	}()
@@ -1509,18 +1716,40 @@ func serveMessages(w http.ResponseWriter, r *http.Request, options Options) {
 		writeAnthropicError(w, http.StatusBadRequest, err.Error(), "invalid_request_error")
 		return
 	}
+	// Ensure Claude Code / Anthropic multi-turn always has a stable prompt_cache_key
+	// before affinity + upstream (parity with OpenAI chat path). Seed from session
+	// metadata / first-user when client omits explicit cache keys.
+	pck := strings.TrimSpace(stringValue(body["prompt_cache_key"]))
+	if pck == "" {
+		pck = strings.TrimSpace(anthropic.ExtractPromptCacheKey(raw))
+		if pck != "" {
+			body["prompt_cache_key"] = pck
+		}
+	}
 	// Echo sticky cache key so clients / relays can reuse it next turn.
-	if pck := strings.TrimSpace(stringValue(body["prompt_cache_key"])); pck != "" {
+	if pck != "" {
 		w.Header().Set("X-Grok2API-Prompt-Cache-Key", pck)
 	}
 	allowedTools := allowedAnthropicToolNames(body)
 	chatReq := proxy.ChatRequest{Model: model, Stream: false, Raw: body, UserAgent: r.UserAgent()}
+	// Also inject pck into chatReq for affinity fingerprint when only raw had session metadata.
+	if pck != "" {
+		if chatReq.Raw == nil {
+			chatReq.Raw = map[string]any{}
+		}
+		chatReq.Raw["prompt_cache_key"] = pck
+	}
 	candidates, err := listCandidatesForRequest(r.Context(), options, chatReq, r.Header)
 	if err != nil {
 		writeAnthropicError(w, http.StatusInternalServerError, err.Error(), "api_error")
 		return
 	}
 	service := newChatService(options)
+	// Claude Code multi-turn: always sticky-first when we have a session/cache key so
+	// least_used / parallel probe cannot hop accounts and cold the prefix cache.
+	if pck != "" || proxy.ChatFingerprint(chatReq) != "" {
+		service.StickyFirstOnly = true
+	}
 	started := time.Now()
 	messageID := newAnthropicMessageID()
 	// Match Python resolve_outbound_max_tools for anthropic (Claude/sub2api-safe).
@@ -1539,47 +1768,113 @@ func serveMessages(w http.ResponseWriter, r *http.Request, options Options) {
 	}
 	if stream {
 		chatReq.Stream = true
-		opened, err := service.OpenStreamWithResult(r.Context(), chatReq, candidates, resolvePickMode(options))
-		if err != nil {
-			// Per-account free-usage / 额度用完 already kicked via FailureReporter.
-			recordAnthropicUsage(r, options, apiKey, opened.AccountID, model, true, false, http.StatusBadGateway, started, nil, err, 0, raw)
-			writeAnthropicProxyError(w, err)
+		// Up to 3 open attempts: OpenStream already failovers inside one call, but
+		// mid-stream empty after message_start cannot rotate. A fresh OpenStream after
+		// a pure open-time empty (headers not yet written) recovers more often under
+		// Claude Code high-effort empty storms. Once streamAnthropic writes headers,
+		// we cannot retry transparently.
+		var (
+			opened       proxy.StreamOpen
+			err          error
+			usage        map[string]any
+			firstTokenMS int
+			lastAccount  string
+			lastModel    = model
+			exclude      = map[string]struct{}{}
+		)
+		maxOpenAttempts := 4
+		candPool := candidates
+		for attempt := 0; attempt < maxOpenAttempts; attempt++ {
+			if attempt > 0 && lastAccount != "" {
+				exclude[lastAccount] = struct{}{}
+				// Drop just-failed account from the next window so OpenStream does not
+				// sticky-repick a hollow token (prompt_cache pin is cleared on empty).
+				filtered := make([]pool.Candidate, 0, len(candPool))
+				for _, c := range candPool {
+					if _, bad := exclude[c.ID]; bad {
+						continue
+					}
+					filtered = append(filtered, c)
+				}
+				if len(filtered) == 0 {
+					break
+				}
+				candPool = filtered
+				// New message id so Claude Code does not merge half envelopes across tries.
+				messageID = newAnthropicMessageID()
+			}
+			opened, err = service.OpenStreamWithResult(r.Context(), chatReq, candPool, resolvePickMode(options))
+			openElapsed := time.Since(started)
+			if err != nil {
+				lastAccount = strings.TrimSpace(opened.AccountID)
+				if lastAccount == "" {
+					// Open failed with no account — nothing to rotate.
+					recordAnthropicUsage(r, options, apiKey, opened.AccountID, model, true, false, http.StatusBadGateway, started, nil, err, 0, raw)
+					writeAnthropicProxyError(w, err)
+					return
+				}
+				// Open-time empty/5xx: report + try another window if attempts remain.
+				reportChatPool(r, options, lastAccount, false, err, http.StatusBadGateway, lastModel)
+				if attempt+1 >= maxOpenAttempts || !isRetryableUpstreamOpenErr(err) {
+					recordAnthropicUsage(r, options, apiKey, lastAccount, model, true, false, http.StatusBadGateway, started, nil, err, 0, raw)
+					writeAnthropicProxyError(w, err)
+					return
+				}
+				continue
+			}
+			lastAccount = opened.AccountID
+			lastModel = opened.Model
+			req := r
+			if options.runtimeConfig().SSEKeepalive > 0 {
+				req = r.WithContext(withAnthropicKeepalive(r.Context(), options.runtimeConfig().SSEKeepalive))
+			}
+			if policy.ToolGap > 0 {
+				req = req.WithContext(withOutboundToolGap(req.Context(), policy.ToolGap))
+			}
+			setAnthropicObservationHeaders(w, protocolObservation{Protocol: "anthropic",
+				AccountID: opened.AccountID, PreferAccount: opened.PreferAccount, Failover: opened.Failover || attempt > 0,
+				Fingerprint: opened.Fingerprint, Accounts: opened.Accounts, Prep: opened.Prep, Stream: true,
+			})
+			if pck := strings.TrimSpace(stringValue(body["prompt_cache_key"])); pck != "" {
+				w.Header().Set("X-Grok2API-Prompt-Cache-Key", pck)
+			}
+			// streamAnthropicMessages writes headers + message_start. Only one attempt
+			// can reach here per response; open-time empties are retried above.
+			usage, firstTokenMS, err = streamAnthropicMessages(w, req, opened.Body, messageID, opened.Model, len(allowedTools) > 0, allowedTools, maxTools)
+			_ = opened.Body.Close()
+			releaseServerPick(options, opened.AccountID)
+			if firstTokenMS > 0 {
+				wall := int(openElapsed.Milliseconds()) + firstTokenMS
+				if wall <= 0 {
+					wall = 1
+				}
+				firstTokenMS = wall
+			}
+			ok := err == nil
+			if !ok && errors.Is(err, r.Context().Err()) {
+				ok = true
+			}
+			// Empty with no TTFT: headers likely uncommitted → try another account.
+			if !ok && firstTokenMS == 0 && isRetryableUpstreamOpenErr(err) && attempt+1 < maxOpenAttempts {
+				reportChatPool(r, options, opened.AccountID, false, err, http.StatusBadGateway, opened.Model)
+				lastAccount = opened.AccountID
+				lastModel = opened.Model
+				continue
+			}
+			status := http.StatusOK
+			if !ok {
+				status = http.StatusBadGateway
+			}
+			recordAnthropicUsage(r, options, apiKey, opened.AccountID, opened.Model, true, ok, status, started, usage, err, firstTokenMS, raw)
+			reportChatPool(r, options, opened.AccountID, ok, err, status, opened.Model)
 			return
 		}
-		defer opened.Body.Close()
-		defer releaseServerPick(options, opened.AccountID)
-		req := r
-		if options.runtimeConfig().SSEKeepalive > 0 {
-			req = r.WithContext(withAnthropicKeepalive(r.Context(), options.runtimeConfig().SSEKeepalive))
+		// Exhausted open attempts without streaming.
+		if err == nil {
+			err = errors.New("Upstream returned HTTP 200 with empty model output (no content/tool_calls)")
 		}
-		if policy.ToolGap > 0 {
-			req = req.WithContext(withOutboundToolGap(req.Context(), policy.ToolGap))
-		}
-		setAnthropicObservationHeaders(w, protocolObservation{Protocol: "anthropic",
-			AccountID: opened.AccountID, PreferAccount: opened.PreferAccount, Failover: opened.Failover,
-			Fingerprint: opened.Fingerprint, Accounts: opened.Accounts, Prep: opened.Prep, Stream: true,
-		})
-		if pck := strings.TrimSpace(stringValue(body["prompt_cache_key"])); pck != "" {
-			w.Header().Set("X-Grok2API-Prompt-Cache-Key", pck)
-		}
-		usage, firstTokenMS, err := streamAnthropicMessages(w, req, opened.Body, messageID, opened.Model, len(allowedTools) > 0, allowedTools, maxTools)
-		// Empty upstream / tool-vanished returns an error; soft disconnect without
-		// payload also returns empty error (see streamAnthropicMessagesWithOptions).
-		// Only pure client-cancel AFTER payload is treated as ok.
-		ok := err == nil
-		if !ok && errors.Is(err, r.Context().Err()) {
-			ok = true
-		}
-		status := http.StatusOK
-		if !ok {
-			status = http.StatusBadGateway
-		}
-		// Hollow / half-open tool streams return an empty error from the stream
-		// function (ClientDeliveryOK / HasClientPayload). Do NOT flip ok=false
-		// solely for zero usage tokens — upstream often omits usage on short tool
-		// turns; that would false-fail real deliveries (and mask the real fix).
-		recordAnthropicUsage(r, options, apiKey, opened.AccountID, opened.Model, true, ok, status, started, usage, err, firstTokenMS, raw)
-		reportChatPool(r, options, opened.AccountID, ok, err, status, opened.Model)
+		recordAnthropicUsage(r, options, apiKey, lastAccount, model, true, false, http.StatusBadGateway, started, nil, err, 0, raw)
+		writeAnthropicProxyError(w, err)
 		return
 	}
 	result, err := service.CompleteWithResult(r.Context(), chatReq, candidates, resolvePickMode(options))
@@ -1996,6 +2291,8 @@ func serveResponses(w http.ResponseWriter, r *http.Request, options Options) {
 		}
 	}
 	service := newChatService(options)
+	// Codex Responses multi-turn: sticky-first for prompt_cache / previous_response.
+	service.StickyFirstOnly = true
 	started := time.Now()
 	responseID := responses.NewResponseID()
 	respPolicy := historycompact.ResolveOutboundToolPolicy(
@@ -2008,11 +2305,69 @@ func serveResponses(w http.ResponseWriter, r *http.Request, options Options) {
 		options.runtimeConfig().OutboundToolGapNative,
 	)
 	if stream {
-		// Codex TTFT: open SSE envelope immediately so the client is not blocked on
-		// account pick + upstream first-byte. Empty/failover still happens before any
-		// model payload is emitted by LiveStreamer.Start being called once only.
+		// Multi-open BEFORE writing the Responses envelope so empty/hollow storms
+		// can rotate accounts without response.failed on a half-open stream.
+		// (Previously we wrote response.created immediately for Codex TTFT; empty
+		// open then could only Fail — client saw empty model output. Open peek
+		// already dominates TTFT under empty storms, so deferring Start is fine.)
+		var (
+			opened      proxy.StreamOpen
+			err         error
+			lastAccount string
+			lastModel   = model
+			exclude     = map[string]struct{}{}
+		)
+		maxOpenAttempts := 4
+		candPool := candidates
+		for attempt := 0; attempt < maxOpenAttempts; attempt++ {
+			if attempt > 0 && lastAccount != "" {
+				exclude[lastAccount] = struct{}{}
+				filtered := make([]pool.Candidate, 0, len(candPool))
+				for _, c := range candPool {
+					if _, bad := exclude[c.ID]; bad {
+						continue
+					}
+					filtered = append(filtered, c)
+				}
+				if len(filtered) == 0 {
+					break
+				}
+				candPool = filtered
+			}
+			opened, err = service.OpenStreamWithResult(r.Context(), chatReq, candPool, resolvePickMode(options))
+			if err != nil {
+				lastAccount = strings.TrimSpace(opened.AccountID)
+				if lastAccount == "" {
+					recordResponsesUsage(r, options, apiKey, opened.AccountID, model, true, false, http.StatusBadGateway, started, nil, err, 0, raw)
+					writeOpenAIProxyError(w, err)
+					return
+				}
+				reportChatPool(r, options, lastAccount, false, err, http.StatusBadGateway, lastModel)
+				if attempt+1 >= maxOpenAttempts || !isRetryableUpstreamOpenErr(err) {
+					recordResponsesUsage(r, options, apiKey, lastAccount, model, true, false, http.StatusBadGateway, started, nil, err, 0, raw)
+					writeOpenAIProxyError(w, err)
+					return
+				}
+				continue
+			}
+			break
+		}
+		if err != nil {
+			recordResponsesUsage(r, options, apiKey, lastAccount, model, true, false, http.StatusBadGateway, started, nil, err, 0, raw)
+			writeOpenAIProxyError(w, err)
+			return
+		}
+		if opened.Body == nil {
+			err = errors.New("Upstream returned HTTP 200 with empty model output (no content/tool_calls)")
+			recordResponsesUsage(r, options, apiKey, lastAccount, model, true, false, http.StatusBadGateway, started, nil, err, 0, raw)
+			writeOpenAIProxyError(w, err)
+			return
+		}
+		openElapsed := time.Since(started)
 		flusher, canFlush := w.(http.Flusher)
 		if !canFlush {
+			_ = opened.Body.Close()
+			releaseServerPick(options, opened.AccountID)
 			writeJSON(w, http.StatusInternalServerError, map[string]any{"detail": "streaming is not supported by this response writer"})
 			return
 		}
@@ -2024,6 +2379,12 @@ func serveResponses(w http.ResponseWriter, r *http.Request, options Options) {
 		if pck != "" {
 			w.Header().Set("X-Grok2API-Prompt-Cache-Key", pck)
 		}
+		// Bind this response_id so next Codex turn with previous_response_id sticks.
+		bindResponseAffinity(r.Context(), options, responseID, opened.AccountID, opened.Model, pck)
+		setProtocolObservationHeaders(w, protocolObservation{
+			Protocol: "openai_responses", AccountID: opened.AccountID, PreferAccount: opened.PreferAccount,
+			Failover: opened.Failover, Fingerprint: opened.Fingerprint, Accounts: opened.Accounts, Prep: opened.Prep,
+		})
 		w.WriteHeader(http.StatusOK)
 		early := responses.NewLiveStreamerWithMaxTools(responseID, model, allowedResponsesToolNames(body), respPolicy.MaxTools)
 		early.SetShellArgKeys(shellArgKeysFrom(r.Context()))
@@ -2034,23 +2395,8 @@ func serveResponses(w http.ResponseWriter, r *http.Request, options Options) {
 		if canFlush {
 			flusher.Flush()
 		}
-		opened, err := service.OpenStreamWithResult(r.Context(), chatReq, candidates, resolvePickMode(options))
-		if err != nil {
-			// Emit failed terminal on already-open stream.
-			for _, frame := range early.Fail(err.Error(), "server_error") {
-				_, _ = w.Write([]byte(frame))
-			}
-			if canFlush {
-				flusher.Flush()
-			}
-			// Per-account free-usage / 额度用完 already kicked via FailureReporter.
-			recordResponsesUsage(r, options, apiKey, opened.AccountID, model, true, false, http.StatusBadGateway, started, nil, err, 0, raw)
-			return
-		}
 		defer opened.Body.Close()
 		defer releaseServerPick(options, opened.AccountID)
-		// Bind this response_id so next Codex turn with previous_response_id sticks.
-		bindResponseAffinity(r.Context(), options, responseID, opened.AccountID, opened.Model, pck)
 		req := r
 		if options.runtimeConfig().SSEKeepalive > 0 {
 			req = r.WithContext(withAnthropicKeepalive(r.Context(), options.runtimeConfig().SSEKeepalive))
@@ -2058,11 +2404,16 @@ func serveResponses(w http.ResponseWriter, r *http.Request, options Options) {
 		if respPolicy.ToolGap > 0 {
 			req = req.WithContext(withOutboundToolGap(req.Context(), respPolicy.ToolGap))
 		}
-		setProtocolObservationHeaders(w, protocolObservation{
-			Protocol: "openai_responses", AccountID: opened.AccountID, PreferAccount: opened.PreferAccount,
-			Failover: opened.Failover, Fingerprint: opened.Fingerprint, Accounts: opened.Accounts, Prep: opened.Prep,
-		})
 		usage, firstTokenMS, err := streamOpenAIResponsesContinue(w, req, opened.Body, early, effectiveResponsesKeepalive(optionsFromRequest(req).Keepalive, len(allowedResponsesToolNames(body)) > 0), respPolicy.MaxTools)
+		// firstTokenMS from Continue is ms from stream-read start → first delivered payload.
+		// Admin TTFT = open/pick duration + stream-local first payload (NOT full request latency).
+		if firstTokenMS > 0 {
+			wallFirst := int(openElapsed.Milliseconds()) + firstTokenMS
+			if wallFirst <= 0 {
+				wallFirst = 1
+			}
+			firstTokenMS = wallFirst
+		}
 		// Client cancel after headers is soft-ok only when the stream function
 		// already soft-closed a real payload (returns nil). Empty/tool-vanished
 		// returns an explicit empty error → not ok.
@@ -2236,23 +2587,54 @@ func recordResponsesUsage(r *http.Request, options Options, apiKey *auth.APIKeyR
 	// Always re-run fill with request body so prompt/total never stay hollow when ok.
 	hint := 0
 	if ok {
-		// If stream already put a completion estimate in usage, keep it via merge max.
+		// Prefer non-zero completion already in usage (from streamer estimate or upstream).
 		if _, c, _, _, _, _ := postgres.UsageFromOpenAI(usageMap); c > 0 {
 			hint = int(c)
+		}
+		// Also read output_tokens alias if completion was stored that way only.
+		if hint <= 0 && usageMap != nil {
+			if v, ok := usageMap["output_tokens"]; ok {
+				if n := anyToInt64(v); n > 0 {
+					hint = int(n)
+				}
+			}
 		}
 		if hint <= 0 && ttftMS > 0 {
 			hint = 1 // TTFT>0 proves client saw payload
 		}
 	}
+	// Propagate streamer estimate markers before re-fill.
+	preEstCompletion := usageMap != nil && usageMap["_estimated_completion"] == true
+	preEstPrompt := usageMap != nil && usageMap["_estimated_prompt"] == true
+	preEstTotal := usageMap != nil && usageMap["_estimated_total"] == true
+	preMissing := usageMap != nil && usageMap["_usage_missing"] == true
+	streamerChars := 0
+	streamerEst := 0
+	if usageMap != nil {
+		streamerChars = int(anyToInt64(usageMap["_streamer_output_chars"]))
+		streamerEst = int(anyToInt64(usageMap["_streamer_estimate"]))
+	}
 	filled, flags := fillMissingUsage(usageMap, requestBody, hint)
+	if preEstCompletion {
+		flags.EstimatedCompletion = true
+	}
+	if preEstPrompt {
+		flags.EstimatedPrompt = true
+	}
+	if preEstTotal {
+		flags.EstimatedTotal = true
+	}
+	if preMissing {
+		flags.Missing = true
+	}
 	if ok {
 		usageMap = filled
-		// Final hard guarantee: never write ok=true with all-zero tokens when TTFT>0.
+		// Final hard guarantee: never write ok=true with completion=0 when TTFT>0.
 		p, c, t, _, _, _ := postgres.UsageFromOpenAI(usageMap)
-		if (p == 0 || c == 0 || t == 0 || t < p+c) && ttftMS > 0 {
-			if c <= 0 {
-				c = 1
-			}
+		if c == 0 && ttftMS > 0 {
+			c = 1
+			flags.EstimatedCompletion = true
+			flags.Missing = true
 			if p <= 0 {
 				if est := estimatePromptTokens(requestBody); est > 0 {
 					p = int64(est)
@@ -2265,10 +2647,6 @@ func recordResponsesUsage(r *http.Request, options Options, apiKey *auth.APIKeyR
 			if t < p+c {
 				t = p + c
 				flags.EstimatedTotal = true
-			}
-			flags.Missing = true
-			if c == 1 {
-				flags.EstimatedCompletion = true
 			}
 			usageMap = map[string]any{
 				"prompt_tokens":     p,
@@ -2289,10 +2667,37 @@ func recordResponsesUsage(r *http.Request, options Options, apiKey *auth.APIKeyR
 					usageMap["reasoning_tokens"] = rs
 				}
 			}
+		} else if (p == 0 || t == 0 || t < p+c) && ttftMS > 0 {
+			// Keep existing completion; only fix prompt/total holes.
+			if p <= 0 {
+				if est := estimatePromptTokens(requestBody); est > 0 {
+					p = int64(est)
+					flags.EstimatedPrompt = true
+				} else {
+					p = 1
+					flags.EstimatedPrompt = true
+				}
+			}
+			if t < p+c {
+				t = p + c
+				flags.EstimatedTotal = true
+			}
+			flags.Missing = true
+			usageMap["prompt_tokens"] = p
+			usageMap["completion_tokens"] = c
+			usageMap["total_tokens"] = t
+			usageMap["input_tokens"] = p
+			usageMap["output_tokens"] = c
 		}
 	} else if usageMap == nil {
 		usageMap = map[string]any{}
 		flags = usageFillFlags{}
+	}
+	// Drop internal estimate markers before numeric parse / storage.
+	if usageMap != nil {
+		for _, k := range []string{"_estimated_completion", "_estimated_prompt", "_estimated_total", "_usage_missing", "_streamer_output_chars", "_streamer_estimate"} {
+			delete(usageMap, k)
+		}
 	}
 	prompt, completion, total, cacheRead, cacheCreate, reasoning := postgres.UsageFromOpenAI(usageMap)
 	streamValue := stream
@@ -2319,6 +2724,18 @@ func recordResponsesUsage(r *http.Request, options Options, apiKey *auth.APIKeyR
 		detail["ttft_ms"] = ttftMS
 	}
 	detail["latency_ms"] = latency
+	if streamerChars > 0 {
+		detail["streamer_output_chars"] = streamerChars
+	}
+	if streamerEst > 0 {
+		detail["streamer_estimate_tokens"] = streamerEst
+	}
+	// If completion came from streamer estimate (markers) but fillMissingUsage
+	// did not re-flag it, still surface completion in usage_estimated_fields.
+	if preEstCompletion && !flags.EstimatedCompletion {
+		flags.EstimatedCompletion = true
+		flags.Missing = true
+	}
 	if ok {
 		flags.apply(detail)
 	}
@@ -2559,7 +2976,16 @@ func streamAnthropicMessagesWithOptions(w http.ResponseWriter, r *http.Request, 
 	w.Header().Set("Connection", "keep-alive")
 	w.Header().Set("X-Accel-Buffering", "no")
 	w.Header().Set("X-Grok2API-Protocol", "anthropic")
-	w.WriteHeader(http.StatusOK)
+	// Delay WriteHeader until first real SSE write so open-time empty can rotate
+	// accounts in serveMessages without committing HTTP 200.
+	headersWritten := false
+	ensureHeaders := func() {
+		if headersWritten {
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		headersWritten = true
+	}
 
 	started := time.Now()
 	firstTokenMS := 0
@@ -2584,6 +3010,7 @@ func streamAnthropicMessagesWithOptions(w http.ResponseWriter, r *http.Request, 
 		if len(frames) == 0 {
 			return "", true, nil
 		}
+		ensureHeaders()
 		writeMu.Lock()
 		defer writeMu.Unlock()
 		forceWrite := force || envelopeOpen || sw.SoftGone()
@@ -2618,6 +3045,19 @@ func streamAnthropicMessagesWithOptions(w http.ResponseWriter, r *http.Request, 
 		if strings.Contains(joined, "text_delta") || strings.Contains(joined, "thinking_delta") ||
 			strings.Contains(joined, `"type":"text"`) || strings.Contains(joined, `"type":"thinking"`) {
 			assembler.AckContentDelivered()
+			if firstTokenMS == 0 {
+				firstTokenMS = int(time.Since(started).Milliseconds())
+				if firstTokenMS <= 0 {
+					firstTokenMS = 1
+				}
+			}
+		}
+		// Tool start that fully landed also counts as first client-visible output.
+		if hasTool && (fullOK || hasToolStop) && firstTokenMS == 0 {
+			firstTokenMS = int(time.Since(started).Milliseconds())
+			if firstTokenMS <= 0 {
+				firstTokenMS = 1
+			}
 		}
 		if strings.Contains(joined, "event: message_stop") || strings.Contains(joined, `"type":"message_stop"`) {
 			assembler.AckTerminal()
@@ -2652,6 +3092,7 @@ func streamAnthropicMessagesWithOptions(w http.ResponseWriter, r *http.Request, 
 			payload := pendingSSE
 			streamCoalesceFlush.Add(1)
 			// Direct WriteBytes: payload is already concatenated SSE frames.
+			ensureHeaders()
 			writeMu.Lock()
 			lastErr = sw.WriteBytes(payload, force || sw.SoftGone() || envelopeOpen)
 			writeMu.Unlock()
@@ -2663,6 +3104,13 @@ func streamAnthropicMessagesWithOptions(w http.ResponseWriter, r *http.Request, 
 				envelopeOpen = true
 				firstPayloadFlushed = true
 				assembler.AckContentDelivered()
+				// Coalesced thinking/text often lands only on flush — mark TTFT here.
+				if firstTokenMS == 0 {
+					firstTokenMS = int(time.Since(started).Milliseconds())
+					if firstTokenMS <= 0 {
+						firstTokenMS = 1
+					}
+				}
 				return nil
 			}
 			// Soft fail: advance past accepted bytes; keep unsent tail.
@@ -2677,6 +3125,12 @@ func streamAnthropicMessagesWithOptions(w http.ResponseWriter, r *http.Request, 
 					firstPayloadFlushed = true
 					// Partial short-write may still have delivered some text.
 					assembler.AckContentDelivered()
+					if firstTokenMS == 0 {
+						firstTokenMS = int(time.Since(started).Milliseconds())
+						if firstTokenMS <= 0 {
+							firstTokenMS = 1
+						}
+					}
 					return nil
 				}
 			}
@@ -2882,13 +3336,9 @@ func streamAnthropicMessagesWithOptions(w http.ResponseWriter, r *http.Request, 
 		return nil
 	}
 
-	// Early envelope: Claude Code perceived TTFT starts when message_start lands,
-	// not when the first model token arrives (important on long tool-prep turns).
-	if err := emitFrames(assembler.Start(0), true); err != nil {
-		return nil, 0, err
-	}
-	envelopeOpen = true
-
+	// Defer message_start until first real model payload. Early Start forced headers
+	// open before hollow streams were known → empty 502 with no transparent failover.
+	// Keepalive comments still flow via onIdle until envelope opens.
 	var finish string
 	var usage anthropic.Usage
 	var openAIUsage map[string]any
@@ -2915,6 +3365,9 @@ func streamAnthropicMessagesWithOptions(w http.ResponseWriter, r *http.Request, 
 		}
 		// Always force when holding tools/text so idle timer resets client-side even
 		// under write-pressure (Claude Code multi-minute Update/Edit turns).
+		if !envelopeOpen || !headersWritten {
+			return nil
+		}
 		force := toolsRequested || assembler.NeedsClientKeepalive() || sw.SoftGone() || envelopeOpen
 		return sw.Keepalive(anthropicKeepaliveFrame, DefaultKeepaliveInterval, force)
 	}
@@ -2951,11 +3404,22 @@ func streamAnthropicMessagesWithOptions(w http.ResponseWriter, r *http.Request, 
 		hasTools := len(delta.AnthropicToolDeltas()) > 0
 		if hasContent || hasReasoning || hasTools {
 			sawModel = true
+			// First model payload: open Anthropic envelope (deferred message_start).
+			if !envelopeOpen {
+				if err := emitFrames(assembler.Start(0), true); err != nil {
+					return err
+				}
+				envelopeOpen = true
+			}
 		}
 		// Live path: do NOT force-flush pure thinking/text (coalesce). Tools/start
 		// inside Feed still force via needImmediate classification in emitFrames.
 		// Soft write errors are still swallowed by sseWriter after envelope open.
 		wroteFrames := false
+		if !envelopeOpen {
+			// No model payload yet — do not write (would commit HTTP 200).
+			return nil
+		}
 		feedFrames := assembler.Feed(delta.Content, delta.Reasoning, delta.AnthropicToolDeltas())
 		if len(feedFrames) > 0 {
 			if err := emitFrames(feedFrames, false); err != nil {
@@ -2988,15 +3452,49 @@ func streamAnthropicMessagesWithOptions(w http.ResponseWriter, r *http.Request, 
 			break
 		}
 	}
+	// End-of-stream TTFT backfill: coalesced content may only flush on drain, or
+	// PayloadDelivered may flip after final Write. Never leave ok success with null TTFT
+	// when the client clearly got text/tools (admin "首字时间无法获取").
+	if firstTokenMS == 0 && (assembler.PayloadDelivered() || assembler.HasClientPayload() || sawModel || assembler.OutputRunes() > 0) {
+		firstTokenMS = int(time.Since(started).Milliseconds())
+		if firstTokenMS <= 0 {
+			firstTokenMS = 1
+		}
+	}
 
 	// fillAnthropicStreamUsage patches zero usage from assembler output when upstream
 	// omitted the usage frame (soft-close / short tool turns → admin hollow success).
+	// Stamps _estimated_* markers so recordAnthropicUsage can surface completion
+	// in usage_estimated_fields (previously flags were dropped → "prompt,total" only).
 	fillAnthropicStreamUsage := func(u map[string]any) map[string]any {
 		hint := 0
+		chars := 0
 		if assembler != nil {
 			hint = assembler.EstimateOutputTokens()
+			chars = assembler.OutputRunes()
 		}
-		filled, _ := fillMissingUsage(u, nil, hint)
+		filled, flags := fillMissingUsage(u, nil, hint)
+		if filled == nil {
+			filled = map[string]any{}
+		}
+		if flags.EstimatedCompletion {
+			filled["_estimated_completion"] = true
+		}
+		if flags.EstimatedPrompt {
+			filled["_estimated_prompt"] = true
+		}
+		if flags.EstimatedTotal {
+			filled["_estimated_total"] = true
+		}
+		if flags.Missing {
+			filled["_usage_missing"] = true
+		}
+		if chars > 0 {
+			filled["_streamer_output_chars"] = chars
+		}
+		if hint > 0 {
+			filled["_streamer_estimate"] = hint
+		}
 		return filled
 	}
 
@@ -3016,9 +3514,15 @@ func streamAnthropicMessagesWithOptions(w http.ResponseWriter, r *http.Request, 
 		return fillAnthropicStreamUsage(openAIUsage), firstTokenMS, err
 	}
 	if !hasPayload {
-		// Soft disconnect before any model payload is still a hollow stream —
-		// never soft-ok (admin ok=true tokens=0). Close envelope if open, then fail.
 		empty := errors.New("Upstream returned HTTP 200 with empty model output (no content/tool_calls)")
+		// Not committed → allow serveMessages multi-open to try another account.
+		if !headersWritten {
+			return fillAnthropicStreamUsage(openAIUsage), firstTokenMS, empty
+		}
+		if !envelopeOpen {
+			_ = emitFrames(assembler.Start(0), true)
+			envelopeOpen = true
+		}
 		if clientGone {
 			_ = emitFrames(assembler.Finish("stop", usage), true)
 			return fillAnthropicStreamUsage(openAIUsage), firstTokenMS, empty
@@ -3165,16 +3669,106 @@ func (p *disconnectProbe) check(ctx context.Context) bool {
 	}
 }
 
+// isRetryableUpstreamOpenErr reports open-time failures worth a fresh OpenStream
+// on a different account (empty/hollow, transient 5xx, rate limit). Auth/billing
+// hard fails should not burn more accounts in a tight loop.
+func isRetryableUpstreamOpenErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	if strings.Contains(msg, "empty model output") ||
+		strings.Contains(msg, "no content/tool_calls") ||
+		strings.Contains(msg, "no client-visible content") {
+		return true
+	}
+	var ue *grok.UpstreamError
+	if errors.As(err, &ue) && ue != nil {
+		if ue.Status == http.StatusTooManyRequests || ue.Status >= 500 {
+			return true
+		}
+		if ue.Status == 0 {
+			return true
+		}
+		body := strings.ToLower(ue.Body)
+		if strings.Contains(body, "empty") || strings.Contains(body, "rate") || strings.Contains(body, "overloaded") {
+			return true
+		}
+	}
+	return strings.Contains(msg, "timeout") || strings.Contains(msg, "temporar") || strings.Contains(msg, "connection reset")
+}
+
 func recordAnthropicUsage(r *http.Request, options Options, apiKey *auth.APIKeyRecord, accountID, model string, stream bool, ok bool, status int, started time.Time, usage any, cause error, ttftMS int, requestBody map[string]any) {
 	usageMap, _ := usage.(map[string]any)
-	// Soft-close / omitted upstream usage: fill prompt from request body and keep
-	// any completion estimate the stream already attached (from OutputRunes).
-	filled, flags := fillMissingUsage(usageMap, requestBody, 0)
+	// Prefer streamer completion estimate already stamped by fillAnthropicStreamUsage.
+	hint := 0
+	preEstCompletion := false
+	preEstPrompt := false
+	preEstTotal := false
+	preMissing := false
+	streamerChars := 0
+	streamerEst := 0
+	if usageMap != nil {
+		if usageMap["_estimated_completion"] == true {
+			preEstCompletion = true
+		}
+		if usageMap["_estimated_prompt"] == true {
+			preEstPrompt = true
+		}
+		if usageMap["_estimated_total"] == true {
+			preEstTotal = true
+		}
+		if usageMap["_usage_missing"] == true {
+			preMissing = true
+		}
+		streamerChars = int(anyToInt64(usageMap["_streamer_output_chars"]))
+		streamerEst = int(anyToInt64(usageMap["_streamer_estimate"]))
+		if _, c, _, _, _, _ := postgres.UsageFromOpenAI(usageMap); c > 0 {
+			hint = int(c)
+		}
+		if hint <= 0 && streamerEst > 0 {
+			hint = streamerEst
+		}
+	}
+	if ok && hint <= 0 && ttftMS > 0 {
+		hint = 1
+	}
+	// Soft-close / omitted upstream usage: fill prompt from request body + streamer hint.
+	filled, flags := fillMissingUsage(usageMap, requestBody, hint)
+	if preEstCompletion {
+		flags.EstimatedCompletion = true
+	}
+	if preEstPrompt {
+		flags.EstimatedPrompt = true
+	}
+	if preEstTotal {
+		flags.EstimatedTotal = true
+	}
+	if preMissing {
+		flags.Missing = true
+	}
 	if ok {
 		usageMap = filled
-		p, c, t, _, _, _ := postgres.UsageFromOpenAI(usageMap)
-		if p == 0 && c == 0 && t == 0 && ttftMS > 0 {
-			filled2, flags2 := fillMissingUsage(usageMap, requestBody, 1)
+		_, c, _, _, _, _ := postgres.UsageFromOpenAI(usageMap)
+		// Real delivery with still-zero completion: lift to streamer/floor.
+		if c == 0 && ttftMS > 0 {
+			forceHint := hint
+			if forceHint < 1 {
+				forceHint = 1
+			}
+			filled2, flags2 := fillMissingUsage(usageMap, requestBody, forceHint)
+			usageMap = filled2
+			flags = flags2
+			flags.EstimatedCompletion = true
+			flags.Missing = true
+			_, c, _, _, _, _ = postgres.UsageFromOpenAI(usageMap)
+		}
+		// Tiny floor completion while streamer saw more → lift (same as Responses).
+		if streamerEst > int(c) && c <= 2 && streamerEst >= 4 {
+			filled2, flags2 := fillMissingUsage(usageMap, requestBody, streamerEst)
 			usageMap = filled2
 			flags = flags2
 			flags.EstimatedCompletion = true
@@ -3183,6 +3777,11 @@ func recordAnthropicUsage(r *http.Request, options Options, apiKey *auth.APIKeyR
 	} else if usageMap == nil {
 		usageMap = map[string]any{}
 		flags = usageFillFlags{}
+	}
+	if usageMap != nil {
+		for _, k := range []string{"_estimated_completion", "_estimated_prompt", "_estimated_total", "_usage_missing", "_streamer_output_chars", "_streamer_estimate"} {
+			delete(usageMap, k)
+		}
 	}
 	prompt, completion, total, cacheRead, cacheCreate, reasoning := postgres.UsageFromOpenAI(usageMap)
 	streamValue := stream
@@ -3195,6 +3794,25 @@ func recordAnthropicUsage(r *http.Request, options Options, apiKey *auth.APIKeyR
 		errText = cause.Error()
 	}
 	latency := int(time.Since(started).Milliseconds())
+	// Successful turns with output must not leave admin TTFT empty ("首字时间无法获取").
+	// Prefer stream-measured firstTokenMS; if missing, use a lower-bound estimate.
+	if ok && ttftMS <= 0 && (completion > 0 || total > prompt) {
+		if latency > 2 {
+			ttftMS = latency / 2
+			if ttftMS < 1 {
+				ttftMS = 1
+			}
+			// Cap estimate below full latency so it is not mistaken for total duration.
+			if ttftMS >= latency {
+				ttftMS = latency - 1
+				if ttftMS < 1 {
+					ttftMS = 1
+				}
+			}
+		} else {
+			ttftMS = 1
+		}
+	}
 	var ttftPtr *int
 	if ttftMS > 0 {
 		v := ttftMS
@@ -3238,7 +3856,18 @@ func recordAnthropicUsage(r *http.Request, options Options, apiKey *auth.APIKeyR
 					if ttftMS <= 0 {
 						d["ttft_missing"] = true
 					}
+					if streamerChars > 0 {
+						d["streamer_output_chars"] = streamerChars
+					}
+					if streamerEst > 0 {
+						d["streamer_estimate_tokens"] = streamerEst
+					}
 					if ok {
+						// Propagate streamer completion estimate into usage_estimated_fields.
+						if preEstCompletion {
+							flags.EstimatedCompletion = true
+							flags.Missing = true
+						}
 						flags.apply(d)
 					}
 					return d
@@ -3731,10 +4360,25 @@ func serveAdminKeys(w http.ResponseWriter, r *http.Request, options Options) {
 	if options.APIKeys != nil {
 		required, _ = options.APIKeys.AuthRequired(r.Context())
 	}
+	// Stats are best-effort: a stats failure must not blank the key list UI.
 	stats, err := options.Store.KeyStats(r.Context(), strings.TrimSpace(options.Config.LegacyAPIKey) != "", required)
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]any{"detail": err.Error()})
-		return
+		stats = map[string]any{
+			"total":          int64(len(public)),
+			"enabled":        int64(0),
+			"disabled":       int64(0),
+			"total_requests": int64(0),
+			"auth_required":  required,
+			"legacy_env_key": strings.TrimSpace(options.Config.LegacyAPIKey) != "",
+			"error":          err.Error(),
+		}
+		for _, k := range public {
+			if en, _ := k["enabled"].(bool); en {
+				stats["enabled"] = stats["enabled"].(int64) + 1
+			} else {
+				stats["disabled"] = stats["disabled"].(int64) + 1
+			}
+		}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"keys": public, "stats": stats, "store_source": "postgres", "store_backend": "postgres"})
 }
@@ -3845,6 +4489,36 @@ func serveAdminAccounts(w http.ResponseWriter, r *http.Request, options Options)
 	writeJSON(w, http.StatusOK, payload)
 }
 
+// Shared registration HTTP client: admin UI polls batch/session every ~150–400ms.
+// Reusing one Transport avoids dial/TLS thrash and cuts log-refresh latency under load.
+var (
+	regHTTPClientOnce sync.Once
+	regHTTPClient     *http.Client
+	regClientMu       sync.Mutex
+	regClientCache    *regclient.Client
+	regClientBase     string
+	regClientToken    string
+)
+
+func sharedRegistrationHTTP() *http.Client {
+	regHTTPClientOnce.Do(func() {
+		// Keep under browser REG_POLL_TIMEOUT_MS (~900ms) so a stuck sidecar never freezes the log UI.
+		regHTTPClient = &http.Client{
+			Timeout: 750 * time.Millisecond,
+			Transport: &http.Transport{
+				DialContext:           (&net.Dialer{Timeout: 250 * time.Millisecond}).DialContext,
+				MaxIdleConns:          128,
+				MaxIdleConnsPerHost:   64,
+				MaxConnsPerHost:       64,
+				IdleConnTimeout:       90 * time.Second,
+				ResponseHeaderTimeout: 600 * time.Millisecond,
+				ForceAttemptHTTP2:     true,
+			},
+		}
+	})
+	return regHTTPClient
+}
+
 func registrationClient(options Options) *regclient.Client {
 	base := strings.TrimSpace(options.RegistrationURL)
 	if base == "" {
@@ -3857,23 +4531,19 @@ func registrationClient(options Options) *regclient.Client {
 	if base == "" {
 		return nil
 	}
-	// Shared fail-fast client: admin polls every ~0.2s; never hang on DefaultClient.
-	// 900ms total keeps under the browser reg-poll abort (1.2s) so the UI never waits
-	// on a stuck Go→sidecar round-trip.
-	return &regclient.Client{
+	regClientMu.Lock()
+	defer regClientMu.Unlock()
+	if regClientCache != nil && regClientBase == base && regClientToken == token {
+		return regClientCache
+	}
+	regClientBase = base
+	regClientToken = token
+	regClientCache = &regclient.Client{
 		BaseURL: base,
 		Token:   token,
-		HTTP: &http.Client{
-			Timeout: 900 * time.Millisecond,
-			Transport: &http.Transport{
-				DialContext:           (&net.Dialer{Timeout: 400 * time.Millisecond}).DialContext,
-				MaxIdleConns:          64,
-				MaxIdleConnsPerHost:   32,
-				IdleConnTimeout:       30 * time.Second,
-				ResponseHeaderTimeout: 700 * time.Millisecond,
-			},
-		},
+		HTTP:    sharedRegistrationHTTP(),
 	}
+	return regClientCache
 }
 
 func requireAdminReadWrite(w http.ResponseWriter, r *http.Request, options Options, write bool) bool {
@@ -5755,6 +6425,63 @@ func resolvePickMode(options Options) string {
 	}
 }
 
+// ensureOpenAIChatPromptCacheKey mints or recovers a multi-turn-stable prompt_cache_key
+// for /v1/chat/completions. Order:
+//  1. body / metadata / x-prompt-cache-key header
+//  2. X-Session-Id / X-Grok-Conv-Id / thread headers
+//  3. stable seed (system + first user) via anthropic.ExtractPromptCacheKey
+//
+// The key is written into chatReq.Raw so affinity + upstream both see it.
+func ensureOpenAIChatPromptCacheKey(r *http.Request, chatReq *proxy.ChatRequest) string {
+	if chatReq == nil {
+		return ""
+	}
+	if chatReq.Raw == nil {
+		chatReq.Raw = map[string]any{}
+	}
+	pck := strings.TrimSpace(stringValue(chatReq.Raw["prompt_cache_key"]))
+	if pck == "" {
+		if meta, _ := chatReq.Raw["metadata"].(map[string]any); meta != nil {
+			pck = strings.TrimSpace(stringValue(meta["prompt_cache_key"]))
+			if pck == "" {
+				pck = strings.TrimSpace(stringValue(meta["session_id"]))
+			}
+			if pck == "" {
+				if sid := anthropic.ExtractClaudeCodeSessionID(stringValue(meta["user_id"])); sid != "" {
+					pck = sid
+				}
+			}
+		}
+	}
+	if pck == "" && r != nil {
+		for _, name := range []string{"X-Prompt-Cache-Key", "x-prompt-cache-key", "X-Session-Id", "x-session-id", "X-Grok-Conv-Id", "x-grok-conv-id", "X-Thread-Id", "x-thread-id"} {
+			if v := strings.TrimSpace(r.Header.Get(name)); v != "" {
+				switch strings.ToLower(name) {
+				case "x-session-id":
+					pck = "session:" + v
+				case "x-grok-conv-id":
+					pck = "conv:" + v
+				case "x-thread-id":
+					pck = "thread:" + v
+				default:
+					pck = v
+				}
+				break
+			}
+		}
+	}
+	if pck == "" {
+		// Seed from first user + system (stable across growing history).
+		if seed := strings.TrimSpace(anthropic.ExtractPromptCacheKey(chatReq.Raw)); seed != "" {
+			pck = seed
+		}
+	}
+	if pck != "" {
+		chatReq.Raw["prompt_cache_key"] = pck
+	}
+	return pck
+}
+
 func listCandidatesForRequest(ctx context.Context, options Options, chatReq proxy.ChatRequest, headers http.Header) ([]pool.Candidate, error) {
 	candidates, err := listCandidates(ctx, options)
 	if err != nil {
@@ -6480,13 +7207,20 @@ func serveExportAccountsSSO(w http.ResponseWriter, r *http.Request, options Opti
 		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"detail": "store unavailable"})
 		return
 	}
+	// Before full SSO download: backfill any registration-session SSO that has not
+	// yet landed as top-level sso on the durable account row (new registers).
+	reconciled := reconcileRegistrationSSOIntoStore(r.Context(), options)
 	authMap, err := options.Store.ExportAuthMap(r.Context(), nil, true)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"detail": err.Error()})
 		return
 	}
 	includePassword := truthy(r.URL.Query().Get("include_password"))
-	writeJSON(w, http.StatusOK, buildSSOExport(authMap, includePassword))
+	out := buildSSOExport(authMap, includePassword)
+	if reconciled > 0 {
+		out["reconciled"] = reconciled
+	}
+	writeJSON(w, http.StatusOK, out)
 }
 
 func serveExportAccountsSSOSelected(w http.ResponseWriter, r *http.Request, options Options) {
@@ -6501,6 +7235,8 @@ func serveExportAccountsSSOSelected(w http.ResponseWriter, r *http.Request, opti
 	_ = json.NewDecoder(r.Body).Decode(&body)
 	ids := stringSlice(body["ids"])
 	includePassword := truthyAny(body["include_password"])
+	// Same reconcile as export-all so newly registered SSO is durable before filter.
+	_ = reconcileRegistrationSSOIntoStore(r.Context(), options)
 	authMap, err := options.Store.ExportAuthMap(r.Context(), ids, true)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"detail": err.Error()})
@@ -8068,6 +8804,145 @@ func serveSub2APIGroupsCreate(w http.ResponseWriter, r *http.Request, options Op
 	writeJSON(w, http.StatusOK, out)
 }
 
+// reconcileRegistrationSSOIntoStore copies SSO cookies from live registration
+// sessions into durable account payloads when the account row is missing top-level
+// sso. Ensures "导出全部 SSO" includes newly registered accounts that already
+// imported tokens but dropped nested-only cookie shapes.
+func reconcileRegistrationSSOIntoStore(ctx context.Context, options Options) int {
+	if options.Store == nil {
+		return 0
+	}
+	client := registrationClient(options)
+	if client == nil {
+		return 0
+	}
+	payload, err := client.Sessions(ctx)
+	if err != nil || payload == nil {
+		return 0
+	}
+	var sessions []any
+	switch v := payload["sessions"].(type) {
+	case []any:
+		sessions = v
+	case []map[string]any:
+		sessions = make([]any, len(v))
+		for i, m := range v {
+			sessions[i] = m
+		}
+	default:
+		return 0
+	}
+	fixed := 0
+	for _, raw := range sessions {
+		sess, _ := raw.(map[string]any)
+		if sess == nil {
+			continue
+		}
+		sso := strings.TrimSpace(stringValue(sess["sso"]))
+		if sso == "" {
+			if cookies, ok := sess["session_cookies"].(map[string]any); ok {
+				sso = strings.TrimSpace(firstNonEmpty(stringValue(cookies["sso"]), stringValue(cookies["sso-rw"])))
+			}
+		}
+		if sso == "" {
+			sso = accounts.GetSSOValue(sess)
+		}
+		if sso == "" {
+			continue
+		}
+		aids := []string{}
+		for _, x := range stringSlice(sess["imported_account_ids"]) {
+			if strings.TrimSpace(x) != "" {
+				aids = append(aids, strings.TrimSpace(x))
+			}
+		}
+		if rows, ok := sess["imported_accounts"].([]any); ok {
+			for _, r := range rows {
+				m, _ := r.(map[string]any)
+				if m == nil {
+					continue
+				}
+				if id := strings.TrimSpace(stringValue(m["id"])); id != "" {
+					aids = append(aids, id)
+				}
+			}
+		}
+		// Also match by registration_session_id / email if no imported ids yet.
+		email := strings.TrimSpace(stringValue(sess["email"]))
+		sid := strings.TrimSpace(stringValue(sess["id"]))
+		if len(aids) == 0 && (email != "" || sid != "") {
+			if authMap, err := options.Store.ExportAuthMap(ctx, nil, true); err == nil {
+				if auth, _ := authMap["auth"].(map[string]any); auth != nil {
+					for aid, rawE := range auth {
+						e, _ := rawE.(map[string]any)
+						if e == nil {
+							continue
+						}
+						if sid != "" && strings.TrimSpace(stringValue(e["registration_session_id"])) == sid {
+							aids = append(aids, aid)
+							continue
+						}
+						if email != "" && strings.EqualFold(strings.TrimSpace(stringValue(e["email"])), email) {
+							aids = append(aids, aid)
+						}
+					}
+				}
+			}
+		}
+		seen := map[string]struct{}{}
+		for _, aid := range aids {
+			aid = strings.TrimSpace(aid)
+			if aid == "" {
+				continue
+			}
+			if _, ok := seen[aid]; ok {
+				continue
+			}
+			seen[aid] = struct{}{}
+			// Load current payload; skip if already has canonical SSO.
+			authMap, err := options.Store.ExportAuthMap(ctx, []string{aid}, true)
+			if err != nil {
+				continue
+			}
+			auth, _ := authMap["auth"].(map[string]any)
+			cur, _ := auth[aid].(map[string]any)
+			if cur == nil {
+				cur = map[string]any{}
+			}
+			if strings.TrimSpace(stringValue(cur["sso"])) != "" || accounts.GetSSOValue(cur) != "" {
+				// Still force top-level if only nested.
+				if strings.TrimSpace(stringValue(cur["sso"])) != "" {
+					continue
+				}
+			}
+			fix := map[string]any{}
+			for k, v := range cur {
+				fix[k] = v
+			}
+			fix["sso"] = sso
+			fix["sso_cookie"] = sso
+			fix["sso_token"] = sso
+			sc, _ := fix["session_cookies"].(map[string]any)
+			if sc == nil {
+				sc = map[string]any{}
+			}
+			sc["sso"] = sso
+			sc["sso-rw"] = sso
+			fix["session_cookies"] = sc
+			if email != "" && strings.TrimSpace(stringValue(fix["email"])) == "" {
+				fix["email"] = email
+			}
+			if sid != "" && strings.TrimSpace(stringValue(fix["registration_session_id"])) == "" {
+				fix["registration_session_id"] = sid
+			}
+			if err := options.Store.UpsertAccount(ctx, aid, fix); err == nil {
+				fixed++
+			}
+		}
+	}
+	return fixed
+}
+
 func buildSSOExport(authMap map[string]any, includePassword bool) map[string]any {
 	auth, _ := authMap["auth"].(map[string]any)
 	lines := []string{}
@@ -8626,6 +9501,10 @@ func serveAdminCreateKey(w http.ResponseWriter, r *http.Request, options Options
 		writeJSON(w, http.StatusUnauthorized, map[string]any{"detail": "Admin authentication required"})
 		return
 	}
+	if options.Store == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"detail": "PostgreSQL store unavailable"})
+		return
+	}
 	var body map[string]any
 	_ = json.NewDecoder(r.Body).Decode(&body)
 	name := stringValue(body["name"])
@@ -8635,9 +9514,13 @@ func serveAdminCreateKey(w http.ResponseWriter, r *http.Request, options Options
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"detail": err.Error()})
 		return
 	}
+	// Flat record for existing UI + nested aliases for clients that expect {key, secret}.
 	payload := result.Record.PublicMap()
 	payload["secret"] = result.Secret
 	payload["key"] = result.Secret
+	payload["api_key"] = result.Secret
+	payload["record"] = result.Record.PublicMap()
+	payload["ok"] = true
 	writeJSON(w, http.StatusOK, payload)
 }
 

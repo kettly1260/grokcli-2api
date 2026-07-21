@@ -2,14 +2,14 @@
 
 把 **Grok OIDC 登录态** 转成 **OpenAI / Anthropic 兼容 API**，并附带 Web 管理台：多 API Key、多账号轮询、设备码 / SSO / JSON 导入导出、协议注册。
 
-**当前版本：v2.0.3** · TempMail.lol · 注册日志低延迟 · empty-output 换号/模型封禁 · 邮件槽位隔离 · Go 主进程
+**当前版本：v2.0.4** · 容器内热更新 · API Key 列表修复 · 注册资源/日志优化 · empty-output 治理 · Go 主进程
 
 [![GHCR](https://img.shields.io/badge/ghcr.io-hm2899%2Fgrokcli--2api-blue)](https://github.com/users/HM2899/packages/container/package/grokcli-2api)
 [![Release](https://img.shields.io/github/v/release/HM2899/grokcli-2api?display_name=tag)](https://github.com/HM2899/grokcli-2api/releases)
 
 | 镜像（全小写） | 说明 |
 |----------------|------|
-| `ghcr.io/hm2899/grokcli-2api:2.0.3` | 当前版本 |
+| `ghcr.io/hm2899/grokcli-2api:2.0.4` | 当前版本 |
 | `ghcr.io/hm2899/grokcli-2api:latest` | 最近 `v*` tag |
 | `ghcr.io/hm2899/grokcli-2api:edge` | `main` 最新 |
 
@@ -55,7 +55,7 @@
 | Anthropic 兼容 | `/v1/messages` · tools / tool_use · `count_tokens` |
 | Claude Code 工具 | Grok `Update`/`StrReplace` → 客户端 `Edit`；**后到完整参数覆盖错误路径（含 both-complete）**；`target_file` 等别名归一；残缺编辑不下发 |
 | 注册机 | 批次自愈 + 孤儿回收；全局 inflight；Device Flow 重试；**SSO 入库 + 文件备份**；导出可走账号库；进度卡防连环 toast |
-| 管理台 | 账号、Key、协议注册、测活、续期、任务日志、用量、**系统设置（维护/压缩/探测/sub2api · CLIProxyAPI）** |
+| 管理台 | 账号、Key、协议注册、测活、续期、任务日志、用量、**系统设置（维护/压缩/探测/sub2api · CLIProxyAPI · 版本与热更新）** |
 | 多账号轮询 | `round_robin` / `least_used` / `random`；**pick-time inflight 分散**；可选**出站代理池** |
 | 会话粘性 | `prompt_cache_key` / `previous_response_id` 粘同一账号；**TTL 可热改** |
 | 冷却状态 | **没额度立即冷却踢出**（任意轮询策略）；live 硬排除；仅测活成功 / 手动解除才回池 |
@@ -72,18 +72,19 @@
 
 ---
 
-## 本版本重点（v2.0.3）
+## 本版本重点（v2.0.4）
 
 | 能力 | 行为 |
 |------|------|
-| **TempMail.lol 邮箱** | 协议注册完整接入；**API Key / 自定义域名默认留空**（免费层）；独立字段 `tempmail_api_key` / `tempmail_domain`，与 MoeMail/YYDS/GPTMail/CF 互不覆盖；删除后保存不恢复旧值 |
-| **注册日志低延迟** | 管理台进度轮询约 **180ms**；优先单次 batch（含 `log_lines`）；深拉 session ≤1；Go→sidecar 超时 **900ms** |
-| **空模型输出治理** | `empty model output` 开流探测最长 **15s**，空流优先换号 failover；账号+模型写入 **模型封禁**（默认 10 分钟，可 `GROK2API_EMPTY_OUTPUT_BLOCK_SEC`） |
-| **注册邮件 Key 防污染** | 切换邮箱服务时不再把 YYDS `AC-*` 写进 MoeMail `mk_*` 槽；启动/保存均 sanitize |
-| **冷却 UI** | 去掉「叠加×N」展示；用量页移除「按上游账号」表 |
-| **继承 v2.0.2** | 额度落库 · 测活回池 · 多模态 · Hermes/Codex shell · 号池稳定排序 |
+| **容器内版本 / 热更新** | 管理台「系统设置 → 版本与热更新」：对照 GitHub Release；**在容器内** `docker pull` + `compose force-recreate`；**无需宿主机 watcher**（可选兼容 `request_file`） |
+| **API Key 列表可见** | 新建 Key 后列表立即可见：最新在前；创建乐观插入；stats 失败不拖垮列表；NULL note 安全扫描 |
+| **注册占用下降** | 默认并发更保守（`MAX_CONCURRENCY=3` / local captcha=1 / global inflight=2）；Redis 镜像节流；log 环形缓冲更短；终态 TTL 更快回收 |
+| **注册日志更低延迟** | 健康路径约 **140ms** 轮询；Go 共享 HTTP 客户端 **750ms**；稳态只打 batch GET，避免全量 `/sessions` 扫描 |
+| **注册资源释放** | stop 时立即 close receiver/client；worker finally 强制释放 + force 镜像 Redis |
+| **空模型输出治理** | 继承 v2.0.3：空流换号 / 模型封禁（`GROK2API_EMPTY_OUTPUT_BLOCK_SEC`） |
+| **TempMail.lol / 邮件槽位** | 继承 v2.0.3：独立 Key 槽位、防交叉污染 |
 
-继承 v2.0.0 / v1.9.92：CPA 风格 prompt cache · 同会话粘号 · 流式 tool 可靠性 · 用量明细补齐。
+继承 v2.0.x：CPA prompt cache · 同会话粘号 · 流式 tool 可靠性 · 用量 TTFT / 思考强度。
 
 ---
 
@@ -167,7 +168,7 @@ ghcr.io/hm2899/grokcli-2api
 **正确示例：**
 
 ```bash
-docker pull ghcr.io/hm2899/grokcli-2api:2.0.3
+docker pull ghcr.io/hm2899/grokcli-2api:2.0.4
 # 或
 docker pull ghcr.io/hm2899/grokcli-2api:latest
 ```
@@ -206,7 +207,7 @@ services:
       retries: 10
 
   grokcli-2api:
-    image: ghcr.io/hm2899/grokcli-2api:2.0.3
+    image: ghcr.io/hm2899/grokcli-2api:2.0.4
     ports:
       # 只映射应用；不要给 postgres/redis 加 ports
       - "3000:3000"
@@ -278,7 +279,7 @@ echo "$GITHUB_TOKEN" | docker login ghcr.io -u YOUR_GITHUB_USERNAME --password-s
 | Claude Code `metadata.user_id` 内嵌 `session_<uuid>` | 提取为 conversation id（CPA 同款） |
 | Responses `previous_response_id` | 用上轮发出的 `response_id` 找回账号（不再误当 conversation_id） |
 | 显式 `conversation_id` / `x-session-id` / `Session_id` / `x-amp-thread-id` / `x-client-request-id` | 最高优先 |
-| 无任何 session 标识 | messages 内容 hash 兜底（首轮 short / 多轮 full） |
+| 无任何 session 标识 | **首条 user + system 前缀 seed** 兜底（多轮稳定，不再用 full messages hash） |
 
 成功响应可观察：
 
@@ -328,11 +329,11 @@ go build -o bin/grok2api ./cmd/grok2api && ./bin/grok2api
 
 ---
 
-## 从 1.x / 旧版升级到 2.0.3
+## 从 1.x / 旧版升级到 2.0.4
 
 完整步骤见 **[docs/UPGRADE.md](./docs/UPGRADE.md)**（含 file→hybrid、1.x→2.x、空库恢复）。
 
-### 速览：1.x（Python / hybrid）→ 2.0.3（Go 主进程）
+### 速览：1.x（Python / hybrid）→ 2.0.4（Go 主进程）
 
 ```bash
 # 1) 备份
@@ -341,8 +342,8 @@ docker exec grokcli-2api-postgres pg_dump -U grok2api -d grok2api \
 cp -a ./data ./data.backup-$(date +%Y%m%d)   # 若仍有 data/*.json
 
 # 2) 拉新镜像（镜像名必须全小写）
-docker pull ghcr.io/hm2899/grokcli-2api:2.0.3
-# compose 里把 image 改成 :2.0.3 或 :latest 后：
+docker pull ghcr.io/hm2899/grokcli-2api:2.0.4
+# compose 里把 image 改成 :2.0.4 或 :latest 后：
 docker compose up -d
 
 # 3) 入口会自动 grok2api-migrate up（可用 GROK2API_AUTO_MIGRATE=0 关闭）
@@ -357,7 +358,7 @@ curl -fsS http://127.0.0.1:3000/health || curl -fsS http://127.0.0.1:40081/healt
 | 已迁移的 `last_quota` 真用量 | 历史 error 壳额度快照会被忽略（显示「未查询」可重查） |
 | 管理台密码哈希 | 浏览器需硬刷新（Ctrl+F5）加载新 `core.*.js` |
 
-### 仅文件后端（`data/auth.json`）→ 2.0.3
+### 仅文件后端（`data/auth.json`）→ 2.0.4
 
 ```bash
 # 备份 data/ 后
@@ -511,17 +512,16 @@ docker exec grokcli-2api sh -c 'echo TZ=$TZ; date'
 ```bash
 # 1) grok2api/app.py 的 APP_VERSION 与 internal/buildinfo.Version 必须与 git tag 一致（镜像路径全小写）
 # 2) 推 main → edge + 版本号；推 v* tag → 额外 latest + GitHub Release
-git add -A && git commit -m "release: v2.0.3"
+git add -A && git commit -m "release: v2.0.4"
 git push origin main
-git tag -a v2.0.3 -m "v2.0.3"
-git push origin v2.0.3
-gh release create v2.0.3 --title "v2.0.3 TempMail.lol · reg log latency · empty-output failover" --notes-file - <<'EOF'
+git tag -a v2.0.4 -m "v2.0.4"
+git push origin v2.0.4
+gh release create v2.0.4 --title "v2.0.4 in-container hot update · API keys · reg resource/latency" --notes-file - <<'EOF'
 ## Highlights
-- TempMail.lol 协议注册：免费无 Key/域名；独立槽位；删除不恢复
-- 注册进度日志低延迟（~180ms 轮询，batch 内嵌 log）
-- empty model output：开流 15s 空流探测 + 换号；模型封禁
-- 多邮箱 Key 槽位防交叉污染；冷却叠加 UI 移除
-- 从 1.x 迁移教程见 README / docs/UPGRADE.md
+- 容器内版本检查与热更新（docker.sock + compose force-recreate，无需宿主机 watcher）
+- API Key 新建后列表立即可见（乐观插入 + 最新在前）
+- 注册占用/日志延迟/资源释放优化（共享 Go HTTP 客户端、batch-only 轮询、stop 即释放）
+- 继承 v2.0.3：TempMail.lol、empty-output 模型封禁、邮件槽位防污染
 EOF
 # 监视构建
 gh run list --workflow=docker-publish.yml --limit 3
@@ -530,7 +530,7 @@ gh run list --workflow=docker-publish.yml --limit 3
 成功后拉取（**必须小写**）：
 
 ```bash
-docker pull ghcr.io/hm2899/grokcli-2api:2.0.3
+docker pull ghcr.io/hm2899/grokcli-2api:2.0.4
 docker pull ghcr.io/hm2899/grokcli-2api:latest
 ```
 
@@ -586,10 +586,14 @@ docker-compose.yml                       # redis + postgres（内网）+ app
 
 ## 版本
 
-- **v2.0.3**（当前）
+- **v2.0.4**（当前）
+  - 容器内热更新（默认 docker 模式）；版本 UI 作用域修复
+  - API Key 创建可见性 / 列表排序 / stats 降级
+  - 注册：更低默认并发、Redis 镜像节流、stop 释放句柄、前端 ~140ms 轮询
+- **v2.0.3**
   - **TempMail.lol**：协议注册完整接入；Key/域名默认可空；独立 DB 槽；删除不恢复旧值
   - **注册日志低延迟**：~180ms 轮询；batch 内嵌 log；Go→sidecar 900ms 超时
-  - **empty model output**：开流最长 15s 空流探测 + 账号链 failover；模型级 soft-block（模型封禁）
+  - **empty model output**：开流最长 ~12s 空流探测 + 账号链/多 Open failover；模型级 soft-block 默认 4m（模型封禁）
   - **邮件 Key 防污染**：多 provider 槽位 sanitize；切换服务不交叉覆盖
   - **管理台**：冷却「叠加」展示移除；用量页去掉「按上游账号」
 - **v2.0.2**
@@ -782,9 +786,48 @@ docker-compose.yml                       # redis + postgres（内网）+ app
 - **v1.9.45–1.9.38**：YYDS 域名、任务日志、JSON/SSO 进度、内联 hybrid 等
 - 更早变更见 [GitHub Releases](https://github.com/HM2899/grokcli-2api/releases)
 
-> 镜像 tag 与 `grok2api/app.py` 的 `APP_VERSION` / `internal/buildinfo.Version` 一致（当前 **2.0.3**）。
+> 镜像 tag 与 `grok2api/app.py` 的 `APP_VERSION` / `internal/buildinfo.Version` 一致（当前 **2.0.4**）。
 > 拉取路径固定 **`ghcr.io/hm2899/grokcli-2api`**（全小写）。
 
 ## License
 
 见 [LICENSE](./LICENSE)。
+
+
+## 版本提示与热更新
+
+管理台 **系统设置 → 版本与热更新**：
+
+1. 自动对照 GitHub Release 最新版（侧栏版本号 + 顶部横幅）
+2. 点击「热更新」在**容器内**执行：
+   - `docker pull ghcr.io/hm2899/grokcli-2api:<tag>`
+   - 写入 compose override 并 `docker compose up -d --force-recreate`
+3. **无需宿主机 watcher**（`g2a-update-watcher` 仅为兼容旧部署可选）
+
+### 容器内热更新要求（compose 已默认配好）
+
+```yaml
+volumes:
+  - /var/run/docker.sock:/var/run/docker.sock
+  - ./:/compose          # 项目目录，用于 compose force-recreate
+environment:
+  GROK2API_HOT_UPDATE_MODE: docker          # 默认；缺 sock 时自动 disabled
+  GROK2API_COMPOSE_DIR: /compose
+  GROK2API_DOCKER_SERVICE: grokcli-2api
+  GROK2API_GHCR_IMAGE: ghcr.io/hm2899/grokcli-2api
+```
+
+镜像内置静态 `docker` 客户端 + `/app/scripts/g2a-hot-update-incontainer.sh`。
+
+可选环境变量：
+
+| 变量 | 说明 |
+|------|------|
+| `GROK2API_HOT_UPDATE_MODE` | `docker`（默认）/ `cmd` / `request_file` / `disabled` |
+| `GROK2API_HOT_UPDATE_CMD` | 自定义 shell（占位 `{{TAG}}` `{{IMAGE}}`），MODE=cmd 或未设 MODE 时优先 |
+| `GROK2API_HOT_UPDATE_SCRIPT` | 覆盖内置更新脚本路径 |
+| `GROK2API_HOT_UPDATE_ALLOW_REQUEST_FILE=1` | 允许回退到写 `data/update.request`（旧 watcher） |
+| `GROK2API_GITHUB_TOKEN` | 提高 GitHub Release 检查限流额度 |
+
+兼容：若仍要宿主机 watcher，设置 `GROK2API_HOT_UPDATE_MODE=request_file` 并运行 `scripts/g2a-update-watcher.sh`。
+

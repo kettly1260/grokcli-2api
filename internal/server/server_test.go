@@ -16,6 +16,7 @@ import (
 	"github.com/hm2899/grokcli-2api/internal/auth"
 	"github.com/hm2899/grokcli-2api/internal/config"
 	"github.com/hm2899/grokcli-2api/internal/protocol/anthropic"
+	"github.com/hm2899/grokcli-2api/internal/proxy"
 	"github.com/hm2899/grokcli-2api/internal/store/postgres"
 )
 
@@ -1021,9 +1022,10 @@ func TestStreamChatCompletionsHollowSSENotSoftSuccess(t *testing.T) {
 	if err == nil {
 		t.Fatalf("expected error after hollow-only stream, got nil body=%q", recorder.Body.String())
 	}
-	out := recorder.Body.String()
-	if !strings.Contains(out, `"type":"server_error"`) && !strings.Contains(out, `"type": "server_error"`) && !strings.Contains(out, "error") {
-		t.Fatalf("expected error JSON after hollow mid-drop:\n%s", out)
+	// Headers stay uncommitted on pure hollow so serveChatCompletions multi-open can
+	// rotate accounts. Error text must still classify as empty model output.
+	if !strings.Contains(err.Error(), "empty model output") && !strings.Contains(err.Error(), "no content/tool_calls") {
+		t.Fatalf("expected empty model output error, got %v body=%q", err, recorder.Body.String())
 	}
 	if stats.FirstTokenMS > 0 {
 		t.Fatalf("hollow SSE must not set TTFT, got %d", stats.FirstTokenMS)
@@ -1395,8 +1397,19 @@ func TestClaudeCodeLongThinkingMultiToolEventTrace(t *testing.T) {
 	t.Logf("event tail: %v", types[max(0, len(types)-8):])
 
 	// Early envelope
-	if len(types) == 0 || types[0] != "message_start" {
-		t.Fatalf("expected early message_start, got head=%v", types[:min(5, len(types))])
+	if len(types) == 0 {
+		t.Fatalf("expected stream events, got none")
+	}
+	// message_start may be deferred until first model payload (empty-stream fix).
+	hasStart := false
+	for _, ty := range types {
+		if ty == "message_start" {
+			hasStart = true
+			break
+		}
+	}
+	if !hasStart {
+		t.Fatalf("expected message_start somewhere, got head=%v", types[:min(8, len(types))])
 	}
 	// Live thinking
 	if thinkingN < 10 {
@@ -1867,5 +1880,42 @@ func TestStreamOpenAIResponsesTextSoftShortWriteNotTruncated(t *testing.T) {
 	}
 	if !strings.Contains(out, "response.completed") {
 		t.Fatal("missing response.completed")
+	}
+}
+
+
+func TestEnsureOpenAIChatPromptCacheKeyStable(t *testing.T) {
+	// Turn 1: no explicit pck → mint from first user seed.
+	req1 := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	chat1 := proxy.ChatRequest{Model: "grok", Raw: map[string]any{
+		"messages": []any{map[string]any{"role": "user", "content": "plan a trip to tokyo"}},
+	}}
+	pck1 := ensureOpenAIChatPromptCacheKey(req1, &chat1)
+	if pck1 == "" {
+		t.Fatal("expected minted pck")
+	}
+	if chat1.Raw["prompt_cache_key"] != pck1 {
+		t.Fatalf("raw not updated: %#v", chat1.Raw["prompt_cache_key"])
+	}
+	// Turn 2: growing history, same seed → same pck.
+	chat2 := proxy.ChatRequest{Model: "grok", Raw: map[string]any{
+		"messages": []any{
+			map[string]any{"role": "user", "content": "plan a trip to tokyo"},
+			map[string]any{"role": "assistant", "content": "ok"},
+			map[string]any{"role": "user", "content": "add food"},
+		},
+	}}
+	pck2 := ensureOpenAIChatPromptCacheKey(req1, &chat2)
+	if pck1 != pck2 {
+		t.Fatalf("pck changed across turns: %q vs %q", pck1, pck2)
+	}
+	// Explicit header wins.
+	req3 := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	req3.Header.Set("X-Prompt-Cache-Key", "client-stable-key")
+	chat3 := proxy.ChatRequest{Model: "grok", Raw: map[string]any{
+		"messages": []any{map[string]any{"role": "user", "content": "x"}},
+	}}
+	if got := ensureOpenAIChatPromptCacheKey(req3, &chat3); got != "client-stable-key" {
+		t.Fatalf("header pck=%q", got)
 	}
 }

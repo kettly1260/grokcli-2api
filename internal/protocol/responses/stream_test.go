@@ -856,3 +856,27 @@ func TestMaxToolsCapDoesNotLoopCompleted(t *testing.T) {
 		t.Fatalf("must not re-emit completed after cap: %s", again)
 	}
 }
+
+func TestEstimateOutputTokensUsesDeliveredRunes(t *testing.T) {
+	s := NewLiveStreamer("resp_t", "grok-4.5", nil)
+	// Simulate long text that was written.
+	_ = s.Text("abcdefghijklmnopqrstuvwxyz0123456789ABCDEF") // 40 chars -> 10 tokens
+	s.AckContentDelivered()
+	tok := s.EstimateOutputTokens()
+	if tok < 10 {
+		t.Fatalf("estimate=%d want >=10 chars=%d", tok, s.OutputChars())
+	}
+}
+
+func TestEstimateOutputTokensNoFloorOnOpenOnly(t *testing.T) {
+	s := NewLiveStreamer("resp_t2", "grok-4.5", nil)
+	// Force open flags without real text (should not floor to 1).
+	s.reasoningOpen = true
+	if s.EstimateOutputTokens() != 0 {
+		t.Fatalf("open-only must estimate 0, got %d", s.EstimateOutputTokens())
+	}
+	if s.HasClientPayload() {
+		// HasClientPayload true due to reasoningOpen — that is OK for keepalive.
+		// Estimate must still be 0 until real chars or PayloadDelivered.
+	}
+}

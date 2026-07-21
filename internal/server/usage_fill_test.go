@@ -124,3 +124,51 @@ func TestMergeUsageMapsPrefersLarger(t *testing.T) {
 		t.Fatalf("total=%v", m["total_tokens"])
 	}
 }
+
+func TestFillMissingUsagePromptOnlyWithCompletionHint(t *testing.T) {
+	// Classic go_chat hollow usage: prompt estimated, completion=0, total=prompt.
+	// Streamer saw real tokens → hint > 0 must fill completion.
+	partial := map[string]any{"prompt_tokens": int64(54000), "completion_tokens": int64(0), "total_tokens": int64(54000)}
+	body := map[string]any{
+		"messages": []any{map[string]any{"role": "user", "content": "hi"}},
+	}
+	filled, flags := fillMissingUsage(partial, body, 120)
+	if !flags.EstimatedCompletion {
+		t.Fatalf("expected completion estimate, flags=%+v filled=%v", flags, filled)
+	}
+	c, _ := filled["completion_tokens"].(int64)
+	if c != 120 {
+		t.Fatalf("completion=%v want 120", c)
+	}
+	p, _ := filled["prompt_tokens"].(int64)
+	if p != 54000 {
+		t.Fatalf("prompt=%v", p)
+	}
+	tot, _ := filled["total_tokens"].(int64)
+	if tot != p+c {
+		t.Fatalf("total=%v want %v", tot, p+c)
+	}
+}
+
+func TestFillMissingUsageLiftsTinyFloor(t *testing.T) {
+	// Streamer saw ~400 tokens of output but usage only has floor completion=1.
+	partial := map[string]any{
+		"prompt_tokens":     int64(3735),
+		"completion_tokens": int64(1),
+		"total_tokens":      int64(3736),
+	}
+	filled, flags := fillMissingUsage(partial, map[string]any{
+		"messages": []any{map[string]any{"role": "user", "content": "hi"}},
+	}, 400)
+	if !flags.EstimatedCompletion {
+		t.Fatalf("expected lift, flags=%+v filled=%v", flags, filled)
+	}
+	c, _ := filled["completion_tokens"].(int64)
+	if c != 400 {
+		t.Fatalf("completion=%v want 400", c)
+	}
+	tot, _ := filled["total_tokens"].(int64)
+	if tot != 3735+400 {
+		t.Fatalf("total=%v", tot)
+	}
+}

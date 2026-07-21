@@ -310,13 +310,10 @@ func (s *StreamAssembler) PayloadDelivered() bool {
 	if s == nil {
 		return false
 	}
+	// Only content that survived Write+Flush (or Ack'd tools). Open block indices
+	// alone must NOT count — that set admin ttft_ms=1 on the first thinking frame
+	// even when the real model payload came seconds later (or never).
 	if s.contentDelivered {
-		return true
-	}
-	// Open text/thinking blocks only after emitFrames LastOK path advanced them
-	// (assembler state is not rolled back on soft text fail; contentDelivered is
-	// the precise signal — keep open-block as secondary for older call sites).
-	if s.textBlock >= 0 || s.thinkingBlock >= 0 {
 		return true
 	}
 	for _, state := range s.tools {

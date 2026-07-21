@@ -63,6 +63,10 @@ type LiveStreamer struct {
 	// Distinct from text/reasoning non-empty (produced) — soft-fail before Ack
 	// must not count as client-visible for TTFT / soft-close decisions.
 	contentDelivered bool
+	// deliveredRunes: client-visible output runes successfully written (text,
+	// reasoning, tool name/args). Used for usage estimation when upstream omits
+	// the final usage frame — more accurate than open-block flags alone.
+	deliveredRunes int
 }
 
 func NewLiveStreamer(responseID, model string, allowed []string) *LiveStreamer {
@@ -597,13 +601,51 @@ func (s *LiveStreamer) PayloadDelivered() bool {
 
 // AckContentDelivered marks text/reasoning frames as successfully written.
 // Call after a Write+Flush of non-tool payload (output_text / reasoning deltas).
+// Only counts when real text/reasoning characters exist — open-only envelopes
+// must not inflate TTFT/usage (that produced completion_tokens=1 floors).
 func (s *LiveStreamer) AckContentDelivered() {
 	if s == nil {
 		return
 	}
-	if s.text != "" || s.reasoning != "" || s.textOpen || s.reasoningOpen {
+	if s.text != "" || s.reasoning != "" {
 		s.contentDelivered = true
+		s.SyncDeliveredFromBuffers()
 	}
+}
+
+// SyncDeliveredFromBuffers sets deliveredRunes to the high-water mark of
+// buffered text/reasoning/emitted tools. Call after successful client writes.
+func (s *LiveStreamer) SyncDeliveredFromBuffers() {
+	if s == nil {
+		return
+	}
+	n := s.bufferOutputChars()
+	if n > s.deliveredRunes {
+		s.deliveredRunes = n
+	}
+}
+
+// bufferOutputChars counts buffered content without deliveredRunes (no recursion).
+func (s *LiveStreamer) bufferOutputChars() int {
+	if s == nil {
+		return 0
+	}
+	n := len([]rune(s.text)) + len([]rune(s.reasoning))
+	for _, state := range s.tools {
+		if state == nil || !(state.emitted || state.clientAcked) {
+			continue
+		}
+		n += len([]rune(state.name)) + len([]rune(state.arguments))
+	}
+	return n
+}
+
+// NoteToolDelivered recounts buffers after a successful function_call write.
+func (s *LiveStreamer) NoteToolDelivered() {
+	if s == nil {
+		return
+	}
+	s.SyncDeliveredFromBuffers()
 }
 
 // HalfOpenTools is true when any tool was framed (emitted) but never client-Ack'd.
@@ -671,27 +713,27 @@ func (s *LiveStreamer) ClientDeliveryOK() bool {
 // OutputChars counts framed text/reasoning/tool-arg runes for usage fallback.
 // Used when upstream omits the usage frame (soft-close / short tool turns) so
 // admin does not record ok=true with all-zero tokens (hollow success).
+// Prefers max(buffered content, successfully delivered runes).
 func (s *LiveStreamer) OutputChars() int {
 	if s == nil {
 		return 0
 	}
-	n := len([]rune(s.text)) + len([]rune(s.reasoning))
-	for _, state := range s.tools {
-		if state == nil || !(state.emitted || state.clientAcked) {
-			continue
-		}
-		n += len([]rune(state.name)) + len([]rune(state.arguments))
+	n := s.bufferOutputChars()
+	if s.deliveredRunes > n {
+		n = s.deliveredRunes
 	}
 	return n
 }
 
 // EstimateOutputTokens approximates completion tokens (~4 runes/token).
-// Returns at least 1 when ClientDeliveryOK-style payload exists but chars==0
-// (rare name-only tool edge); 0 when there is no client payload at all.
+// Returns at least 1 only when real client-visible characters or Ack'd payload
+// exist — never floors solely on open block flags (that caused completion=1
+// for hollow short streams).
 func (s *LiveStreamer) EstimateOutputTokens() int {
 	if s == nil {
 		return 0
 	}
+	s.SyncDeliveredFromBuffers()
 	chars := s.OutputChars()
 	if chars > 0 {
 		tok := (chars + 3) / 4
@@ -700,7 +742,8 @@ func (s *LiveStreamer) EstimateOutputTokens() int {
 		}
 		return tok
 	}
-	if s.HasClientPayload() {
+	// PayloadDelivered implies text/tools actually written; still floor at 1.
+	if s.PayloadDelivered() {
 		return 1
 	}
 	return 0

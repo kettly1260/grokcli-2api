@@ -188,6 +188,7 @@ func runOpenAIResponsesStream(w http.ResponseWriter, r *http.Request, body io.Re
 					joined := strings.Join(g, "")
 					if strings.Contains(joined, "function_call") {
 						streamer.AckToolsInPayload(joined)
+						streamer.NoteToolDelivered()
 						if isToolGroup {
 							toolsEmitted++
 						}
@@ -198,6 +199,7 @@ func runOpenAIResponsesStream(w http.ResponseWriter, r *http.Request, body io.Re
 					}
 					if strings.Contains(joined, "response.completed") || strings.Contains(joined, "[DONE]") {
 						streamer.AckTerminal()
+						streamer.SyncDeliveredFromBuffers()
 					}
 					return nil
 				}
@@ -297,6 +299,13 @@ func runOpenAIResponsesStream(w http.ResponseWriter, r *http.Request, body io.Re
 			break
 		}
 	}
+	// Coalesced first payload may only land on drain — capture TTFT then.
+	if firstTokenMS == 0 && streamer.PayloadDelivered() {
+		firstTokenMS = int(time.Since(started).Milliseconds())
+		if firstTokenMS <= 0 {
+			firstTokenMS = 1
+		}
+	}
 
 	clientGone := sw.SoftGone() || errors.Is(err, r.Context().Err()) || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || isSoftClientWriteError(err)
 	hasPayload := streamer.HasClientPayload() || streamer.HasPendingTools() || streamer.HasUnackedTools()
@@ -365,11 +374,32 @@ func runOpenAIResponsesStream(w http.ResponseWriter, r *http.Request, body io.Re
 
 // fillStreamUsage patches zero usage from LiveStreamer output when the upstream
 // omitted the final usage frame (common on soft-close / short tool turns).
+// Stamps _estimated_* markers so recordResponsesUsage can surface accurate
+// usage_estimated_fields (previously flags were dropped and completion looked "real").
 func fillStreamUsage(usage map[string]any, streamer *responses.LiveStreamer) map[string]any {
 	hint := 0
 	if streamer != nil {
 		hint = streamer.EstimateOutputTokens()
 	}
-	filled, _ := fillMissingUsage(usage, nil, hint)
+	filled, flags := fillMissingUsage(usage, nil, hint)
+	if filled == nil {
+		filled = map[string]any{}
+	}
+	if flags.EstimatedCompletion {
+		filled["_estimated_completion"] = true
+	}
+	if flags.EstimatedPrompt {
+		filled["_estimated_prompt"] = true
+	}
+	if flags.EstimatedTotal {
+		filled["_estimated_total"] = true
+	}
+	if flags.Missing {
+		filled["_usage_missing"] = true
+	}
+	if streamer != nil {
+		filled["_streamer_output_chars"] = streamer.OutputChars()
+		filled["_streamer_estimate"] = hint
+	}
 	return filled
 }

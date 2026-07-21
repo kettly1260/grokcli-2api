@@ -134,18 +134,17 @@ func (c *Client) doAbsolute(ctx context.Context, method, absPath string, body an
 	}
 	httpClient := c.HTTP
 	if httpClient == nil {
-		// Fail-fast for admin poll paths — DefaultClient has no timeout and can
-		// freeze registration log refresh for tens of seconds under load.
-		// Keep under the browser poll budget (~2s) so Go→sidecar→browser stays snappy.
+		// Fail-fast fallback only — server package injects a shared Transport.
+		// Keep under browser REG_POLL_TIMEOUT_MS (~900ms).
 		httpClient = &http.Client{
-			// Keep under browser REG_POLL_TIMEOUT_MS (1.2s) so admin log ticks stay live.
-			Timeout: 900 * time.Millisecond,
+			Timeout: 750 * time.Millisecond,
 			Transport: &http.Transport{
-				DialContext:           (&net.Dialer{Timeout: 400 * time.Millisecond}).DialContext,
-				MaxIdleConns:          64,
-				MaxIdleConnsPerHost:   32,
-				IdleConnTimeout:       30 * time.Second,
-				ResponseHeaderTimeout: 700 * time.Millisecond,
+				DialContext:           (&net.Dialer{Timeout: 250 * time.Millisecond}).DialContext,
+				MaxIdleConns:          128,
+				MaxIdleConnsPerHost:   64,
+				IdleConnTimeout:       90 * time.Second,
+				ResponseHeaderTimeout: 600 * time.Millisecond,
+				ForceAttemptHTTP2:     true,
 			},
 		}
 	}

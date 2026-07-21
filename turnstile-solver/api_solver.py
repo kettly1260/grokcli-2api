@@ -68,7 +68,7 @@ class TurnstileAPIServer:
         self.headless = headless
         # Hard cap browser pool size — Camoufox is hundreds of MB each.
         try:
-            hard_cap = int(os.getenv("TURNSTILE_THREAD_MAX", "3") or 3)
+            hard_cap = int(os.getenv("TURNSTILE_THREAD_MAX", "4") or 4)
         except (TypeError, ValueError):
             hard_cap = 3
         hard_cap = max(1, min(8, hard_cap))
@@ -993,7 +993,7 @@ class TurnstileAPIServer:
             rounds = 2
         rounds = max(1, min(4, rounds))
         try:
-            poll_attempts = int(os.getenv("TURNSTILE_POLL_ATTEMPTS", "36") or 36)
+            poll_attempts = int(os.getenv("TURNSTILE_POLL_ATTEMPTS", "40") or 40)
         except (TypeError, ValueError):
             poll_attempts = 36
         poll_attempts = max(20, min(60, poll_attempts))
@@ -1006,7 +1006,18 @@ class TurnstileAPIServer:
             try:
                 await self._ensure_pool()
                 self._last_used = time.time()
-                index, browser, browser_config = await self.browser_pool.get()
+                # Multi-thread: wait up to 90s for a free browser; re-warm if pool
+                # was reclaimed mid-wait (idle reaper race under load).
+                try:
+                    index, browser, browser_config = await asyncio.wait_for(
+                        self.browser_pool.get(), timeout=90.0
+                    )
+                except asyncio.TimeoutError:
+                    logger.warning("Browser pool get timeout (90s) — rebuilding pool")
+                    await self._ensure_pool()
+                    index, browser, browser_config = await asyncio.wait_for(
+                        self.browser_pool.get(), timeout=60.0
+                    )
                 acquired = True
                 self._last_used = time.time()
             except Exception as e:

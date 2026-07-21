@@ -38,13 +38,14 @@ window.G2A = window.G2A || {};
   let regProbedIds = new Set();
   let regProbeRunning = false;
   // Adaptive registration poll cadence + round-robin live session refresh.
-  let regPollIntervalMs = 220;
+  let regPollIntervalMs = 180;
   let regPollLiveCursor = 0;
   let regPollLastDurationMs = 0;
   // Hard abort per admin→Go request. Keep under Go→sidecar budget so ticks stay snappy.
-  const REG_POLL_TIMEOUT_MS = 1200;
+  // Shared Go client timeout is ~750ms; browser abort slightly above that.
+  const REG_POLL_TIMEOUT_MS = 900;
   // Deep session GETs are expensive; batch embed already carries log_lines.
-  // Only re-fetch 1 live session when embed has almost no timeline.
+  // Only re-fetch 1 live session when embed has no timeline yet.
   const REG_POLL_LIVE_REFRESH = 1;
   // Survive hard refresh: remember which batch/sessions the UI was tracking.
   const REG_TRACK_KEY = "g2a_reg_track_v1";
@@ -824,6 +825,7 @@ function initPageSubnav(opts) {
 function rebindPageControls() {
   try { initPageSubnav({ replace: true }); } catch (_) {}
   try { bindKeysControls(); } catch (_) {}
+  try { bindVersionSettingsUI(); } catch (_) {}
   try { bindModelsControls(); } catch (_) {}
   try { bindUpstreamMonitorControls(); } catch (_) {}
   try { bindLogsControls(); } catch (_) {}
@@ -890,6 +892,13 @@ function rebindPageControls() {
   });
   on("btn-refresh-all", "onclick", async () => {
     try {
+      const page = document.body.dataset.page || pageFromPath(location.pathname) || "";
+      // Keys page reuses #btn-refresh-all for list reload — do not replace with dashboard load.
+      if (page === "keys" && typeof renderKeys === "function") {
+        await renderKeys();
+        toast("已刷新 Key 列表");
+        return;
+      }
       _statusFetchedAt = 0;
       statusCache = null;
       await loadDashboard();
@@ -1220,7 +1229,7 @@ function rebindPageControls() {
       toast(r.message || `已启动注册 ×${startedCount}（线程 ${workers}，同时最多 ${workers} 个）`);
       // Start path auto-saves on server; refresh form from DB shortly after
       setTimeout(() => { loadRegConfig(true).catch(() => {}); }, 300);
-      startRegPolling({ immediate: true, intervalMs: 220 });
+      startRegPolling({ immediate: true, intervalMs: 180 });
     } catch (e) { toast(e.message, false); }
     finally { if ($("btn-start-reg")) $("btn-start-reg").disabled = false; }
   });
@@ -1617,7 +1626,11 @@ async function loadDashboard() {
   try {
     const st = statusCache || {};
     const ver = st.version || (dashCache && dashCache.version) || "";
-    if ($("app-version") && ver) $("app-version").textContent = "v" + ver;
+    if ($("app-version") && ver) {
+      $("app-version").textContent = "v" + ver;
+      try { window.__g2aCurrentVersion = String(ver).replace(/^v/, ""); } catch (_) {}
+    }
+    try { scheduleVersionBannerCheck(); } catch (_) {}
     const pill = $("status-pill");
     if (pill) {
       const mode = st.account_mode || (dashCache && dashCache.account_mode) || "";
@@ -1771,16 +1784,29 @@ function extractKeySecret(payload) {
 
 function extractKeyRecord(payload) {
   if (!payload || typeof payload !== "object") return {};
-  // Prefer nested record if present and is an object.
+  // Prefer nested record object when present (avoid treating plaintext key string as record).
+  if (payload.record && typeof payload.record === "object" && !Array.isArray(payload.record)) {
+    return { ...payload.record };
+  }
   if (payload.key && typeof payload.key === "object" && !Array.isArray(payload.key)) {
     return { ...payload.key };
   }
-  if (payload.record && typeof payload.record === "object") {
-    return { ...payload.record };
+  // Flat create/regenerate body.
+  return { ...payload };
+}
+
+/** Normalize list payloads from GET /keys (array under keys/items/data, or single object). */
+function normalizeKeyList(data) {
+  if (!data) return [];
+  if (Array.isArray(data)) return data.filter((k) => k && typeof k === "object" && k.id);
+  if (typeof data !== "object") return [];
+  const candidates = [data.keys, data.items, data.data, data.records, data.api_keys];
+  for (const c of candidates) {
+    if (Array.isArray(c)) return c.filter((k) => k && typeof k === "object" && k.id);
   }
-  // Flat create/regenerate body — drop plaintext aliases from the record view.
-  const rec = { ...payload };
-  return rec;
+  // Single-key create-shaped body mistakingly used as list.
+  if (data.id && (data.prefix || data.name || data.secret || data.key)) return [data];
+  return [];
 }
 
 function rememberKeySecret(id, secret) {
@@ -1788,6 +1814,45 @@ function rememberKeySecret(id, secret) {
   if (!keysCache || typeof keysCache !== "object" || Array.isArray(keysCache)) keysCache = {};
   const prev = keysCache[id] || { id };
   keysCache[id] = { ...prev, id, secret, key: secret, has_secret: true };
+}
+
+/** Paint one key row into the table immediately (create/regenerate optimistic UI). */
+function paintKeyRowOptimistic(rec, secret) {
+  if (!rec || !rec.id) return;
+  const body = $("keys-tbody");
+  if (!body) return;
+  // Drop empty / loading placeholders so the new row is visible.
+  const emptyRow = body.querySelector("tr:not([data-key-id])");
+  if (emptyRow && body.querySelectorAll("tr[data-key-id]").length === 0) {
+    body.innerHTML = "";
+  }
+  const id = String(rec.id);
+  const existing = body.querySelector(`tr[data-key-id="${CSS && CSS.escape ? CSS.escape(id) : id.replace(/"/g, '\\"')}"]`);
+  if (existing) existing.remove();
+  const full = secret || extractKeySecret(rec) || "";
+  if (full) rememberKeySecret(id, full);
+  else {
+    if (!keysCache || typeof keysCache !== "object" || Array.isArray(keysCache)) keysCache = {};
+    keysCache[id] = { ...(keysCache[id] || {}), ...rec, id };
+  }
+  const cached = keysCache[id] || rec;
+  const canCopy = !!(extractKeySecret(cached) || rec.has_secret || full);
+  const lastUsed = rec.last_used_at != null ? rec.last_used_at : rec.created_at;
+  const tr = document.createElement("tr");
+  tr.setAttribute("data-key-id", id);
+  tr.innerHTML = `
+      <td>${esc(rec.name || "—")}<div class="g2a-muted" style="font-size:0.75rem">${esc(rec.note || "")}</div></td>
+      <td class="mono" title="${canCopy ? "可复制完整 Key" : "库内无完整 Key，需重建"}">${esc(rec.prefix || "")}…</td>
+      <td>${rec.enabled === false ? '<span class="g2a-tag bad">停用</span>' : '<span class="g2a-tag ok">启用</span>'}</td>
+      <td class="mono">${fmtNum(rec.request_count || 0)}</td>
+      <td class="g2a-muted" title="最后使用 / 创建时间">${esc(fmtTime(lastUsed))}</td>
+      <td class="g2a-actions">
+        <button type="button" class="g2a-btn g2a-btn-primary g2a-btn-sm" data-act="copy" data-id="${esc(id)}">${canCopy ? "复制" : "重建复制"}</button>
+        <button type="button" class="g2a-btn g2a-btn-default g2a-btn-sm" data-act="toggle" data-id="${esc(id)}" data-on="${rec.enabled === false ? 1 : 0}">${rec.enabled === false ? "启用" : "停用"}</button>
+        <button type="button" class="g2a-btn g2a-btn-danger g2a-btn-sm" data-act="del" data-id="${esc(id)}">删除</button>
+      </td>`;
+  body.insertBefore(tr, body.firstChild);
+  try { bindKeysControls(); } catch (_) {}
 }
 
 function showNewKeyBox(secret, meta) {
@@ -1834,13 +1899,24 @@ async function createApiKeyFromForm() {
       method: "POST",
       body: JSON.stringify({ name, note }),
     });
-    const rec = extractKeyRecord(data);
+    const rec = extractKeyRecord(data) || {};
+    // Flat create body uses id on the root; ensure id/name/prefix survive extract.
+    if (!rec.id && data && data.id) Object.assign(rec, data);
+    if (data && typeof data === "object") {
+      if (!rec.name && data.name) rec.name = data.name;
+      if (!rec.prefix && data.prefix) rec.prefix = data.prefix;
+      if (rec.enabled == null && data.enabled != null) rec.enabled = data.enabled;
+      if (!rec.note && data.note) rec.note = data.note;
+      if (!rec.created_at && data.created_at != null) rec.created_at = data.created_at;
+    }
     const full = extractKeySecret(data) || extractKeySecret(rec);
     if (rec && rec.id && full) rememberKeySecret(rec.id, full);
     else if (rec && rec.id) {
-      if (!keysCache || typeof keysCache !== "object") keysCache = {};
+      if (!keysCache || typeof keysCache !== "object" || Array.isArray(keysCache)) keysCache = {};
       keysCache[rec.id] = { ...(keysCache[rec.id] || {}), ...rec };
     }
+    // Paint immediately so the new row is visible even if list refresh races/fails.
+    try { paintKeyRowOptimistic(rec, full); } catch (_) {}
     showNewKeyBox(full, rec);
     if (full) {
       const ok = await copyText(full);
@@ -1850,7 +1926,12 @@ async function createApiKeyFromForm() {
     }
     if (nameEl) nameEl.value = "";
     if (noteEl) noteEl.value = "";
-    await renderKeys();
+    // Re-sync from server (newest-first). Keep optimistic row if list is empty/stale.
+    try {
+      await renderKeys({ preserveIds: rec && rec.id ? [rec.id] : [] });
+    } catch (e) {
+      console.warn("renderKeys after create", e);
+    }
     return true;
   } catch (e) {
     toast((e && e.message) || "创建 Key 失败", false);
@@ -1886,6 +1967,7 @@ async function handleKeyRowAction(btn) {
         rememberKeySecret(id, full);
         if (rec && typeof rec === "object") {
           keysCache[id] = { ...(keysCache[id] || {}), ...rec, secret: full, key: full };
+          try { paintKeyRowOptimistic({ ...(keysCache[id] || {}), id, ...rec }, full); } catch (_) {}
         }
         regenerated = true;
         showNewKeyBox(full, rec);
@@ -1951,7 +2033,9 @@ function bindKeysControls() {
   });
 }
 
-function renderKeys() {
+function renderKeys(opts) {
+  opts = opts || {};
+  const preserveIds = new Set((opts.preserveIds || []).map(String).filter(Boolean));
   bindKeysControls();
   const tbody = $("keys-tbody");
   const hasRows = !!(tbody && tbody.querySelector("tr[data-key-id]"));
@@ -1961,7 +2045,9 @@ function renderKeys() {
   return api("/keys").then((data) => {
     const body = $("keys-tbody");
     if (!body) return;
-    const keys = (data && data.keys) || [];
+    let keys = normalizeKeyList(data);
+    // Guard: never treat stats object {total, enabled, ...} as a key list.
+    if (!Array.isArray(keys)) keys = [];
     const src = (data && (data.store_source || data.store_backend)) || "";
     window.__g2aKeysStore = { source: src };
     if ($("page-sub") && document.body && document.body.dataset.page === "keys") {
@@ -1983,12 +2069,26 @@ function renderKeys() {
         has_secret: !!(secret || k.has_secret),
       };
     });
+    // If server list is empty/missing a just-created id, keep cache entry for optimistic paint.
+    if (preserveIds.size && keysCache && typeof keysCache === "object") {
+      preserveIds.forEach((id) => {
+        if (!next[id] && keysCache[id]) next[id] = { ...keysCache[id] };
+      });
+    }
     keysCache = next;
-    if (!keys.length) {
+    // Prefer server order (newest first). Append any preserve-only rows at top.
+    const list = keys.slice();
+    if (preserveIds.size) {
+      const have = new Set(list.map((k) => String(k && k.id)));
+      preserveIds.forEach((id) => {
+        if (!have.has(id) && next[id]) list.unshift(next[id]);
+      });
+    }
+    if (!list.length) {
       body.innerHTML = `<tr><td colspan="6" class="g2a-muted">暂无 Key。创建后客户端访问 /v1 将需要鉴权。</td></tr>`;
       return;
     }
-    body.innerHTML = keys.map((k) => {
+    body.innerHTML = list.map((k) => {
       const cached = keysCache[k.id] || k;
       const canCopy = !!(extractKeySecret(cached) || k.has_secret);
       const lastUsed = k.last_used_at != null ? k.last_used_at : k.created_at;
@@ -2010,6 +2110,11 @@ function renderKeys() {
     try { bindKeysControls(); } catch (_) {}
   }).catch((e) => {
     const body = $("keys-tbody");
+    // Keep optimistic rows if we already painted a create result.
+    if (body && preserveIds.size && body.querySelector("tr[data-key-id]")) {
+      toast(e.message || "刷新 Keys 失败（已保留新建项）", false);
+      return;
+    }
     if (body) body.innerHTML = `<tr><td colspan="6" class="g2a-muted">加载失败：${esc(e.message || e)}</td></tr>`;
     toast(e.message || "加载 Keys 失败", false);
   });
@@ -5521,18 +5626,18 @@ function markTrackedRegistrationMissing(reason) {
 function _desiredRegPollInterval() {
   // Adaptive: snappy when polls are fast; back off only under real load so we
   // don't pile up concurrent ticks (regPollInFlight lock freezes the log).
-  if (regStopping) return 500;
+  if (regStopping) return 400;
   const last = Number(regPollLastDurationMs) || 0;
-  if (last >= 1100) return 700;
-  if (last >= 700) return 450;
-  if (last >= 350) return 280;
-  return 180; // healthy batch-only path: ~5–6 paints/sec
+  if (last >= 800) return 550;
+  if (last >= 500) return 320;
+  if (last >= 250) return 200;
+  return 140; // healthy batch-only path: ~7 paints/sec
 }
 
 function _scheduleRegPollTick(ms) {
   try { clearInterval(regPollTimer); } catch (_) {}
   try { clearTimeout(regPollTimer); } catch (_) {}
-  regPollIntervalMs = Math.max(150, Number(ms) || 220);
+  regPollIntervalMs = Math.max(120, Number(ms) || 180);
   // setTimeout chain (not setInterval) so a slow tick never overlaps its own
   // cadence and we can adapt the next wait to the previous duration.
   regPollTimer = setTimeout(() => {
@@ -5547,9 +5652,9 @@ function _scheduleRegPollTick(ms) {
   }, regPollIntervalMs);
 }
 
-function startRegPolling({ immediate = true, intervalMs = 220 } = {}) {
+function startRegPolling({ immediate = true, intervalMs = 180 } = {}) {
   regFinishedNotified = false;
-  regPollIntervalMs = Math.max(regStopping ? 500 : 150, Number(intervalMs) || 220);
+  regPollIntervalMs = Math.max(regStopping ? 400 : 120, Number(intervalMs) || 180);
   if (immediate) {
     // First paint ASAP; subsequent ticks use adaptive schedule.
     try { clearInterval(regPollTimer); } catch (_) {}
@@ -5676,7 +5781,7 @@ async function stopRegistration() {
     showPanel("reg-session-box");
     saveRegTrack();
     // Keep polling until cancelled/stopped, but avoid aggressive 1.2s thrash.
-    startRegPolling({ immediate: true, intervalMs: 220 });
+    startRegPolling({ immediate: true, intervalMs: 180 });
   } catch (e) {
     regStopping = false;
     toast((e && e.message) || "停止失败", false);
@@ -6728,7 +6833,7 @@ function adoptRegSessions(sessions, { batch = null, continuePolling = true } = {
   // Live task only.
   regFinishedNotified = false;
   if (continuePolling) {
-    startRegPolling({ immediate: true, intervalMs: 220 });
+    startRegPolling({ immediate: true, intervalMs: 180 });
   }
   saveRegTrack();
   return true;
@@ -7090,24 +7195,32 @@ function buildRegLogText(sessions, { batch = null, extraLines = [] } = {}) {
   (sessions || []).forEach((s, i) => lines.push(formatRegSessionLine(s, i)));
   // Real-time step timeline (written by adapter update() → log_lines / Redis).
   const timeline = [];
+  // Prefer live sessions' steps; cap total lines so setLogPanel stays cheap.
+  const liveFirst = [];
+  const rest = [];
   for (const s of sessions || []) {
+    const st = regStatusOf(s);
+    if (REG_TERMINAL_OK.has(st) || REG_TERMINAL_BAD.has(st)) rest.push(s);
+    else liveFirst.push(s);
+  }
+  for (const s of liveFirst.concat(rest)) {
     const rows = Array.isArray(s && s.log_lines) ? s.log_lines : [];
     const email = (s && s.email) || regSessionKey(s) || "";
     if (rows.length) {
-      for (const row of rows.slice(-20)) {
+      for (const row of rows.slice(-12)) {
         timeline.push(`${email ? email + " " : ""}${row}`);
       }
     } else if (s && (s.log || s.output_tail)) {
       String(s.log || s.output_tail)
         .split("\n")
         .filter(Boolean)
-        .slice(-8)
+        .slice(-6)
         .forEach((row) => timeline.push(`${email ? email + " " : ""}${row}`));
     }
   }
   if (timeline.length) {
     lines.push("-------- 实时步骤 --------");
-    lines.push(...timeline.slice(-80));
+    lines.push(...timeline.slice(-48));
   }
   // Probe details from backend auto-probe
   const probeRows = [];
@@ -7299,17 +7412,20 @@ async function pollRegSession() {
   const regApi = (path, extra) => api(path, Object.assign({ timeoutMs: REG_POLL_TIMEOUT_MS }, extra || {}));
   try {
   // Prefer batch endpoint when available for accurate total/success/fail.
-  // Batch embeds compact sessions WITH log_lines (adapter keeps last 24), so one
-  // request is enough for timely log updates in the common path.
+  // Batch embeds compact sessions WITH log_lines — one request is the fast path.
+  // Avoid extra /sessions list sweeps and deep session GETs (main latency source).
   let batch = null;
   let batchMissing = false;
   if (regBatchId) {
     try {
       batch = await regApi("/accounts/register-email/batches/" + encodeURIComponent(regBatchId));
       if (batch && Array.isArray(batch.session_ids)) {
-        for (const id of batch.session_ids) {
+        // Cap tracked ids — UI only needs embed window + a little headroom.
+        const incoming = batch.session_ids.filter(Boolean);
+        for (const id of incoming) {
           if (id && !regSessionIds.includes(id)) regSessionIds.push(id);
         }
+        if (regSessionIds.length > 120) regSessionIds = regSessionIds.slice(-120);
       }
     } catch (e) {
       batchMissing = isNotFoundError(e);
@@ -7335,65 +7451,40 @@ async function pollRegSession() {
     if (batch && Array.isArray(batch.sessions) && batch.sessions.length) {
       sessions = batch.sessions.slice();
       sessionHits = sessions.length;
-      // Batch embed already includes log_lines (adapter keeps last 20). Prefer
-      // zero extra session GETs — deep-fetch only when embed has no timeline yet
-      // (first 1–2s of a new session). Cap at REG_POLL_LIVE_REFRESH (=1).
-      const needDeep = sessions
-        .filter((s) => {
-          const st = regStatusOf(s);
-          if (REG_TERMINAL_OK.has(st) || REG_TERMINAL_BAD.has(st)) return false;
-          const logs = Array.isArray(s.log_lines) ? s.log_lines : [];
-          // Only when completely bare (no steps yet).
-          return logs.length < 1;
-        })
-        .map((s) => regSessionKey(s))
-        .filter(Boolean);
-      const n = Math.min(REG_POLL_LIVE_REFRESH, needDeep.length);
-      const liveIds = [];
-      if (n > 0) {
-        const start = regPollLiveCursor % needDeep.length;
-        for (let i = 0; i < n; i++) {
-          liveIds.push(needDeep[(start + i) % needDeep.length]);
-        }
-        regPollLiveCursor = (start + n) % Math.max(1, needDeep.length);
-      }
-      if (liveIds.length) {
-        const fresh = await Promise.all(
-          liveIds.map(async (id) => {
-            try {
-              return {
-                ok: true,
-                id,
-                data: await regApi("/accounts/register-email/sessions/" + encodeURIComponent(id)),
-              };
-            } catch (e) {
-              return { ok: false, id, missing: isNotFoundError(e) };
-            }
+      // Batch embed already includes log_lines. Deep-fetch ONLY when embed has
+      // zero timeline AND we are not under load (slow last tick = skip extra RTT).
+      const lastMs = Number(regPollLastDurationMs) || 0;
+      if (lastMs < 450) {
+        const needDeep = sessions
+          .filter((s) => {
+            const st = regStatusOf(s);
+            if (REG_TERMINAL_OK.has(st) || REG_TERMINAL_BAD.has(st)) return false;
+            const logs = Array.isArray(s.log_lines) ? s.log_lines : [];
+            return logs.length < 1;
           })
-        );
-        const byId = new Map(sessions.map((s) => [regSessionKey(s), s]));
-        for (const r of fresh) {
-          if (r && r.ok && r.data) {
-            const id = regSessionKey(r.data) || r.id;
-            if (!id) continue;
-            const prev = byId.get(id) || {};
-            const prevTs = Number(prev.updated_at || 0) || 0;
-            const nextTs = Number(r.data.updated_at || 0) || 0;
-            const prevLogs = Array.isArray(prev.log_lines) ? prev.log_lines.length : 0;
-            const nextLogs = Array.isArray(r.data.log_lines) ? r.data.log_lines.length : 0;
-            if (nextTs >= prevTs || nextLogs > prevLogs) {
-              byId.set(id, r.data);
+          .map((s) => regSessionKey(s))
+          .filter(Boolean);
+        const n = Math.min(REG_POLL_LIVE_REFRESH, needDeep.length);
+        if (n > 0) {
+          const start = regPollLiveCursor % needDeep.length;
+          const liveId = needDeep[start];
+          regPollLiveCursor = (start + 1) % Math.max(1, needDeep.length);
+          try {
+            const data = await regApi("/accounts/register-email/sessions/" + encodeURIComponent(liveId));
+            if (data) {
+              const id = regSessionKey(data) || liveId;
+              const idx = sessions.findIndex((s) => regSessionKey(s) === id);
+              if (idx >= 0) sessions[idx] = data;
+              else sessions.push(data);
             }
-          } else if (r && r.missing) {
-            sessionMisses += 1;
+          } catch (e) {
+            if (isNotFoundError(e)) sessionMisses += 1;
           }
         }
-        sessions = Array.from(byId.values());
-        sessionHits = sessions.length;
       }
     } else {
-      // No batch embed: parallel-fetch a small window (hard cap keeps tick < ~0.6s).
-      const fetchIds = ids.slice(0, 4);
+      // No batch embed: parallel-fetch a tiny window (hard cap keeps tick snappy).
+      const fetchIds = ids.slice(0, 2);
       const results = await Promise.all(
         fetchIds.map(async (id) => {
           try {
@@ -7416,29 +7507,15 @@ async function pollRegSession() {
       }
     }
 
-    // Pull all sessions so late-spawned batch workers appear.
-    // Strict filter: only the currently tracked batch / session ids — never
-    // absorb leftover sessions from a previous finished/stopped registration.
-    // Skip this extra list call when the batch payload already has sessions —
-    // it was the main source of 2–4s poll lag under multi-worker load.
+    // Never call full /sessions list during steady-state polling — it is expensive
+    // (Redis SCAN + merge) and was the main multi-second log lag source.
+    // Only a one-shot recovery when we have zero hits and no embed at all.
     let listHasTrackedBatch = false;
-    // Prefer batch payload; only sweep /sessions when batch is far incomplete.
-    // Spawning lag of a few sessions is fine — next batch poll will catch up.
-    const needListSweep = (() => {
-      if (!batch) return ids.length === 0 || sessionHits === 0;
-      if (!Array.isArray(batch.sessions) || !batch.sessions.length) {
-        // Only during early spawn when we have zero sessions yet.
-        return sessionHits === 0 && (
-          Number(batch.spawned || 0) > 0
-          || (Array.isArray(batch.session_ids) && batch.session_ids.length > 0)
-          || Number(batch.count || 0) > 0
-        );
-      }
-      const want = Array.isArray(batch.session_ids) ? batch.session_ids.length : 0;
-      if (want <= 0) return false;
-      // Only when dramatically behind (e.g. embed window truncated vs total).
-      return batch.sessions.length + 12 < want;
-    })();
+    const needListSweep =
+      sessionHits === 0 &&
+      !batch &&
+      ids.length === 0 &&
+      !!regBatchId;
     if (needListSweep) try {
       const all = await regApi("/accounts/register-email/sessions");
       if (all && Array.isArray(all.sessions)) {
@@ -7448,40 +7525,21 @@ async function pollRegSession() {
             : (regSessionId ? [regSessionId] : [])
           ).map((x) => String(x || "").trim()).filter(Boolean)
         );
-        const known = new Set(sessions.map(regSessionKey).filter(Boolean));
         for (const s of all.sessions) {
           const id = regSessionKey(s);
           if (!id) continue;
           const sameBatch = !!(regBatchId && s.batch_id && s.batch_id === regBatchId);
           const tracked = trackedIds.has(id);
-          // Without a batch id, only accept explicitly tracked session ids.
           if (!(sameBatch || tracked)) continue;
           if (!regSessionIds.includes(id)) regSessionIds.push(id);
-          if (!known.has(id)) {
-            sessions.push(s);
-            known.add(id);
-            sessionHits += 1;
-          } else {
-            // Prefer the fresher message/status by updated_at when merging.
-            const idx = sessions.findIndex((x) => regSessionKey(x) === id);
-            if (idx >= 0) {
-              const cur = sessions[idx] || {};
-              const curTs = Number(cur.updated_at || 0) || 0;
-              const nextTs = Number(s.updated_at || 0) || 0;
-              const curLogs = Array.isArray(cur.log_lines) ? cur.log_lines.length : 0;
-              const nextLogs = Array.isArray(s.log_lines) ? s.log_lines.length : 0;
-              if (nextTs > curTs || (nextTs === curTs && nextLogs >= curLogs)) {
-                sessions[idx] = s;
-              }
-            }
-          }
+          sessions.push(s);
+          sessionHits += 1;
         }
-        // Prefer batch stats from list endpoint when present.
         if (regBatchId && Array.isArray(all.batches)) {
           const listed = all.batches.find((b) => (b.id || b.batch_id) === regBatchId) || null;
           if (listed) {
             listHasTrackedBatch = true;
-            if (!batch) batch = listed;
+            batch = listed;
           }
         }
       }
@@ -7785,7 +7843,14 @@ on("btn-logout", "onclick", async () => {  try { await api("/logout", { method: 
   localStorage.removeItem(TOKEN_KEY);
   showAuth(false);
 });
-on("btn-refresh-all", "onclick", async () => {  try {
+on("btn-refresh-all", "onclick", async () => {
+  try {
+    const page = document.body.dataset.page || pageFromPath(location.pathname) || "";
+    if (page === "keys" && typeof renderKeys === "function") {
+      await renderKeys();
+      toast("已刷新 Key 列表");
+      return;
+    }
     statusCache = await api("/status");
     await loadDashboard();
     toast("已刷新");
@@ -9654,6 +9719,8 @@ async function loadSystemSettings(force) {
   if (dashCache) dashCache.settings = Object.assign({}, dashCache.settings || {}, s);
   if (statusCache) statusCache.settings = Object.assign({}, statusCache.settings || {}, s);
   fillSystemSettingsForm(s);
+  try { bindVersionSettingsUI(); } catch (_) {}
+  try { checkVersionUpdate({ soft: true }); } catch (_) {}
   clearAdminPasswordFields();
   // Browsers may autofill password fields after paint; clear again shortly after.
   setTimeout(clearAdminPasswordFields, 0);
@@ -10268,7 +10335,7 @@ if ($("btn-start-reg")) {
         }
         saveRegTrack();
         setTimeout(() => { loadRegConfig(true).catch(() => {}); }, 300);
-        startRegPolling({ immediate: true, intervalMs: 220 });
+        startRegPolling({ immediate: true, intervalMs: 180 });
         if (r.batch_id) {
           setTimeout(async () => {
             try {
@@ -11251,7 +11318,7 @@ async function loadAdminLogs({ reset = false, soft = false } = {}) {
 }
 
 
-window.G2AAdmin = { bootstrap, loadDashboard, api, $, toast, PAGE_META, renderAccounts, renderKeys };
+window.G2AAdmin = { bootstrap, loadDashboard, api, $, toast, PAGE_META, renderAccounts, renderKeys, checkVersionUpdate, bindVersionSettingsUI };
   if (document.body && document.body.dataset.page) {
     const _boot = () => {
       try { if (document.body.dataset.page === "accounts") renderAccountStatusChips(); } catch (_) {}
@@ -11260,5 +11327,218 @@ window.G2AAdmin = { bootstrap, loadDashboard, api, $, toast, PAGE_META, renderAc
     if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", _boot);
     else _boot();
   }
+
+/* ── Version check + hot update ─────────────────────────────────── */
+let _versionBannerCheckedAt = 0;
+let _versionInfoCache = null;
+
+function scheduleVersionBannerCheck() {
+  const now = Date.now();
+  if (now - _versionBannerCheckedAt < 10 * 60 * 1000 && _versionInfoCache) {
+    try { renderVersionBanner(_versionInfoCache); } catch (_) {}
+    return;
+  }
+  _versionBannerCheckedAt = now;
+  // Soft check — never block page paint.
+  setTimeout(() => {
+    checkVersionUpdate({ soft: true }).catch(() => {});
+  }, 1200);
+}
+
+async function checkVersionUpdate({ soft = false, force = false } = {}) {
+  const path = force ? "/version/check" : "/version";
+  let info;
+  try {
+    info = await api(path + (force ? "" : ""));
+  } catch (e) {
+    if (!soft) toast((e && e.message) || "检查版本失败", false);
+    return null;
+  }
+  _versionInfoCache = info;
+  try { renderVersionBanner(info); } catch (_) {}
+  try { renderVersionSettingsCard(info); } catch (_) {}
+  if (!soft && info) {
+    if (info.update_available) {
+      toast(`发现新版本 v${info.latest}（当前 v${info.current}）`, true);
+    } else if (info.latest) {
+      toast(`已是最新版本 v${info.current}`, true);
+    } else if (info.error) {
+      toast("检查更新失败: " + info.error, false);
+    }
+  }
+  return info;
+}
+
+function renderVersionBanner(info) {
+  if (!info || !info.update_available) {
+    const old = document.getElementById("g2a-version-banner");
+    if (old) old.remove();
+    return;
+  }
+  let el = document.getElementById("g2a-version-banner");
+  if (!el) {
+    el = document.createElement("div");
+    el.id = "g2a-version-banner";
+    el.setAttribute("role", "status");
+    el.style.cssText = [
+      "position:sticky", "top:0", "z-index:40",
+      "padding:10px 16px", "display:flex", "gap:12px", "align-items:center",
+      "justify-content:space-between", "flex-wrap:wrap",
+      "background:linear-gradient(90deg,rgba(59,130,246,.18),rgba(16,185,129,.12))",
+      "border-bottom:1px solid rgba(59,130,246,.35)",
+      "font-size:13px",
+    ].join(";");
+    const host = document.querySelector(".g2a-main") || document.body;
+    host.insertBefore(el, host.firstChild);
+  }
+  const cur = info.current || "?";
+  const lat = info.latest || "?";
+  el.innerHTML = `
+    <div>
+      <strong>发现新版本</strong>
+      <span class="g2a-muted">当前 <code>v${esc(cur)}</code> → 最新 <code>v${esc(lat)}</code></span>
+      ${info.release_name ? `<span class="g2a-muted"> · ${esc(info.release_name)}</span>` : ""}
+    </div>
+    <div style="display:flex;gap:8px;align-items:center">
+      ${info.release_url ? `<a class="g2a-btn g2a-btn-default g2a-btn-sm" href="${esc(info.release_url)}" target="_blank" rel="noopener">Release</a>` : ""}
+      <a class="g2a-btn g2a-btn-default g2a-btn-sm" href="/admin/settings#sec-version">去更新</a>
+      <button type="button" class="g2a-btn g2a-btn-primary g2a-btn-sm" id="g2a-banner-update">热更新并重启</button>
+      <button type="button" class="g2a-btn g2a-btn-default g2a-btn-sm" id="g2a-banner-dismiss" aria-label="关闭">×</button>
+    </div>`;
+  const btnU = el.querySelector("#g2a-banner-update");
+  if (btnU) btnU.onclick = () => requestVersionUpdate({ tag: lat }).catch(() => {});
+  const btnD = el.querySelector("#g2a-banner-dismiss");
+  if (btnD) btnD.onclick = () => { try { el.remove(); } catch (_) {} };
+}
+
+function renderVersionSettingsCard(info) {
+  if (!$("sec-version")) return;
+  if (!info) return;
+  if ($("ver-current")) $("ver-current").textContent = info.current ? ("v" + info.current) : "—";
+  if ($("ver-latest")) $("ver-latest").textContent = info.latest ? ("v" + info.latest) : (info.error ? "检查失败" : "—");
+  if ($("ver-release-name")) $("ver-release-name").textContent = info.release_name || "";
+  if ($("ver-notes")) $("ver-notes").textContent = info.release_notes || info.error || "—";
+  if ($("ver-update-hint")) $("ver-update-hint").textContent = info.update_hint || "";
+  const pill = $("version-pill");
+  if (pill) {
+    if (info.update_available) {
+      pill.className = "g2a-tag warn";
+      pill.textContent = "有新版本 v" + info.latest;
+    } else if (info.latest) {
+      pill.className = "g2a-tag ok";
+      pill.textContent = "已是最新";
+    } else {
+      pill.className = "g2a-tag";
+      pill.textContent = info.error ? "检查失败" : "—";
+    }
+  }
+  const btn = $("btn-version-update");
+  if (btn) {
+    const canUpdate = !!(info.update_supported && info.latest);
+    btn.disabled = !canUpdate;
+    btn.title = info.update_supported
+      ? (info.update_hint || "")
+      : (info.update_hint || "热更新未启用");
+    btn.textContent = info.update_available
+      ? ("热更新并重启到 v" + info.latest)
+      : (info.update_supported ? "热更新并重启（当前已是最新也可 recreate）" : "热更新未启用");
+  }
+  const link = $("ver-release-link");
+  if (link) {
+    if (info.release_url) {
+      link.href = info.release_url;
+      link.style.display = "";
+      link.textContent = "查看 Release";
+    } else {
+      link.style.display = "none";
+    }
+  }
+  const st = info.update_status;
+  if ($("ver-update-status")) {
+    if (st && st.status) {
+      $("ver-update-status").textContent =
+        `状态: ${st.status}` +
+        (st.tag ? ` · 目标 v${st.tag}` : "") +
+        (st.message ? ` · ${st.message}` : "");
+    } else {
+      $("ver-update-status").textContent =
+        info.update_supported
+          ? ("模式: " + (info.update_mode || "docker"))
+          : "热更新未启用";
+    }
+  }
+}
+
+async function requestVersionUpdate({ tag, restartOnly = false } = {}) {
+  const tip = restartOnly
+    ? "确认在容器内重启服务？（force-recreate，不强制换版本）服务会短暂中断。"
+    : "确认在容器内热更新并自动重启？\n\n容器将：docker pull 镜像 + compose force-recreate\n无需宿主机 watcher。";
+  if (!confirm(tip)) return;
+  try {
+    const body = {};
+    if (tag) body.tag = String(tag).replace(/^v/, "");
+    if (restartOnly) body.tag = body.tag || (window.__g2aCurrentVersion || "latest");
+    const r = await api("/version/update", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    toast((r && r.message) || "已提交容器内热更新/重启（将自动 recreate）", true);
+    // Poll status longer — pull can take minutes.
+    for (let i = 0; i < 40; i++) {
+      await new Promise((res) => setTimeout(res, 3000));
+      let info = null;
+      try { info = await checkVersionUpdate({ soft: true, force: false }); } catch (_) {}
+      const st = info && info.update_status;
+      if (st && (st.status === "done" || st.status === "error")) {
+        if (st.status === "done") {
+          toast("更新/重启完成，即将刷新页面…", true);
+          setTimeout(() => location.reload(), 2000);
+        } else {
+          toast("更新失败: " + (st.message || "unknown"), false);
+        }
+        break;
+      }
+      if (i === 5 || i === 15) {
+        toast("仍在更新中（pull/recreate）…", true);
+      }
+    }
+  } catch (e) {
+    toast((e && e.message) || "热更新请求失败", false);
+  }
+}
+
+function bindVersionSettingsUI() {
+  const chk = $("btn-version-check");
+  if (chk && !chk._bound) {
+    chk._bound = true;
+    chk.onclick = () => checkVersionUpdate({ force: true }).catch(() => {});
+  }
+  const upd = $("btn-version-update");
+  if (upd && !upd._bound) {
+    upd._bound = true;
+    upd.onclick = () => {
+      const tag = (_versionInfoCache && _versionInfoCache.latest) || "";
+      requestVersionUpdate({ tag }).catch(() => {});
+    };
+  }
+  const rst = $("btn-version-restart");
+  if (rst && !rst._bound) {
+    rst._bound = true;
+    rst.onclick = () => requestVersionUpdate({ restartOnly: true }).catch(() => {});
+  }
+  // Load once when settings page is present
+  if ($("sec-version")) {
+    checkVersionUpdate({ soft: true }).catch(() => {});
+  }
+}
+
+// Auto-bind when settings page content is live
+try {
+  document.addEventListener("DOMContentLoaded", () => {
+    try { bindVersionSettingsUI(); } catch (_) {}
+  });
+} catch (_) {}
+
 })();
 /* g2a-cache-bust-20260715-reg-restore-fix */

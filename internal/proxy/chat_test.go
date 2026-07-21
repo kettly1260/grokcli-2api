@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -99,11 +100,18 @@ func TestChatFingerprintUsesExplicitConversation(t *testing.T) {
 	}
 }
 
-func TestChatFingerprintFallsBackToMessagesHash(t *testing.T) {
+func TestChatFingerprintFallsBackToStableSeed(t *testing.T) {
+	// Same first user message → same seed fingerprint (stable across multi-turn growth).
 	fp1 := ChatFingerprint(ChatRequest{Model: "grok", Raw: map[string]any{"messages": []any{map[string]any{"role": "user", "content": "hi"}}}})
-	fp2 := ChatFingerprint(ChatRequest{Model: "grok", Raw: map[string]any{"messages": []any{map[string]any{"role": "user", "content": "hi"}}}})
-	if fp1 == "" || fp1 != fp2 || !strings.HasPrefix(fp1, "chat:grok:messages:") {
-		t.Fatalf("unexpected fingerprints %q %q", fp1, fp2)
+	fp2 := ChatFingerprint(ChatRequest{Model: "grok", Raw: map[string]any{"messages": []any{
+		map[string]any{"role": "user", "content": "hi"},
+		map[string]any{"role": "assistant", "content": "yo"},
+	}}})
+	if fp1 == "" || fp1 != fp2 {
+		t.Fatalf("seed fingerprint unstable: %q vs %q", fp1, fp2)
+	}
+	if !strings.HasPrefix(fp1, "chat:grok:seed:") {
+		t.Fatalf("expected seed fingerprint, got %q", fp1)
 	}
 }
 
@@ -538,6 +546,54 @@ func TestChatFingerprintPrefersPromptCacheKey(t *testing.T) {
 	}})
 	if fp != "chat:grok:prompt_cache_key:stable-pck" {
 		t.Fatalf("fingerprint=%q", fp)
+	}
+}
+
+func TestChatFingerprintSeedStableAcrossTurns(t *testing.T) {
+	// OpenAI multi-turn without prompt_cache_key: fingerprint must NOT change as
+	// messages grow, or affinity breaks and upstream prefix cache always misses.
+	turn1 := ChatRequest{Model: "grok-4.5", Raw: map[string]any{
+		"messages": []any{
+			map[string]any{"role": "user", "content": "hello world please help"},
+		},
+	}}
+	turn2 := ChatRequest{Model: "grok-4.5", Raw: map[string]any{
+		"messages": []any{
+			map[string]any{"role": "user", "content": "hello world please help"},
+			map[string]any{"role": "assistant", "content": "sure"},
+			map[string]any{"role": "user", "content": "and then?"},
+		},
+	}}
+	fp1 := ChatFingerprint(turn1)
+	fp2 := ChatFingerprint(turn2)
+	if fp1 == "" || fp2 == "" {
+		t.Fatalf("empty fingerprint fp1=%q fp2=%q", fp1, fp2)
+	}
+	if fp1 != fp2 {
+		t.Fatalf("seed fingerprint changed across turns:\n  t1=%q\n  t2=%q", fp1, fp2)
+	}
+	if strings.Contains(fp1, ":messages:") {
+		t.Fatalf("must not use full-messages hash: %q", fp1)
+	}
+	if !strings.Contains(fp1, ":seed:") && !strings.Contains(fp1, "prompt_cache_key") {
+		t.Fatalf("expected seed or pck fingerprint, got %q", fp1)
+	}
+}
+
+func TestBindAffinityBindsSeedFingerprint(t *testing.T) {
+	store := &fakeAffinityStore{bound: map[string]string{}}
+	svc := &ChatService{AffinityStore: store}
+	req := ChatRequest{Model: "grok", Raw: map[string]any{
+		"messages": []any{map[string]any{"role": "user", "content": "sticky seed message"}},
+	}}
+	fp := ChatFingerprint(req)
+	if fp == "" {
+		t.Fatal("empty fingerprint")
+	}
+	svc.bindAffinity(context.Background(), req, "acc-seed")
+	if store.bound[fp] != "acc-seed" {
+		// bindAffinity prefers pck when present; seed path binds fingerprint.
+		t.Fatalf("seed fingerprint not bound: fp=%q bound=%#v", fp, store.bound)
 	}
 }
 
@@ -992,5 +1048,126 @@ func TestGuardStreamAgainstEmptySilenceThenDone(t *testing.T) {
 	// Should resolve near the 800ms write, not wait full 15s.
 	if elapsed > 5*time.Second {
 		t.Fatalf("took too long %v (should resolve soon after DONE)", elapsed)
+	}
+}
+
+func TestParseChatDeltaMultipartContent(t *testing.T) {
+	raw := []byte(`{"choices":[{"delta":{"content":[{"type":"text","text":"hello "},{"type":"output_text","text":"world"}]}}]}`)
+	d, err := ParseChatDelta(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d.Content != "hello world" {
+		t.Fatalf("content=%q", d.Content)
+	}
+}
+
+func TestParseChatDeltaNestedResponseUsage(t *testing.T) {
+	raw := []byte(`{"response":{"usage":{"input_tokens":10,"output_tokens":20,"total_tokens":30}}}`)
+	d, err := ParseChatDelta(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	u, _ := d.Usage.(map[string]any)
+	if u == nil {
+		t.Fatal("usage nil")
+	}
+	if n, _ := u["output_tokens"].(float64); n != 20 {
+		t.Fatalf("usage=%v", u)
+	}
+}
+
+
+func TestGuardStreamAgainstEmptyHollowTimeoutIsEmpty(t *testing.T) {
+	// Continuous hollow frames with no [DONE] for longer than abs budget must
+	// be empty so OpenStream can failover (anthropic empty-output main path).
+	pr, pw := io.Pipe()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		// Drip empty deltas for ~1s then stop writing (no DONE).
+		for i := 0; i < 20; i++ {
+			_, _ = pw.Write([]byte("data: {\"choices\":[{\"delta\":{}}]}\n\n"))
+			time.Sleep(50 * time.Millisecond)
+		}
+		// Keep connection open until peeker stops; then close.
+		time.Sleep(emptyStreamAbsBudget + 2*time.Second)
+		_ = pw.Close()
+	}()
+	// Use a shorter wait by relying on abs budget — test may be slow (~18s).
+	// Skip under -short.
+	if testing.Short() {
+		_ = pw.Close()
+		t.Skip("slow hollow timeout test")
+	}
+	started := time.Now()
+	guarded, empty, err := guardStreamAgainstEmpty(pr)
+	elapsed := time.Since(started)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !empty {
+		t.Fatalf("hollow timeout must be empty (elapsed=%v)", elapsed)
+	}
+	if guarded != nil {
+		_ = guarded.Close()
+	}
+	// Should resolve near abs budget, not hang until pipe close.
+	if elapsed > emptyStreamAbsBudget+3*time.Second {
+		t.Fatalf("took too long %v", elapsed)
+	}
+	_ = done
+}
+
+
+func TestShouldDropStickyPinClassifiesErrors(t *testing.T) {
+	// Transient transport must KEEP pin (return false).
+	for _, err := range []error{
+		context.DeadlineExceeded,
+		errors.New("i/o timeout while dialing"),
+		errors.New("connection reset by peer"),
+		&grok.UpstreamError{Status: 502, Body: "bad gateway"},
+		&grok.UpstreamError{Status: 0, Body: "upstream hung"},
+	} {
+		if shouldDropStickyPin(err) {
+			t.Fatalf("expected keep sticky for %v", err)
+		}
+	}
+	// Empty / auth must DROP pin (return true).
+	for _, err := range []error{
+		&grok.UpstreamError{Status: 502, Body: "Upstream returned HTTP 200 with empty model output (no content/tool_calls)"},
+		&grok.UpstreamError{Status: 401, Body: "unauthorized"},
+		&grok.UpstreamError{Status: 403, Body: "forbidden"},
+		errors.New("empty model output"),
+	} {
+		if !shouldDropStickyPin(err) {
+			t.Fatalf("expected drop sticky for %v", err)
+		}
+	}
+}
+
+func TestEnsureUpstreamCacheKeyFromRequestPCK(t *testing.T) {
+	body := map[string]any{"messages": []any{}}
+	req := ChatRequest{Model: "grok", Raw: map[string]any{"prompt_cache_key": "sess-xyz"}}
+	ensureUpstreamCacheKey(body, req)
+	if body["prompt_cache_key"] != "sess-xyz" {
+		t.Fatalf("pck not injected: %#v", body)
+	}
+	// Does not overwrite existing.
+	body2 := map[string]any{"prompt_cache_key": "keep-me"}
+	ensureUpstreamCacheKey(body2, req)
+	if body2["prompt_cache_key"] != "keep-me" {
+		t.Fatalf("overwrote existing pck: %#v", body2)
+	}
+}
+
+func TestEnsureUpstreamCacheKeyFromClaudeUser(t *testing.T) {
+	body := map[string]any{
+		"user": "user_abc_account__session_01234567-89ab-cdef-0123-456789abcdef",
+	}
+	ensureUpstreamCacheKey(body, ChatRequest{Model: "grok", Raw: map[string]any{}})
+	pck, _ := body["prompt_cache_key"].(string)
+	if !strings.HasPrefix(pck, "session_") {
+		t.Fatalf("expected session pck from user, got %q", pck)
 	}
 }

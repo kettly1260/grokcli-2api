@@ -225,3 +225,27 @@ func TestClassifyEmptyModelOutputShortCool(t *testing.T) {
 		t.Fatalf("bare 5xx must not soft-block model: %+v", d)
 	}
 }
+
+func TestClassifyForbiddenEdgeBlock(t *testing.T) {
+	d := ClassifyUpstreamFailure(403, "error code: 1020\nAccess denied\ncloudflare", "grok-4.5")
+	if !d.ShouldCooldown {
+		t.Fatalf("expected cool: %+v", d)
+	}
+	if d.Class != ClassAuth {
+		t.Fatalf("class=%v", d.Class)
+	}
+	if d.Until == nil || d.Until.Before(time.Now().Add(10*time.Minute)) {
+		t.Fatalf("403 edge cool too short: until=%v", d.Until)
+	}
+}
+
+func TestClassifyUnauthorizedShorterThanForbidden(t *testing.T) {
+	u := ClassifyUpstreamFailure(401, "invalid api key", "grok-4.5")
+	f := ClassifyUpstreamFailure(403, "cloudflare access denied", "grok-4.5")
+	if u.Until == nil || f.Until == nil {
+		t.Fatal("missing until")
+	}
+	if !f.Until.After(*u.Until) {
+		t.Fatalf("forbidden cool should be longer: 401=%v 403=%v", u.Until, f.Until)
+	}
+}

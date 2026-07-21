@@ -17,23 +17,46 @@ func (o PickObserver) LoadPenalty(ctx context.Context, accountID string) int64 {
 	if o.Client == nil {
 		return 0
 	}
-	inflight, err := o.Client.GetInflight(ctx, accountID)
-	if err != nil {
-		return 0
+	// Inflight dominates (avoid stacking concurrent streams on one token).
+	// Soft-used adds a smaller spread so least_used does not pin the same few
+	// accounts under burst traffic (reduces WAF/403 heat).
+	var penalty int64
+	if inflight, err := o.Client.GetInflight(ctx, accountID); err == nil && inflight > 0 {
+		// Super-linear: 1→1000, 2→3000, 3→6000 … so multi-inflight accounts fall far back.
+		penalty += inflight * (inflight + 1) / 2 * 1000
 	}
-	return inflight * 1000
+	if age, err := o.Client.GetSoftUsedAgeSec(ctx, accountID, time.Now()); err == nil && age >= 0 {
+		// Recently used within SoftUsedTTL: up to +800, decaying with age.
+		// age=0 → 800; age>=30 → 0
+		remain := 30.0 - age
+		if remain > 0 {
+			penalty += int64(remain * (800.0 / 30.0))
+		}
+	}
+	return penalty
 }
 
-// LoadPenalties batches inflight lookups for a candidate window (hot path).
+// LoadPenalties batches inflight + soft_used lookups for a candidate window (hot path).
 func (o PickObserver) LoadPenalties(ctx context.Context, accountIDs []string) map[string]int64 {
 	out := map[string]int64{}
 	if o.Client == nil || len(accountIDs) == 0 {
 		return out
 	}
 	inflight := o.Client.GetInflightMany(ctx, accountIDs)
-	for id, n := range inflight {
-		if n > 0 {
-			out[id] = n * 1000
+	soft := o.Client.GetSoftUsedAgeSecMany(ctx, accountIDs, time.Now())
+	for _, id := range accountIDs {
+		var penalty int64
+		if n := inflight[id]; n > 0 {
+			penalty += n * (n + 1) / 2 * 1000
+		}
+		if age, ok := soft[id]; ok && age >= 0 {
+			remain := 30.0 - age
+			if remain > 0 {
+				penalty += int64(remain * (800.0 / 30.0))
+			}
+		}
+		if penalty > 0 {
+			out[id] = penalty
 		}
 	}
 	return out

@@ -272,9 +272,14 @@ class YesCaptchaSolver:
             )
         except (TypeError, ValueError):
             outer_rounds = 2
-        # Local already multi-rounds inside Camoufox; keep outer pass lean.
+        # Local already multi-rounds inside Camoufox; prefer single outer pass
+        # under multi-thread load (inner TURNSTILE_SOLVE_ROUNDS covers CF flakiness).
         if local:
-            outer_rounds = min(outer_rounds, 2)
+            try:
+                local_outer = int(os.environ.get("GROK2API_TURNSTILE_LOCAL_OUTER", "1") or 1)
+            except (TypeError, ValueError):
+                local_outer = 1
+            outer_rounds = min(outer_rounds, max(1, min(2, local_outer)))
         outer_rounds = max(1, min(4, outer_rounds))
 
         errors: list[str] = []

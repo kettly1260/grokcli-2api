@@ -44,12 +44,18 @@ func fillMissingUsage(usage map[string]any, requestBody map[string]any, completi
 			completion = int64(completionHint)
 			flags.EstimatedCompletion = true
 			flags.Missing = true
-		} else if int64(completionHint) > completion && (prompt <= 0 || total <= 0 || total < prompt+completion) {
-			// Only lift completion when the upstream frame is clearly partial
-			// (missing prompt/total). Solid real usage is never overwritten.
-			completion = int64(completionHint)
-			flags.EstimatedCompletion = true
-			flags.Missing = true
+		} else if int64(completionHint) > completion {
+			// Lift only when the upstream frame is partial / floor-valued.
+			// Solid real usage (total >= prompt+completion and completion > 2)
+			// is never overwritten by a larger streamer estimate.
+			solid := prompt > 0 && completion > 2 && total >= prompt+completion
+			incomplete := prompt <= 0 || total <= 0 || total <= prompt || total < prompt+completion
+			tinyFloor := completion <= 2 && int64(completionHint) >= completion*4
+			if !solid && (incomplete || tinyFloor) {
+				completion = int64(completionHint)
+				flags.EstimatedCompletion = true
+				flags.Missing = true
+			}
 		}
 	}
 	if prompt <= 0 {

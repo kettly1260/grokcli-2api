@@ -567,12 +567,7 @@ func normalizeExportPayload(payload map[string]any, id string, email *string) ma
 	if stringFromMap(payload, "id") == "" && id != "" {
 		payload["id"] = id
 	}
-	if sso := strings.TrimSpace(accounts.GetSSOValue(payload)); sso != "" {
-		payload["sso"] = sso
-		if stringFromMap(payload, "sso_cookie") == "" {
-			payload["sso_cookie"] = sso
-		}
-	}
+	canonicalizeSSOFields(payload)
 	// Mirror password aliases used by re-import / SSO text export.
 	if stringFromMap(payload, "password") == "" && stringFromMap(payload, "register_password") != "" {
 		payload["password"] = stringFromMap(payload, "register_password")
@@ -1518,27 +1513,28 @@ func mergeDurableLocal(entry, old map[string]any) map[string]any {
 		return map[string]any{}
 	}
 	out := cloneMapAny(entry)
-	if old == nil {
-		return out
-	}
-	durable := []string{
-		"sso", "sso_cookie", "sso_token", "session_cookies", "cookies", "cookie",
-		"set_cookie", "set-cookie", "set_cookies", "password", "register_password",
-		"registration_session_id", "registration_batch_id", "sso_backup_path",
-		"source", "id_token", "refresh_token",
-	}
-	// SSO first
-	if stringFromMap(out, "sso") == "" && stringFromMap(out, "sso_cookie") == "" {
-		if s := firstMapString(old, "sso", "sso_cookie", "sso_token"); s != "" {
-			out["sso"] = s
-			out["sso_cookie"] = s
+	if old != nil {
+		durable := []string{
+			"sso", "sso_cookie", "sso_token", "session_cookies", "cookies", "cookie",
+			"set_cookie", "set-cookie", "set_cookies", "password", "register_password",
+			"registration_session_id", "registration_batch_id", "sso_backup_path",
+			"source", "id_token", "refresh_token",
+		}
+		// Prefer any nested/header SSO shape from old when new omits it.
+		if accounts.GetSSOValue(out) == "" {
+			if s := accounts.GetSSOValue(old); s != "" {
+				out["sso"] = s
+				out["sso_cookie"] = s
+			}
+		}
+		for _, key := range durable {
+			if (out[key] == nil || out[key] == "") && old[key] != nil && old[key] != "" {
+				out[key] = old[key]
+			}
 		}
 	}
-	for _, key := range durable {
-		if (out[key] == nil || out[key] == "") && old[key] != nil && old[key] != "" {
-			out[key] = old[key]
-		}
-	}
+	// Always canonicalize so exports / has_sso filters never miss nested-only shapes.
+	canonicalizeSSOFields(out)
 	if stringFromMap(out, "password") == "" && stringFromMap(out, "register_password") != "" {
 		out["password"] = stringFromMap(out, "register_password")
 	}
@@ -1546,6 +1542,40 @@ func mergeDurableLocal(entry, old map[string]any) map[string]any {
 		out["register_password"] = stringFromMap(out, "password")
 	}
 	return out
+}
+
+// canonicalizeSSOFields lifts GetSSOValue into top-level sso/sso_cookie and
+// session_cookies so admin "有 SSO" + export-all always see registered accounts.
+func canonicalizeSSOFields(payload map[string]any) {
+	if payload == nil {
+		return
+	}
+	sso := strings.TrimSpace(accounts.GetSSOValue(payload))
+	if sso == "" {
+		return
+	}
+	payload["sso"] = sso
+	if stringFromMap(payload, "sso_cookie") == "" {
+		payload["sso_cookie"] = sso
+	}
+	nested, _ := payload["session_cookies"].(map[string]any)
+	if nested == nil {
+		nested = map[string]any{}
+	} else {
+		// shallow copy so we do not mutate shared maps from old rows
+		cp := make(map[string]any, len(nested)+2)
+		for k, v := range nested {
+			cp[k] = v
+		}
+		nested = cp
+	}
+	if strings.TrimSpace(fmt.Sprint(nested["sso"])) == "" || nested["sso"] == nil {
+		nested["sso"] = sso
+	}
+	if strings.TrimSpace(fmt.Sprint(nested["sso-rw"])) == "" || nested["sso-rw"] == nil {
+		nested["sso-rw"] = sso
+	}
+	payload["session_cookies"] = nested
 }
 
 func cloneMapAny(in map[string]any) map[string]any {

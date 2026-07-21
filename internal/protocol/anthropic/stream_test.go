@@ -898,3 +898,21 @@ func TestMaxToolsCapDoesNotLoopMessageStop(t *testing.T) {
 		t.Fatal("after cap+ack, NeedsFinishRetry must be false")
 	}
 }
+
+func TestPayloadDeliveredRequiresAck(t *testing.T) {
+	s := NewStreamAssembler("msg_1", "grok-4.5", false, 0, nil)
+	_ = s.Start(0)
+	// Open thinking via Feed reasoning without AckContentDelivered.
+	frames := s.Feed("", "thinking...", nil)
+	if len(frames) == 0 {
+		t.Fatal("expected frames")
+	}
+	// Thinking open must NOT set PayloadDelivered until AckContentDelivered.
+	if s.PayloadDelivered() {
+		t.Fatal("open thinking must not count as delivered")
+	}
+	s.AckContentDelivered()
+	if !s.PayloadDelivered() {
+		t.Fatal("expected delivered after ack")
+	}
+}

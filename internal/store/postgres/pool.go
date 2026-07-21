@@ -22,7 +22,16 @@ var (
 )
 
 // Slightly longer than previous 400ms: still fresh for kick/cooldown, fewer PG stampedes.
-const candidateCacheTTL = 1200 * time.Millisecond
+const candidateCacheTTL = 800 * time.Millisecond
+
+// InvalidatePoolCandidateCache drops the hot-path candidate window so the next
+// pick re-reads PG (cooldowns / model blocks from empty-output land immediately).
+func InvalidatePoolCandidateCache() {
+	candidateCacheMu.Lock()
+	candidateCacheAt = time.Time{}
+	candidateCacheData = nil
+	candidateCacheMu.Unlock()
+}
 
 // GetPoolCandidate loads one account as a pick candidate (sticky TTFT / prompt-cache path).
 func (c *Connector) GetPoolCandidate(ctx context.Context, accountID string) (*pool.Candidate, error) {
@@ -99,7 +108,7 @@ func (c *Connector) ListPoolCandidates(ctx context.Context) ([]pool.Candidate, e
 			     OR COALESCE(a.payload->>'token', '') <> ''
 			  )
 			ORDER BY COALESCE(ap.weight, 1) DESC, COALESCE(ap.fail_count, 0) ASC, COALESCE(ap.request_count, 0) ASC, a.id ASC
-			LIMIT 32`)
+			LIMIT 48`)
 		if err != nil {
 			return nil, err
 		}

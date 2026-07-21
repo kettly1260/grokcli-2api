@@ -367,3 +367,32 @@ func TestReadSSEMultiLineData(t *testing.T) {
 		t.Fatalf("got %#v", got)
 	}
 }
+
+
+func TestExtractConvIDClaudeCodeUser(t *testing.T) {
+	// Claude Code embeds session in metadata.user_id; body.user is the common
+	// post-BuildOpenAIChatBody form (metadata is stripped before upstream).
+	id := extractConvID(map[string]any{
+		"user": "user_abc_account__session_01234567-89ab-cdef-0123-456789abcdef",
+	})
+	if !strings.HasPrefix(id, "session_") {
+		t.Fatalf("expected session_… conv id, got %q", id)
+	}
+	// prompt_cache_key still wins when present.
+	id2 := extractConvID(map[string]any{
+		"prompt_cache_key": "pck-stable",
+		"user":             "user_x__session_deadbeef-0000-0000-0000-000000000000",
+	})
+	if id2 != "pck-stable" {
+		t.Fatalf("pck should win: %q", id2)
+	}
+	// metadata.user_id path (pre-sanitize).
+	id3 := extractConvID(map[string]any{
+		"metadata": map[string]any{
+			"user_id": "user_y__session_aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+		},
+	})
+	if !strings.HasPrefix(id3, "session_") {
+		t.Fatalf("metadata session: %q", id3)
+	}
+}

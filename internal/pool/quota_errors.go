@@ -162,9 +162,9 @@ func ClassifyUpstreamFailure(status int, errText string, requestedModel ...strin
 	// Status is often rewritten to 502 by the proxy path; body text must win over
 	// bare 5xx classification.
 	if isEmptyModelOutputText(low) || isEmptyModelOutputCode(codeFromJSON) {
-		// Default 10 minutes — visible in admin chips; self-heals without manual unblock.
+		// Default 4 minutes — long enough for admin chips, short enough that empty-storms do not shrink the pool.
 		// Override via GROK2API_EMPTY_OUTPUT_BLOCK_SEC (30–86400).
-		blockSec := 10 * 60
+		blockSec := 4 * 60
 		if v := strings.TrimSpace(os.Getenv("GROK2API_EMPTY_OUTPUT_BLOCK_SEC")); v != "" {
 			if n, err := strconv.Atoi(v); err == nil && n >= 30 && n <= 24*3600 {
 				blockSec = n
@@ -199,15 +199,27 @@ func ClassifyUpstreamFailure(status int, errText string, requestedModel ...strin
 		}
 	}
 
-	// Auth — short cool so we don't hot-loop a bad token before refresh.
-	if status == http.StatusUnauthorized || status == http.StatusForbidden || isAuthText(low) {
-		until := time.Now().Add(5 * time.Minute)
+	// Auth / WAF / edge block — cool so the picker stops re-using the same token
+	// against a 403 wall (Cloudflare / edge bans heat up with rapid retries).
+	if status == http.StatusUnauthorized || status == http.StatusForbidden || isAuthText(low) || isEdgeBlockText(low) {
+		// 403 / Cloudflare-like: longer cool. 401 token issues: moderate cool.
+		cool := 8 * time.Minute
+		if status == http.StatusUnauthorized && !isEdgeBlockText(low) {
+			cool = 3 * time.Minute
+		} else if status == http.StatusForbidden || isEdgeBlockText(low) {
+			cool = 15 * time.Minute
+		}
+		until := time.Now().Add(cool)
+		reason := "auth error"
+		if status == http.StatusForbidden || isEdgeBlockText(low) {
+			reason = "edge/waf blocked (403)"
+		}
 		return CooldownDecision{
 			Class:          ClassAuth,
 			Code:           string(ClassAuth),
 			Until:          &until,
 			ShouldCooldown: true,
-			Reason:         firstNonEmpty(text, "auth error"),
+			Reason:         firstNonEmpty(text, reason),
 		}
 	}
 
@@ -473,6 +485,29 @@ func isAuthText(low string) bool {
 		strings.Contains(low, "authentication") ||
 		strings.Contains(low, "未授权") ||
 		strings.Contains(low, "鉴权失败")
+}
+
+// isEdgeBlockText detects Cloudflare / reverse-proxy WAF style blocks that often
+// surface as HTTP 403 (or HTML bodies) when a single token is hammered.
+func isEdgeBlockText(low string) bool {
+	if low == "" {
+		return false
+	}
+	return strings.Contains(low, "cloudflare") ||
+		strings.Contains(low, "cf-ray") ||
+		strings.Contains(low, "cf-mitigated") ||
+		strings.Contains(low, "attention required") ||
+		strings.Contains(low, "just a moment") ||
+		strings.Contains(low, "access denied") ||
+		strings.Contains(low, "request blocked") ||
+		strings.Contains(low, "web application firewall") ||
+		strings.Contains(low, "waf") ||
+		strings.Contains(low, "captcha") && strings.Contains(low, "challenge") ||
+		strings.Contains(low, "error 1015") || // CF rate limited
+		strings.Contains(low, "error 1020") || // CF access denied
+		strings.Contains(low, "error 1006") ||
+		strings.Contains(low, "403 forbidden") ||
+		strings.Contains(low, "http 403")
 }
 
 func freeUsageCooldownDuration(low string) time.Duration {

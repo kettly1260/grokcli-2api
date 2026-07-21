@@ -112,6 +112,9 @@ type StreamOpen struct {
 type StreamStats struct {
 	Usage        any
 	FirstTokenMS int // 0 if never observed
+	// CompletionHint approximates output tokens from streamed content/tools when
+	// upstream omits the final usage frame (admin would otherwise show completion=0).
+	CompletionHint int
 }
 
 func DecodeChatRequest(reader io.Reader) (ChatRequest, error) {
@@ -143,7 +146,8 @@ func (s *ChatService) CompleteWithResult(ctx context.Context, request ChatReques
 		return ChatResult{}, err
 	}
 	accounts := upstreamAccounts(chain)
-	body, prep := PrepareUpstreamBodyDetailed(request.Raw, request.UserAgent)
+		body, prep := PrepareUpstreamBodyDetailed(request.Raw, request.UserAgent)
+	ensureUpstreamCacheKey(body, request)
 	fingerprint := ChatFingerprint(request)
 	// Prefer account already boosted to chain[0] by prepareChain/ensureStickyCandidate.
 	// Avoid a second Redis GET on the TTFT hot path.
@@ -157,6 +161,12 @@ func (s *ChatService) CompleteWithResult(ctx context.Context, request ChatReques
 	}
 	var lastEmpty error
 	lastFailAccountID := ""
+	stickyFirst := s.StickyFirstOnly
+	if !stickyFirst {
+		stickyFirst = prefer != "" && first != "" && prefer == first && len(accounts) > 1
+	}
+	// stickyMissID defers pin clear until a later account actually succeeds.
+	stickyMissID := ""
 	for i, account := range accounts {
 		s.markAttempt(ctx, account.ID)
 		attempt, err := OpenWithFailover(ctx, client, []grok.Account{account}, model, body, &CommitState{})
@@ -165,6 +175,9 @@ func (s *ChatService) CompleteWithResult(ctx context.Context, request ChatReques
 			// enter the cooldown pool even when a later account succeeds.
 			s.reportAccountFailure(account.ID, model, err)
 			lastFailAccountID = account.ID
+			if stickyFirst && i == 0 && shouldDropStickyPin(err) {
+				stickyMissID = account.ID
+			}
 			// Retryable/non-retryable both continue within short chain until exhausted.
 			if i == len(accounts)-1 {
 				s.releaseChain(ctx, chain)
@@ -186,12 +199,12 @@ func (s *ChatService) CompleteWithResult(ctx context.Context, request ChatReques
 		}
 		if !collector.emptyModelOutput() {
 			s.releaseChainExcept(ctx, chain, attempt.Account.ID)
-			// Failover accounts must NOT steal the sticky pin — otherwise multi-turn
-			// cannot return to the cache-warm primary after cooldown ends.
 			failover := first != "" && attempt.Account.ID != first
-			// Only skip rebinding when we failed over away from an EXISTING sticky pin.
-			// Always pin the account that produced a live response so multi-turn
-			// prompt-cache stays on the healthy account after sticky failover.
+			// Only drop sticky pin once we know a different account produced live output.
+			if failover && stickyMissID != "" {
+				s.noteStickyOutcome(ctx, request, stickyMissID, false)
+			}
+			// Always pin the live account so multi-turn cache stays on the healthy row.
 			s.bindAffinity(ctx, request, attempt.Account.ID)
 			return ChatResult{
 				Payload: collector.response(), AccountID: attempt.Account.ID, Model: collector.model, Usage: collector.usage,
@@ -202,6 +215,9 @@ func (s *ChatService) CompleteWithResult(ctx context.Context, request ChatReques
 		lastEmpty = &grok.UpstreamError{Status: 502, Body: "Upstream returned HTTP 200 with empty model output (no content/tool_calls)"}
 		s.reportAccountFailure(attempt.Account.ID, model, lastEmpty)
 		lastFailAccountID = attempt.Account.ID
+		if stickyFirst && i == 0 {
+			stickyMissID = account.ID
+		}
 	}
 	s.releaseChain(ctx, chain)
 	if lastEmpty == nil {
@@ -233,7 +249,8 @@ func (s *ChatService) OpenStreamWithResult(ctx context.Context, request ChatRequ
 		return StreamOpen{}, err
 	}
 	accounts := upstreamAccounts(chain)
-	body, prep := PrepareUpstreamBodyDetailed(request.Raw, request.UserAgent)
+		body, prep := PrepareUpstreamBodyDetailed(request.Raw, request.UserAgent)
+	ensureUpstreamCacheKey(body, request)
 	fingerprint := ChatFingerprint(request)
 	// Prefer account already boosted to chain[0] by prepareChain/ensureStickyCandidate.
 	// Avoid a second Redis GET on the TTFT hot path.
@@ -278,6 +295,26 @@ func (s *ChatService) OpenStreamWithResult(ctx context.Context, request ChatRequ
 			s.reportAccountFailure(attempt.Account.ID, model, emptyErr)
 			return StreamOpen{PreferAccount: prefer, FirstAccount: first, Fingerprint: fingerprint, Accounts: len(chain), Prep: prep, AccountID: attempt.Account.ID}, false, emptyErr
 		}
+		// Silence-pass may still hollow-end empty (Claude high-effort). Confirm briefly
+		// before binding sticky / returning live to streamAnthropic.
+		guarded, empty, err = confirmStreamNotEmpty(guarded)
+		if err != nil {
+			if guarded != nil {
+				_ = guarded.Close()
+			}
+			s.reportAccountFailure(attempt.Account.ID, model, err)
+			s.releasePick(ctx, account.ID)
+			return StreamOpen{PreferAccount: prefer, FirstAccount: first, Fingerprint: fingerprint, Accounts: len(chain), Prep: prep, AccountID: attempt.Account.ID}, false, err
+		}
+		if empty {
+			if guarded != nil {
+				_ = guarded.Close()
+			}
+			s.releasePick(ctx, account.ID)
+			emptyErr := &grok.UpstreamError{Status: 502, Body: "Upstream returned HTTP 200 with empty model output (no content/tool_calls)"}
+			s.reportAccountFailure(attempt.Account.ID, model, emptyErr)
+			return StreamOpen{PreferAccount: prefer, FirstAccount: first, Fingerprint: fingerprint, Accounts: len(chain), Prep: prep, AccountID: attempt.Account.ID}, false, emptyErr
+		}
 		failover := first != "" && attempt.Account.ID != first
 		// Always pin the live stream account (rebind after sticky failover).
 		s.bindAffinity(ctx, request, attempt.Account.ID)
@@ -288,23 +325,28 @@ func (s *ChatService) OpenStreamWithResult(ctx context.Context, request ChatRequ
 		}, true, nil
 	}
 
-	// Phase 1: sticky / first account alone (preserves prompt cache warmth).
+	// Phase 1: top account alone (preserves sticky prompt-cache warmth when pinned).
+	// Always race the remainder after first miss — sequential openOne over the full
+	// chain made empty storms take tens of seconds before client 502.
 	primary := accounts
 	rest := []grok.Account(nil)
-	if stickyFirst && len(accounts) > 1 {
+	if len(accounts) > 1 {
 		primary = accounts[:1]
 		rest = accounts[1:]
 	}
+	// stickyMissID: sticky/primary that failed. We defer clearStickyPins until a
+	// failover winner is confirmed. Clearing early then losing the race left the
+	// conversation with NO pin → next turn cold-picks a random account (intermittent
+	// cache miss under empty/timeout storms).
+	stickyMissID := ""
 	for _, account := range primary {
 		opened, ok, err := openOne(account)
 		if ok {
 			s.releaseChainExcept(ctx, chain, opened.AccountID)
 			return opened, nil
 		}
-		// Sticky primary missed — drop the pin so the failover winner (and next
-		// turn) does not keep routing to a dead/cooling account.
-		if stickyFirst {
-			s.noteStickyOutcome(ctx, request, account.ID, false)
+		if stickyFirst && shouldDropStickyPin(err) {
+			stickyMissID = account.ID
 		}
 		if err != nil {
 			// Prefer the concrete failing account id so open-failure paths still
@@ -318,8 +360,8 @@ func (s *ChatService) OpenStreamWithResult(ctx context.Context, request ChatRequ
 				lastEmpty = err
 				continue
 			}
-			// Non-empty errors: still try rest if sticky-first; else fall through.
-			if !(stickyFirst && len(rest) > 0) {
+			// Always try remaining accounts (parallel phase) before failing the request.
+			if len(rest) == 0 {
 				s.releaseChain(ctx, chain)
 				if lastEmpty != nil {
 					return meta, lastEmpty
@@ -334,24 +376,27 @@ func (s *ChatService) OpenStreamWithResult(ctx context.Context, request ChatRequ
 	// Race dials; first non-empty stream wins. Others are closed immediately.
 	// Caps concurrency to keep upstream load bounded (default chain is 4).
 	if len(rest) == 0 {
-		rest = nil
-		// If stickyFirst was false we already tried all in primary.
-		if !(stickyFirst && len(accounts) > 1) {
-			s.releaseChain(ctx, chain)
-			if lastEmpty == nil {
-				lastEmpty = &grok.UpstreamError{Status: 502, Body: "Upstream returned HTTP 200 with empty model output (no content/tool_calls)"}
-			}
-			return StreamOpen{PreferAccount: prefer, FirstAccount: first, Fingerprint: fingerprint, Accounts: len(chain), Prep: prep, Failover: true}, lastEmpty
+		s.releaseChain(ctx, chain)
+		if lastEmpty == nil {
+			lastEmpty = &grok.UpstreamError{Status: 502, Body: "Upstream returned HTTP 200 with empty model output (no content/tool_calls)"}
 		}
+		return StreamOpen{PreferAccount: prefer, FirstAccount: first, Fingerprint: fingerprint, Accounts: len(chain), Prep: prep, Failover: true}, lastEmpty
 	}
 	if len(rest) > 0 {
 		opened, err := s.parallelFirstByteOpen(ctx, rest, client, model, body, chain, prefer, first, fingerprint, prep, request)
 		if err == nil {
+			// Confirmed failover winner — drop the dead sticky pin only now.
+			if stickyMissID != "" {
+				s.noteStickyOutcome(ctx, request, stickyMissID, false)
+				// parallelFirstByteOpen already bindAffinity'd the winner.
+			}
 			return opened, nil
 		}
 		if lastEmpty == nil {
 			lastEmpty = err
 		}
+		// All failover failed: KEEP original sticky pin so a transient storm does not
+		// permanently orphan the conversation onto a random cold account next turn.
 	}
 
 	s.releaseChain(ctx, chain)
@@ -388,8 +433,8 @@ func (s *ChatService) parallelFirstByteOpen(
 	if s != nil && s.FirstByteProbeWorkers > 0 {
 		maxWorkers = s.FirstByteProbeWorkers
 	}
-	if maxWorkers > 8 {
-		maxWorkers = 8
+	if maxWorkers > 5 {
+		maxWorkers = 5
 	}
 	if maxWorkers < 1 {
 		maxWorkers = 1
@@ -441,6 +486,34 @@ func (s *ChatService) parallelFirstByteOpen(
 			}
 			if empty {
 				_ = guarded.Close()
+				emptyErr := &grok.UpstreamError{Status: 502, Body: "Upstream returned HTTP 200 with empty model output (no content/tool_calls)"}
+				s.reportAccountFailure(account.ID, model, emptyErr)
+				s.releasePick(ctx, account.ID)
+				select {
+				case ch <- raced{err: emptyErr, idx: i}:
+				case <-ctx.Done():
+				}
+				return
+			}
+			// Match sticky openOne: silence-pass may still hollow-end empty
+			// (Claude high-effort). Confirm before racing this body as a winner.
+			guarded, empty, err = confirmStreamNotEmpty(guarded)
+			if err != nil {
+				if guarded != nil {
+					_ = guarded.Close()
+				}
+				s.reportAccountFailure(account.ID, model, err)
+				s.releasePick(ctx, account.ID)
+				select {
+				case ch <- raced{err: err, idx: i}:
+				case <-ctx.Done():
+				}
+				return
+			}
+			if empty {
+				if guarded != nil {
+					_ = guarded.Close()
+				}
 				emptyErr := &grok.UpstreamError{Status: 502, Body: "Upstream returned HTTP 200 with empty model output (no content/tool_calls)"}
 				s.reportAccountFailure(account.ID, model, emptyErr)
 				s.releasePick(ctx, account.ID)
@@ -564,7 +637,7 @@ func (s *ChatService) prepare(ctx context.Context, request ChatRequest, candidat
 }
 
 // defaultFailoverChain matches Python MAX_FAILOVER_ATTEMPTS (short sticky-friendly chain).
-const defaultFailoverChain = 6
+const defaultFailoverChain = 12
 
 func (s *ChatService) prepareChain(ctx context.Context, request ChatRequest, candidates []pool.Candidate, mode string) (string, []pool.Candidate, *grok.Client, error) {
 	model := s.resolveModel(request)
@@ -1503,7 +1576,14 @@ func parseChatDelta(data []byte) (ChatDelta, error) {
 	if created, ok := numberToInt64(payload["created"]); ok {
 		delta.Created = created
 	}
-	delta.Usage = payload["usage"]
+	// Prefer top-level usage; some relays nest under response.usage on hybrid frames.
+	if u := payload["usage"]; u != nil {
+		delta.Usage = u
+	} else if resp, _ := payload["response"].(map[string]any); resp != nil {
+		if u := resp["usage"]; u != nil {
+			delta.Usage = u
+		}
+	}
 	choices, _ := payload["choices"].([]any)
 	for _, item := range choices {
 		choice, _ := item.(map[string]any)
@@ -1511,12 +1591,15 @@ func parseChatDelta(data []byte) (ChatDelta, error) {
 			delta.FinishReason = reason
 		}
 		if itemDelta, _ := choice["delta"].(map[string]any); itemDelta != nil {
-			if text, _ := itemDelta["content"].(string); text != "" {
-				delta.Content += text
+			delta.Content += contentTextFromAny(itemDelta["content"])
+			if t := rawString(itemDelta["text"]); t != "" {
+				delta.Content += t
 			}
 			if text := rawString(itemDelta["reasoning_content"]); text != "" {
 				delta.Reasoning += text
 			} else if text := rawString(itemDelta["reasoning"]); text != "" {
+				delta.Reasoning += text
+			} else if text := contentTextFromAny(itemDelta["reasoning_content"]); text != "" {
 				delta.Reasoning += text
 			}
 			if calls := toolCallsFromAny(itemDelta["tool_calls"]); len(calls) > 0 {
@@ -1527,12 +1610,12 @@ func parseChatDelta(data []byte) (ChatDelta, error) {
 			}
 		}
 		if message, _ := choice["message"].(map[string]any); message != nil {
-			if text, _ := message["content"].(string); text != "" {
-				delta.Content += text
-			}
+			delta.Content += contentTextFromAny(message["content"])
 			if text := rawString(message["reasoning_content"]); text != "" {
 				delta.Reasoning += text
 			} else if text := rawString(message["reasoning"]); text != "" {
+				delta.Reasoning += text
+			} else if text := contentTextFromAny(message["reasoning_content"]); text != "" {
 				delta.Reasoning += text
 			}
 			if calls := toolCallsFromAny(message["tool_calls"]); len(calls) > 0 {
@@ -1544,6 +1627,46 @@ func parseChatDelta(data []byte) (ChatDelta, error) {
 		}
 	}
 	return delta, nil
+}
+
+// contentTextFromAny extracts visible text from OpenAI content that may be a
+// plain string or an array of {type,text} / {type:output_text,text} parts.
+// Without this, multi-part content frames never reach usage estimation and the
+// admin shows completion_tokens=0/1 for real multi-part streams.
+func contentTextFromAny(value any) string {
+	switch v := value.(type) {
+	case string:
+		return v
+	case []any:
+		var b strings.Builder
+		for _, part := range v {
+			switch p := part.(type) {
+			case string:
+				b.WriteString(p)
+			case map[string]any:
+				if t := rawString(p["text"]); t != "" {
+					b.WriteString(t)
+					continue
+				}
+				if t := rawString(p["content"]); t != "" {
+					b.WriteString(t)
+					continue
+				}
+				// Nested content arrays (rare).
+				if nested := contentTextFromAny(p["content"]); nested != "" {
+					b.WriteString(nested)
+				}
+			}
+		}
+		return b.String()
+	case map[string]any:
+		if t := rawString(v["text"]); t != "" {
+			return t
+		}
+		return contentTextFromAny(v["content"])
+	default:
+		return ""
+	}
 }
 
 func toolCallsFromAny(value any) []map[string]any {
@@ -1654,6 +1777,58 @@ func (s *ChatService) clearStickyPins(ctx context.Context, request ChatRequest) 
 	}
 }
 
+
+// shouldDropStickyPin reports whether a sticky-primary open failure is durable
+// enough to abandon the multi-turn pin. Transient network/timeouts keep the pin
+// so the next turn can retry the cache-warm account (avoids intermittent cache
+// miss after brief upstream blips). Empty/auth/quota failures drop the pin so
+// the failover winner can own the conversation.
+func shouldDropStickyPin(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	// Empty HTTP 200 / hollow stream: account+model is soft-blocked; hop.
+	if strings.Contains(msg, "empty model output") ||
+		strings.Contains(msg, "no content/tool_calls") ||
+		strings.Contains(msg, "empty_upstream") {
+		return true
+	}
+	// Transient transport — keep sticky.
+	for _, needle := range []string{
+		"timeout", "deadline exceeded", "i/o timeout",
+		"connection reset", "connection refused", "broken pipe",
+		"temporary", "temporar", "eof", "unexpected eof",
+		"tls handshake", "no such host", "network is unreachable",
+	} {
+		if strings.Contains(msg, needle) {
+			return false
+		}
+	}
+	var ue *grok.UpstreamError
+	if errors.As(err, &ue) && ue != nil {
+		// Auth / forbidden / free-usage style → drop pin.
+		if ue.Status == 401 || ue.Status == 403 {
+			return true
+		}
+		body := strings.ToLower(ue.Body)
+		if strings.Contains(body, "empty model output") ||
+			strings.Contains(body, "no content/tool_calls") ||
+			strings.Contains(body, "quota") ||
+			strings.Contains(body, "额度") ||
+			strings.Contains(body, "rate limit") ||
+			strings.Contains(body, "too many requests") {
+			return true
+		}
+		// 5xx / 0 often transient on sticky primary under load.
+		if ue.Status == 0 || ue.Status >= 500 {
+			return false
+		}
+	}
+	// Default: drop so a hard failure cannot sticky-loop forever.
+	return true
+}
+
 // noteStickyOutcome clears sticky pins when the sticky primary fails so the
 // failover winner can be rebound and subsequent turns keep cache warmth.
 func (s *ChatService) noteStickyOutcome(ctx context.Context, request ChatRequest, triedID string, success bool) {
@@ -1739,8 +1914,9 @@ func (s *ChatService) bindAffinity(ctx context.Context, request ChatRequest, acc
 	if fingerprint == "" {
 		return
 	}
-	// Avoid binding ephemeral previous_response_id / messages-hash as primary sticky.
-	if strings.Contains(fingerprint, ":previous_response_id:") || strings.Contains(fingerprint, ":messages:") {
+	// Avoid binding ephemeral previous_response_id as primary sticky (changes every turn).
+	// Seed fingerprints ARE stable and must bind — OpenAI chat without pck relies on them.
+	if strings.Contains(fingerprint, ":previous_response_id:") {
 		return
 	}
 	_ = s.AffinityStore.BindAffinity(ctxOrBackground(ctx), fingerprint, accountID)
@@ -1752,6 +1928,32 @@ func upstreamAccounts(chain []pool.Candidate) []grok.Account {
 		accounts = append(accounts, candidate.UpstreamAccount())
 	}
 	return accounts
+}
+
+
+// ensureUpstreamCacheKey guarantees body.prompt_cache_key survives Stabilize/Sanitize
+// so cli-chat-proxy /responses receives the same key that affinity used. Without this,
+// intermittent strip/empty pck makes x-grok-conv-id empty and cache hits go cold.
+func ensureUpstreamCacheKey(body map[string]any, request ChatRequest) {
+	if body == nil {
+		return
+	}
+	if raw, _ := body["prompt_cache_key"].(string); strings.TrimSpace(raw) != "" {
+		return
+	}
+	// Prefer request-level pck (Claude session / OpenAI mint).
+	if request.Raw != nil {
+		if pck, _ := request.Raw["prompt_cache_key"].(string); strings.TrimSpace(pck) != "" {
+			body["prompt_cache_key"] = strings.TrimSpace(pck)
+			return
+		}
+	}
+	// Last resort: derive from Claude Code user field if present on body.
+	if user, _ := body["user"].(string); strings.TrimSpace(user) != "" {
+		if sid := anthropic.ExtractClaudeCodeSessionID(user); sid != "" {
+			body["prompt_cache_key"] = sid
+		}
+	}
 }
 
 func ChatFingerprint(request ChatRequest) string {
@@ -1766,24 +1968,47 @@ func ChatFingerprint(request ChatRequest) string {
 			return "chat:" + strings.TrimSpace(request.Model) + ":" + key + ":" + strings.TrimSpace(value)
 		}
 	}
-	// Nested metadata (Anthropic / some relays).
+	// Nested metadata (Anthropic / some relays). Skip bare user_id when it is only a
+	// global user id (no session_ marker) — shared across unrelated chats and would
+	// pin unrelated conversations onto one account.
 	if meta, _ := request.Raw["metadata"].(map[string]any); meta != nil {
-		for _, key := range []string{"prompt_cache_key", "session_id", "sessionId", "thread_id", "conversation_id", "user_id"} {
+		for _, key := range []string{"prompt_cache_key", "session_id", "sessionId", "thread_id", "conversation_id"} {
 			if value, _ := meta[key].(string); strings.TrimSpace(value) != "" {
 				return "chat:" + strings.TrimSpace(request.Model) + ":meta:" + key + ":" + strings.TrimSpace(value)
 			}
 		}
+		if uid, _ := meta["user_id"].(string); strings.TrimSpace(uid) != "" {
+			if sid := anthropic.ExtractClaudeCodeSessionID(uid); sid != "" {
+				return "chat:" + strings.TrimSpace(request.Model) + ":meta:session_id:" + sid
+			}
+		}
 	}
-	messages, ok := request.Raw["messages"].([]any)
-	if !ok || len(messages) == 0 {
+	// Stable conversation seed (system prefix + first user message). Full messages
+	// hash changes every turn and was the main OpenAI multi-turn cache-miss path:
+	// new fingerprint → no sticky pin → random account → upstream prefix cold.
+	if seed := stableConversationSeed(request.Raw); seed != "" {
+		return "chat:" + strings.TrimSpace(request.Model) + ":seed:" + seed
+	}
+	return ""
+}
+
+// stableConversationSeed mirrors anthropic.ExtractPromptCacheKey's seed path so
+// OpenAI chat without an explicit prompt_cache_key still gets a multi-turn-stable
+// affinity key. Tools are intentionally excluded (clients mutate tool lists).
+func stableConversationSeed(raw map[string]any) string {
+	if raw == nil {
 		return ""
 	}
-	encoded, err := json.Marshal(messages)
-	if err != nil || len(encoded) == 0 {
-		return ""
+	// Prefer the shared extractor (session metadata + first-user seed).
+	if pck := strings.TrimSpace(anthropic.ExtractPromptCacheKey(raw)); pck != "" {
+		// Avoid double-prefixing when extractor already returned sess:/session_ ids.
+		if strings.HasPrefix(pck, "sess:") {
+			return strings.TrimPrefix(pck, "sess:")
+		}
+		sum := sha256.Sum256([]byte(pck))
+		return hex.EncodeToString(sum[:16])
 	}
-	sum := sha256.Sum256(encoded)
-	return "chat:" + strings.TrimSpace(request.Model) + ":messages:" + hex.EncodeToString(sum[:16])
+	return ""
 }
 
 // ChatFingerprintFromHeaders picks sticky keys from common client/proxy headers
@@ -1899,7 +2124,12 @@ const emptyStreamNoDataBudget = 120 * time.Millisecond
 // empty deltas then [DONE]. Waiting here (before Anthropic message_start) lets
 // OpenStream failover. Healthy high-effort first tokens usually arrive within
 // this window; if not, we pass live and the stream continues (slow TTFT).
-const emptyStreamAbsBudget = 15 * time.Second
+const emptyStreamAbsBudget = 8 * time.Second
+
+// emptyStreamConfirmBudget: after silence-pass (slow TTFT path), keep peeking a bit
+// longer for hollow-then-DONE before declaring the stream live. High-effort Claude
+// often sits silent then ends empty; returning live too early causes mid-stream 502.
+const emptyStreamConfirmBudget = 4 * time.Second
 
 // emptyStreamHollowBudget: once hollow frames arrive, prefer resolving empty vs
 // live within this sub-window (still capped by absBudget). Instant hollow+[DONE]
@@ -2056,7 +2286,111 @@ func guardStreamAgainstEmpty(body io.ReadCloser) (io.ReadCloser, bool, error) {
 			_ = pumped.Close()
 			return io.NopCloser(strings.NewReader(result.buffered)), true, nil
 		}
-		// Still no terminal signal after absBudget → live (very slow first token).
+		// Hollow drips for the whole abs window with no model payload: treat as
+		// empty even without [DONE]. Passing these live was the main remaining
+		// anthropic empty-output path (p50 ~7s hollow then client 502).
+		if result.sawHollow && !result.sawModel {
+			_ = pumped.Close()
+			return io.NopCloser(strings.NewReader(result.buffered)), true, nil
+		}
+		// Pure silence for absBudget → live (very slow high-effort first token).
+		return finishLive(result.buffered), false, nil
+	}
+}
+
+// confirmStreamNotEmpty extends a silence-passed live stream with a short second
+// peek. If the stream ends hollow within confirmBudget, treat as empty so OpenStream
+// can failover before HTTP headers / message_start.
+func confirmStreamNotEmpty(body io.ReadCloser) (io.ReadCloser, bool, error) {
+	if body == nil {
+		return nil, true, &grok.UpstreamError{Status: 502, Body: "Upstream returned HTTP 200 with empty model output (no content/tool_calls)"}
+	}
+	// If already a multiClose/pumped stream from guard, still safe to re-wrap.
+	pumped, ok := body.(*multiClose)
+	_ = pumped
+	_ = ok
+	// Use peeker on whatever reader we got.
+	// Re-buffer via new pumped stream if possible.
+	var underlying io.ReadCloser = body
+	ps := newPumpedStream(underlying)
+
+	type peekResult struct {
+		sawModel  bool
+		sawDone   bool
+		sawHollow bool
+		buffered  string
+		err       error
+	}
+	stopPeek := make(chan struct{})
+	var stopOnce sync.Once
+	requestStop := func() { stopOnce.Do(func() { close(stopPeek) }) }
+	resultCh := make(chan peekResult, 1)
+	go func() {
+		var buffered strings.Builder
+		sawModel, sawDone, sawHollow := false, false, false
+		src := &peekerReader{p: ps, stop: stopPeek}
+		err := grok.ReadSSE(io.TeeReader(src, &buffered), func(event grok.Event) error {
+			if event.Done {
+				sawDone = true
+				return errStopPeek
+			}
+			delta, parseErr := parseChatDelta(event.Data)
+			if parseErr != nil {
+				sawHollow = true
+				return nil
+			}
+			if strings.TrimSpace(delta.Content) != "" ||
+				strings.TrimSpace(delta.Reasoning) != "" ||
+				len(delta.ToolCalls) > 0 ||
+				delta.FunctionCall != nil {
+				sawModel = true
+				return errStopPeek
+			}
+			sawHollow = true
+			return nil
+		})
+		if err != nil && !errors.Is(err, errStopPeek) {
+			resultCh <- peekResult{err: err}
+			return
+		}
+		resultCh <- peekResult{sawModel: sawModel, sawDone: sawDone, sawHollow: sawHollow, buffered: buffered.String()}
+	}()
+	finishLive := func(buffered string) io.ReadCloser {
+		return &multiClose{Reader: io.MultiReader(strings.NewReader(buffered), ps), closer: ps}
+	}
+	select {
+	case result := <-resultCh:
+		if result.err != nil {
+			_ = ps.Close()
+			return nil, false, result.err
+		}
+		if result.sawModel {
+			return finishLive(result.buffered), false, nil
+		}
+		if result.sawDone && !result.sawModel {
+			_ = ps.Close()
+			return io.NopCloser(strings.NewReader(result.buffered)), true, nil
+		}
+		if result.sawHollow && !result.sawModel {
+			_ = ps.Close()
+			return io.NopCloser(strings.NewReader(result.buffered)), true, nil
+		}
+		return finishLive(result.buffered), false, nil
+	case <-time.After(emptyStreamConfirmBudget):
+		requestStop()
+		result := <-resultCh
+		if result.err != nil {
+			_ = ps.Close()
+			return nil, false, result.err
+		}
+		if result.sawModel {
+			return finishLive(result.buffered), false, nil
+		}
+		if (result.sawDone || result.sawHollow) && !result.sawModel {
+			_ = ps.Close()
+			return io.NopCloser(strings.NewReader(result.buffered)), true, nil
+		}
+		// Still pure silence — likely slow high-effort thinking; pass live.
 		return finishLive(result.buffered), false, nil
 	}
 }

@@ -244,6 +244,47 @@
     </div>
 
     <div class="g2a-subpanel" data-section="pool" id="panel-pool" hidden>
+<section class="g2a-card" id="sec-version">
+  <div class="g2a-card-head">
+    <div>
+      <h3>版本与热更新</h3>
+      <p>对照 GitHub Release / GHCR 最新版本；在<strong>容器内</strong>一键 pull 并 force-recreate（无需宿主机 watcher）。</p>
+    </div>
+    <span id="version-pill" class="g2a-tag">—</span>
+  </div>
+  <div class="g2a-form-grid" style="display:grid;gap:12px;max-width:720px">
+    <div class="g2a-field">
+      <label>当前版本</label>
+      <div class="mono" id="ver-current">—</div>
+    </div>
+    <div class="g2a-field">
+      <label>最新版本</label>
+      <div class="mono" id="ver-latest">—</div>
+      <div class="g2a-muted" style="margin-top:4px" id="ver-release-name"></div>
+    </div>
+    <div class="g2a-field" style="grid-column:1/-1">
+      <label>更新说明</label>
+      <pre id="ver-notes" class="g2a-muted" style="white-space:pre-wrap;max-height:160px;overflow:auto;margin:0;font-size:12px">—</pre>
+    </div>
+    <div class="g2a-field" style="grid-column:1/-1">
+      <label>热更新状态</label>
+      <div id="ver-update-status" class="g2a-muted">—</div>
+      <div class="g2a-muted" style="margin-top:4px" id="ver-update-hint"></div>
+    </div>
+    <div class="g2a-actions" style="grid-column:1/-1;display:flex;flex-wrap:wrap;gap:8px;align-items:center">
+      <button type="button" class="g2a-btn g2a-btn-default" id="btn-version-check">检查更新</button>
+      <button type="button" class="g2a-btn g2a-btn-primary" id="btn-version-update" disabled>热更新并重启</button>
+      <button type="button" class="g2a-btn g2a-btn-default" id="btn-version-restart" title="不强制换版本号时，仍走容器内 recreate">仅重启服务</button>
+      <a id="ver-release-link" href="#" target="_blank" rel="noopener" class="g2a-muted" style="margin-left:4px;display:none">查看 Release</a>
+    </div>
+    <div class="g2a-muted" style="grid-column:1/-1;font-size:12px">
+      容器内热更新：挂载 <code>/var/run/docker.sock</code> + 项目目录到 <code>/compose</code> 后，点击「热更新」会在容器内
+      <code>docker pull</code> 目标 GHCR 镜像并 <code>compose up -d --force-recreate</code>。
+      不再依赖宿主机 <code>g2a-update-watcher</code>。
+    </div>
+  </div>
+</section>
+
 <section id="sec-pool" class="g2a-card">
   <div class="g2a-card-head">
     <div>
@@ -649,6 +690,6 @@
   <script src="/static/dist/api.443dfc63c0.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
   <script src="/static/dist/state.5846ce62e4.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
   <script src="/static/dist/auth.539061a1a7.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
-  <script src="/static/dist/core.97a3c54337.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
+  <script src="/static/dist/core.cfc11b8162.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
 </body>
 </html>
