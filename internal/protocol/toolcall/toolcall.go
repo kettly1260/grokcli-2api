@@ -1070,6 +1070,13 @@ func sanitizeShellDialectArtifacts(s string) string {
 	if s == "" {
 		return s
 	}
+	// Recover a live Grok/Codex corruption where every Windows path separator
+	// gains a literal "t" and only a quoted executable's closing quote survives.
+	// This is deliberately PowerShell-only and strongly gated inside the helper;
+	// legitimate paths such as C:\temp\tools\test.exe must remain unchanged.
+	s = repairMangledWindowsPathsForPS(s)
+	s = repairMangledPSExecutablePrefix(s)
+	s = repairJSONStylePSArrayPipeline(s)
 	// FIRST: rewrite python -c with bash quote-glue into a PS-safe form.
 	// Blind glue strip turns:
 	//   python -c 'p=Path(r'\''x'\'')'
@@ -1112,6 +1119,159 @@ func sanitizeShellDialectArtifacts(s string) string {
 	}
 	s = stripFakePSArrayJoinPrefix(s)
 	return s
+}
+
+// repairMangledWindowsPathsForPS repairs the captured client-facing shape:
+//
+//	C:\tUsers\tYING\t.cache\t...\tnode.exe" '.\t.tmp\tscript.js'
+//
+// into valid PowerShell:
+//
+//	& 'C:\Users\YING\.cache\...\node.exe' '.\.tmp\script.js'
+//
+// Activation requires at least three literal backslash-t separators plus a
+// drive-root corruption whose first real segment starts uppercase or dot. That
+// avoids changing legitimate paths such as C:\temp\tools\test.exe.
+func repairMangledWindowsPathsForPS(s string) string {
+	if strings.Count(s, `\t`) < 3 || !hasMangledWindowsDriveRoot(s) {
+		return s
+	}
+
+	var b strings.Builder
+	b.Grow(len(s))
+	for i := 0; i < len(s); i++ {
+		if s[i] == '\\' && i+2 < len(s) && s[i+1] == 't' && isLikelyWindowsPathSegmentStart(s[i+2]) {
+			b.WriteByte('\\')
+			i++ // drop the injected literal 't'
+			continue
+		}
+		b.WriteByte(s[i])
+	}
+	return b.String()
+}
+
+func hasMangledWindowsDriveRoot(s string) bool {
+	for i := 0; i+4 < len(s); i++ {
+		if i > 0 && s[i-1] != '$' && s[i-1] != '\'' && s[i-1] != '"' && !isSpace(s[i-1]) {
+			continue
+		}
+		if !((s[i] >= 'A' && s[i] <= 'Z') || (s[i] >= 'a' && s[i] <= 'z')) || s[i+1] != ':' || s[i+2] != '\\' || s[i+3] != 't' {
+			continue
+		}
+		next := s[i+4]
+		if (next >= 'A' && next <= 'Z') || next == '.' {
+			return true
+		}
+	}
+	return false
+}
+
+func isLikelyWindowsPathSegmentStart(c byte) bool {
+	return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+		(c >= '0' && c <= '9') || c == '.' || c == '_' || c == '-'
+}
+
+func repairMangledPSExecutablePrefix(s string) string {
+	trimmed := strings.TrimSpace(s)
+	if len(trimmed) < 6 {
+		return s
+	}
+
+	pathStart := -1
+	switch {
+	case trimmed[0] == '$' && len(trimmed) > 3 && trimmed[2] == ':' && trimmed[3] == '\\':
+		pathStart = 1
+	case trimmed[0] == '"' && len(trimmed) > 3 && trimmed[2] == ':' && trimmed[3] == '\\':
+		pathStart = 1
+	case ((trimmed[0] >= 'A' && trimmed[0] <= 'Z') || (trimmed[0] >= 'a' && trimmed[0] <= 'z')) &&
+		len(trimmed) > 2 && trimmed[1] == ':' && trimmed[2] == '\\':
+		pathStart = 0
+	default:
+		return s
+	}
+	closeRel := strings.IndexByte(trimmed[pathStart:], '"')
+	if closeRel < 0 {
+		return s
+	}
+	closeIdx := pathStart + closeRel
+	path := trimmed[pathStart:closeIdx]
+	if !strings.HasSuffix(strings.ToLower(path), ".exe") {
+		return s
+	}
+	rest := strings.TrimLeft(trimmed[closeIdx+1:], " \t")
+	fixed := "& '" + escapePSSingle(path) + "'"
+	if rest != "" {
+		fixed += " " + rest
+	}
+	return fixed
+}
+
+// repairJSONStylePSArrayPipeline converts the common model mistake
+//
+//	[ "a", "b" ] | ForEach-Object { ... }
+//
+// to PowerShell array syntax:
+//
+//	@( "a", "b" ) | ForEach-Object { ... }
+//
+// It only fires when the bracket body is valid JSON containing strings and the
+// next token is a ForEach-Object pipeline, so type accelerators/casts are safe.
+func repairJSONStylePSArrayPipeline(s string) string {
+	trimmed := strings.TrimSpace(s)
+	if len(trimmed) < 4 || trimmed[0] != '[' {
+		return s
+	}
+	depth := 0
+	inString := false
+	escaped := false
+	closeIdx := -1
+	for i := 0; i < len(trimmed); i++ {
+		c := trimmed[i]
+		if inString {
+			if escaped {
+				escaped = false
+				continue
+			}
+			if c == '\\' {
+				escaped = true
+				continue
+			}
+			if c == '"' {
+				inString = false
+			}
+			continue
+		}
+		switch c {
+		case '"':
+			inString = true
+		case '[':
+			depth++
+		case ']':
+			depth--
+			if depth == 0 {
+				closeIdx = i
+				i = len(trimmed)
+			}
+		}
+	}
+	if closeIdx < 0 {
+		return s
+	}
+	rest := strings.TrimSpace(trimmed[closeIdx+1:])
+	lowRest := strings.ToLower(rest)
+	if !strings.HasPrefix(lowRest, "| foreach-object") && !strings.HasPrefix(lowRest, "| %") {
+		return s
+	}
+	var values []any
+	if json.Unmarshal([]byte(trimmed[:closeIdx+1]), &values) != nil || len(values) == 0 {
+		return s
+	}
+	for _, value := range values {
+		if _, ok := value.(string); !ok {
+			return s
+		}
+	}
+	return "@(" + trimmed[1:closeIdx] + ") " + rest
 }
 
 // rewritePythonCBashGlueForPS rewrites short python -c / python3 -c / py -3 -c

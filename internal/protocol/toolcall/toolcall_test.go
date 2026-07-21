@@ -1547,6 +1547,79 @@ func TestSanitizeBashQuoteGlueAndMultiStatement(t *testing.T) {
 	}
 }
 
+func TestProjectShellArgsRepairsMangledWindowsExecutablePath(t *testing.T) {
+	prevR, prevG, prevU, prevW := CodexPowerShellRulesEnabled(), CodexPowerShellGuardEnabled(), CodexPowerShellUnwrapEnabled(), CodexPowerShellWriteSafeEnabled()
+	t.Cleanup(func() { ConfigureCodexShellPolicy(prevR, prevG, prevU, prevW) })
+	ConfigureCodexShellPolicy(false, false, false, false)
+
+	// Captured from Codex Desktop through Grok: every Windows path separator
+	// gained a literal "t" and only the executable path's closing quote survived.
+	// (The leading "$" in the exported UI transcript is the shell prompt marker.)
+	broken := `C:\tUsers\tYING\t.cache\tcodex-runtimes\tcodex-primary-runtime\tdependencies\tnode\tbin\tnode.exe" '.\t.tmp\tanalyze-debug-log.js'`
+	payload, err := json.Marshal(map[string]any{"command": broken})
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := ProjectShellArgsForClient(string(payload), "exec_command", "cmd")
+	var obj map[string]any
+	if err := json.Unmarshal([]byte(out), &obj); err != nil {
+		t.Fatalf("projected JSON: %v (%s)", err, out)
+	}
+	cmd, _ := obj["cmd"].(string)
+	want := `& 'C:\Users\YING\.cache\codex-runtimes\codex-primary-runtime\dependencies\node\bin\node.exe' '.\.tmp\analyze-debug-log.js'`
+	if cmd != want {
+		t.Fatalf("mangled Windows path not repaired:\n got %q\nwant %q", cmd, want)
+	}
+
+	// A legitimate path with several real t-prefixed segments is not the captured
+	// uppercase/dot drive-root corruption and must remain byte-for-byte unchanged.
+	sane := `& 'C:\temp\tools\test.exe' 'C:\tmp\test.js'`
+	payload, err = json.Marshal(map[string]any{"command": sane})
+	if err != nil {
+		t.Fatal(err)
+	}
+	out = ProjectShellArgsForClient(string(payload), "exec_command", "cmd")
+	obj = map[string]any{}
+	if err := json.Unmarshal([]byte(out), &obj); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := obj["cmd"].(string); got != sane {
+		t.Fatalf("legitimate t-prefixed path changed: got %q want %q", got, sane)
+	}
+
+	brokenQuotedExe := `C:\Program Files\PowerShell\7\pwsh.exe" -Command 'Get-Date'`
+	payload, _ = json.Marshal(map[string]any{"command": brokenQuotedExe})
+	out = ProjectShellArgsForClient(string(payload), "exec_command", "cmd")
+	obj = map[string]any{}
+	if err := json.Unmarshal([]byte(out), &obj); err != nil {
+		t.Fatal(err)
+	}
+	wantQuotedExe := `& 'C:\Program Files\PowerShell\7\pwsh.exe' -Command 'Get-Date'`
+	if got, _ := obj["cmd"].(string); got != wantQuotedExe {
+		t.Fatalf("quoted executable prefix not repaired: got %q want %q", got, wantQuotedExe)
+	}
+}
+
+func TestProjectShellArgsRepairsJSONStylePowerShellArray(t *testing.T) {
+	broken := `[ "'.tmp", ".pytest_cache", "logs" ] | ForEach-Object { if (Test-Path -LiteralPath $_) { Remove-Item -LiteralPath $_ -Recurse -Force } }`
+	payload, err := json.Marshal(map[string]any{"command": broken})
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := ProjectShellArgsForClient(string(payload), "exec_command", "cmd")
+	var obj map[string]any
+	if err := json.Unmarshal([]byte(out), &obj); err != nil {
+		t.Fatal(err)
+	}
+	cmd, _ := obj["cmd"].(string)
+	if !strings.HasPrefix(strings.TrimSpace(cmd), `@( "'.tmp", ".pytest_cache", "logs" ) | ForEach-Object`) {
+		t.Fatalf("JSON-style PowerShell array not repaired: %q", cmd)
+	}
+	if strings.HasPrefix(strings.TrimSpace(cmd), "[") {
+		t.Fatalf("broken leading bracket remains: %q", cmd)
+	}
+}
+
 // Linux / bash clients must keep legitimate bash quote-glue. Projection with
 // preferredKey=command (non-Codex) must NOT strip '\”.
 func TestLinuxCLIPreservesBashQuoteGlue(t *testing.T) {
