@@ -6140,6 +6140,23 @@ function readRegConfig() {
     cfmail_api_key: regMailKeys.cfmail || "",
     tempmail_api_key: regMailKeys.tempmail || "",
     captcha_provider: isLocal ? "local" : "yescaptcha",
+    oauth_mode: (function () {
+      const v = $("reg-oauth-mode")
+        ? String($("reg-oauth-mode").value || "auto").trim().toLowerCase()
+        : "auto";
+      const allowed = ["auto", "device", "protocol", "playwright", "browser"];
+      return allowed.includes(v) ? v : "auto";
+    })(),
+    oauth_consent_action_id: (function () {
+      const raw = $("reg-oauth-consent-action-id")
+        ? String($("reg-oauth-consent-action-id").value || "").trim().toLowerCase()
+        : "";
+      if (!raw) return "";
+      let v = raw.replace(/^[\"']+|[\"']+$/g, "").trim();
+      if (v.startsWith("0x")) v = v.slice(2);
+      v = v.replace(/^[\"']+|[\"']+$/g, "").trim();
+      return /^[a-f0-9]{40,44}$/.test(v) ? v : "";
+    })(),
     // Inline local solver is fixed; do not accept/show custom URL.
     local_solver_url: isLocal ? "http://127.0.0.1:5072" : "",
     yescaptcha_key: isLocal
@@ -6309,6 +6326,16 @@ function applyRegConfig(cfg) {
     const provider = String(cfg.captcha_provider || "local").trim().toLowerCase();
     $("reg-captcha-provider").value = provider === "yescaptcha" ? "yescaptcha" : "local";
   }
+  if ($("reg-oauth-mode")) {
+    const m = String(cfg.oauth_mode || "auto").trim().toLowerCase();
+    const allowed = ["auto", "device", "protocol", "playwright", "browser"];
+    $("reg-oauth-mode").value = allowed.includes(m) ? m : "auto";
+  }
+  if ($("reg-oauth-consent-action-id")) {
+    $("reg-oauth-consent-action-id").value = cfg.oauth_consent_action_id
+      ? String(cfg.oauth_consent_action_id)
+      : "";
+  }
   // Local solver URL is not user-facing (always inline 127.0.0.1:5072).
   if ($("reg-yescaptcha-key")) $("reg-yescaptcha-key").value = cfg.yescaptcha_key || "";
   if ($("reg-proxy")) $("reg-proxy").value = cfg.proxy || "";
@@ -6439,7 +6466,7 @@ async function saveRegConfig() {
     // Prefer form values for non-secret fields when server echoes stale/default.
     // Secrets: keep clean submitted keys if server returns masked.
     for (const k of ["count", "concurrency", "stagger_ms", "probe_delay_sec", "proxy",
-      "proxy_username", "proxy_strategy", "captcha_provider", "expiry_ms",
+      "proxy_username", "proxy_strategy", "captcha_provider", "oauth_mode", "oauth_consent_action_id", "expiry_ms",
       "moemail_domain", "yyds_domain", "gptmail_domain", "cfmail_domain", "tempmail_domain",
       "moemail_base_url", "cfmail_base_url", "domain", "base_url", "mail_provider"]) {
       if (Object.prototype.hasOwnProperty.call(cfg, k) && cfg[k] != null && cfg[k] !== "") {
@@ -6634,6 +6661,18 @@ function buildRegBody(config) {
     body.local_solver_url = "http://127.0.0.1:5072";
   } else if (config.yescaptcha_key) {
     body.yescaptcha_key = config.yescaptcha_key;
+  }
+  {
+    const m = String(config.oauth_mode || "auto").trim().toLowerCase();
+    const allowed = ["auto", "device", "protocol", "playwright", "browser"];
+    body.oauth_mode = allowed.includes(m) ? m : "auto";
+  }
+  {
+    let v = String(config.oauth_consent_action_id || "").trim().toLowerCase();
+    v = v.replace(/^[\"']+|[\"']+$/g, "").trim();
+    if (v.startsWith("0x")) v = v.slice(2);
+    v = v.replace(/^[\"']+|[\"']+$/g, "").trim();
+    if (/^[a-f0-9]{40,44}$/.test(v)) body.oauth_consent_action_id = v;
   }
   if (config.proxy) body.proxy = config.proxy;
   if (config.proxy_username) body.proxy_username = config.proxy_username;
