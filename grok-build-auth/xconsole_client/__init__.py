@@ -44,6 +44,13 @@ from .xai_oauth import (
     save_oauth_record as save_xai_oauth,
 )
 from .oauth_protocol import login_with_protocol as xai_oauth_login_protocol
+from .device_oauth import (
+    approve_device_login,
+    login_with_device,
+    poll_device_token,
+    request_device_code,
+    sso_to_token as device_sso_to_token,
+)
 from . import grpcweb, config, sso
 
 # fingerprint.py is optional (depends on curl_cffi); expose it only if importable.
@@ -81,6 +88,11 @@ __all__ = [
     "xai_oauth_login",
     "xai_oauth_login_playwright",
     "xai_oauth_login_protocol",
+    "login_with_device",
+    "request_device_code",
+    "approve_device_login",
+    "poll_device_token",
+    "device_sso_to_token",
     "refresh_xai_access_token",
     "save_cliproxyapi_auth_record",
     "save_xai_oauth",

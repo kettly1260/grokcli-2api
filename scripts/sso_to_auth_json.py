@@ -218,74 +218,13 @@ def _poll_interval_sec(raw: Any = None) -> float:
 
 
 def request_device_code(session: Any | None = None) -> dict | None:
-    """Request OIDC device code. Prefer shared curl_cffi session when given.
-
-    Retries on xAI rate limits (HTTP 429 / slow_down) — common when several
-    registration workers enter device-flow together.
-    """
-    form = {"client_id": GROK_CLI_CLIENT_ID, "scope": OIDC_SCOPES}
-    timeout = _http_timeout()
-    retries = _device_flow_retries()
-    last_err = ""
-    for attempt in range(1, retries + 1):
-        _wait_device_flow_slot()
-        if session is not None:
-            try:
-                r = session.post(
-                    f"{OIDC_ISSUER}/oauth2/device/code",
-                    data=form,
-                    headers={"Content-Type": "application/x-www-form-urlencoded"},
-                    impersonate="chrome",
-                    timeout=timeout,
-                    **_proxy_kwargs(),
-                )
-                code = int(getattr(r, "status_code", 0) or 0)
-                body = (getattr(r, "text", None) or "")[:300]
-                if code >= 400:
-                    last_err = f"HTTP {code}: {body[:200]}"
-                    print(f"  ❌ device/code {last_err}")
-                    if _is_rate_limited_payload(body, status=code) and attempt < retries:
-                        time.sleep(_device_flow_backoff_sec(attempt))
-                        continue
-                    return None
-                data = r.json()
-                return data if isinstance(data, dict) else None
-            except Exception as e:  # noqa: BLE001
-                last_err = str(e)
-                print(f"  ❌ device/code: {e}")
-                if attempt < retries and _is_rate_limited_payload(str(e)):
-                    time.sleep(_device_flow_backoff_sec(attempt))
-                    continue
-                return None
-
-        data = urllib.parse.urlencode(form).encode()
-        req = urllib.request.Request(
-            f"{OIDC_ISSUER}/oauth2/device/code",
-            data=data,
-            method="POST",
-            headers={"Content-Type": "application/x-www-form-urlencoded"},
-        )
-        try:
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
-                return json.loads(resp.read())
-        except urllib.error.HTTPError as e:
-            body = e.read().decode()[:300]
-            last_err = f"HTTP {e.code}: {body[:200]}"
-            print(f"  ❌ device/code {last_err}")
-            if _is_rate_limited_payload(body, status=e.code) and attempt < retries:
-                time.sleep(_device_flow_backoff_sec(attempt))
-                continue
-            return None
-        except Exception as e:  # noqa: BLE001
-            last_err = str(e)
-            print(f"  ❌ device/code: {e}")
-            if attempt < retries:
-                time.sleep(_device_flow_backoff_sec(attempt))
-                continue
-            return None
-    if last_err:
-        print(f"  ❌ device/code exhausted retries: {last_err}")
-    return None
+    """Request OIDC device code via shared xconsole_client.device_oauth."""
+    try:
+        from xconsole_client.device_oauth import request_device_code as _req
+        return _req(session=session)
+    except Exception as e:  # noqa: BLE001
+        print(f"  ❌ device/code: {e}")
+        return None
 
 
 def poll_token(
@@ -297,219 +236,31 @@ def poll_token(
     session: Any | None = None,
     immediate: bool = True,
 ) -> dict | None:
-    """Exchange an approved device_code for tokens.
-
-    Performance notes:
-    - Poll **immediately** after approve (do not sleep first).
-    - Use a short interval (default ~1s) instead of the upstream 5s hint.
-    - Prefer curl_cffi session when provided (same TLS fingerprint path).
-    """
-    interval_f = _poll_interval_sec(interval)
-    deadline = time.time() + min(float(expires_in or 1800), float(timeout or 45))
-    form = {
-        "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
-        "client_id": GROK_CLI_CLIENT_ID,
-        "device_code": device_code,
-    }
-    http_timeout = _http_timeout()
-    first = True
-    while time.time() < deadline:
-        if not (first and immediate):
-            time.sleep(interval_f)
-        first = False
-
-        if session is not None:
-            try:
-                r = session.post(
-                    f"{OIDC_ISSUER}/oauth2/token",
-                    data=form,
-                    headers={"Content-Type": "application/x-www-form-urlencoded"},
-                    impersonate="chrome",
-                    timeout=http_timeout,
-                    **_proxy_kwargs(),
-                )
-                code = int(getattr(r, "status_code", 0) or 0)
-                if code < 400:
-                    data = r.json()
-                    return data if isinstance(data, dict) else None
-                try:
-                    err = r.json() if r.content else {}
-                except Exception:
-                    err = {}
-                error = str((err or {}).get("error") or "")
-                if error == "authorization_pending":
-                    continue
-                if error == "slow_down":
-                    interval_f = min(10.0, interval_f + 1.0)
-                    continue
-                print(f"  ❌ token: {error or f'HTTP {code}'}")
-                return None
-            except Exception as e:  # noqa: BLE001
-                # Transient network blip — retry until deadline.
-                if time.time() >= deadline:
-                    print(f"  ❌ token network: {e}")
-                    return None
-                continue
-
-        data = urllib.parse.urlencode(form).encode()
-        req = urllib.request.Request(
-            f"{OIDC_ISSUER}/oauth2/token",
-            data=data,
-            method="POST",
-            headers={"Content-Type": "application/x-www-form-urlencoded"},
+    """Poll device token via shared xconsole_client.device_oauth."""
+    try:
+        from xconsole_client.device_oauth import poll_device_token as _poll
+        return _poll(
+            device_code,
+            interval=float(interval or 1),
+            expires_in=int(expires_in or 1800),
+            timeout=float(timeout or 45),
+            session=session,
+            immediate=immediate,
         )
-        try:
-            with urllib.request.urlopen(req, timeout=http_timeout) as resp:
-                return json.loads(resp.read())
-        except urllib.error.HTTPError as e:
-            try:
-                err = json.loads(e.read())
-            except Exception:
-                err = {}
-            error = err.get("error", "")
-            if error == "authorization_pending":
-                continue
-            if error == "slow_down":
-                interval_f = min(10.0, interval_f + 1.0)
-                continue
-            print(f"  ❌ token: {error}")
-            return None
-        except Exception as e:  # noqa: BLE001
-            if time.time() >= deadline:
-                print(f"  ❌ token network: {e}")
-                return None
-            continue
-    print("  ❌ 轮询超时")
-    return None
+    except Exception as e:  # noqa: BLE001
+        print(f"  ❌ token: {e}")
+        return None
 
 
 def sso_to_token(sso_cookie: str, *, quiet: bool = False) -> dict | None:
-    """SSO cookie → token dict (access/refresh/expires_in).
-
-    ``quiet=True`` reduces per-account stdout (faster under high concurrency).
-
-    Retries the full device flow on xAI rate limits (device/code 429 slow_down,
-    verify/approve ``rate_limited``). Concurrent registration workers otherwise
-    produce consecutive conversion failures after SSO was already obtained.
-    """
-    log = (lambda *a, **k: None) if quiet else print
-    s = requests.Session()
-    s.cookies.set("sso", sso_cookie, domain=".x.ai")
-    timeout = _http_timeout()
-    proxy_kw = _proxy_kwargs()
-
+    """SSO cookie → token dict via shared xconsole_client.device_oauth."""
     try:
-        r = s.get(
-            "https://accounts.x.ai/",
-            impersonate="chrome",
-            timeout=timeout,
-            **proxy_kw,
-        )
-    except Exception as e:
-        log(f"  ❌ 网络错误: {e}")
+        from xconsole_client.device_oauth import sso_to_token as _sso
+        return _sso(sso_cookie, quiet=quiet)
+    except Exception as e:  # noqa: BLE001
+        if not quiet:
+            print(f"  ❌ sso_to_token: {e}")
         return None
-    if "sign-in" in r.url or "sign-up" in r.url:
-        log("  ❌ sso 无效")
-        return None
-    log("  ✅ sso 有效")
-
-    retries = _device_flow_retries()
-    for attempt in range(1, retries + 1):
-        log(f"  🔑 Device Flow... (try {attempt}/{retries})")
-        dc = request_device_code(session=s)
-        if not dc:
-            if attempt < retries:
-                time.sleep(_device_flow_backoff_sec(attempt))
-                continue
-            return None
-        log(f"  📋 user_code: {dc.get('user_code')}")
-
-        rate_limited = False
-        try:
-            s.get(
-                dc["verification_uri_complete"],
-                impersonate="chrome",
-                timeout=timeout,
-                **proxy_kw,
-            )
-            r = s.post(
-                f"{OIDC_ISSUER}/oauth2/device/verify",
-                data={"user_code": dc["user_code"]},
-                headers={"Content-Type": "application/x-www-form-urlencoded"},
-                impersonate="chrome",
-                timeout=timeout,
-                allow_redirects=True,
-                **proxy_kw,
-            )
-            if "consent" not in (r.url or ""):
-                log(f"  ❌ verify 失败: {r.url}")
-                if _is_rate_limited_payload(getattr(r, "text", None), r.url, getattr(r, "status_code", None)):
-                    rate_limited = True
-                else:
-                    return None
-        except Exception as e:
-            log(f"  ❌ verify 异常: {e}")
-            if _is_rate_limited_payload(str(e)):
-                rate_limited = True
-            else:
-                return None
-        if rate_limited:
-            if attempt < retries:
-                time.sleep(_device_flow_backoff_sec(attempt))
-                continue
-            return None
-
-        try:
-            r = s.post(
-                f"{OIDC_ISSUER}/oauth2/device/approve",
-                data={
-                    "user_code": dc["user_code"],
-                    "action": "allow",
-                    "principal_type": "User",
-                    "principal_id": "",
-                },
-                headers={"Content-Type": "application/x-www-form-urlencoded"},
-                impersonate="chrome",
-                timeout=timeout,
-                allow_redirects=True,
-                **proxy_kw,
-            )
-            if "done" not in (r.url or ""):
-                log(f"  ❌ approve 失败: {r.url}")
-                if _is_rate_limited_payload(getattr(r, "text", None), r.url, getattr(r, "status_code", None)):
-                    if attempt < retries:
-                        time.sleep(_device_flow_backoff_sec(attempt))
-                        continue
-                return None
-            log("  ✅ 授权确认")
-        except Exception as e:
-            log(f"  ❌ approve 异常: {e}")
-            if _is_rate_limited_payload(str(e)) and attempt < retries:
-                time.sleep(_device_flow_backoff_sec(attempt))
-                continue
-            return None
-
-        # Approve already happened — poll immediately with a short interval.
-        token = poll_token(
-            dc["device_code"],
-            dc.get("interval", 1),
-            dc.get("expires_in", 1800),
-            timeout=float(os.getenv("GROK2API_SSO_POLL_TIMEOUT", "45") or 45),
-            session=s,
-            immediate=True,
-        )
-        if not token:
-            if attempt < retries:
-                log("  ⏳ token poll empty — retry device flow")
-                time.sleep(_device_flow_backoff_sec(attempt))
-                continue
-            return None
-        log(
-            f"  ✅ access_token (expires_in={token.get('expires_in')}s)"
-            + (" + refresh_token" if token.get("refresh_token") else "")
-        )
-        return token
-    return None
 
 
 def token_to_auth_entry(token: dict, email: str = "") -> tuple[str, dict]:
