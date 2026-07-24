@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import re
 import os
 import hmac
 import json
@@ -1852,6 +1853,8 @@ _REG_CONFIG_KEYS = (
     "prefix",
     "expiry_ms",
     "captcha_provider",
+    "oauth_mode",
+    "oauth_consent_action_id",
     "local_solver_url",
     "yescaptcha_key",
     "proxy",
@@ -2064,6 +2067,21 @@ def _env_registration_defaults() -> dict[str, Any]:
     ).strip().lower()
     if captcha_provider in {"local", "yescaptcha"}:
         out["captcha_provider"] = captcha_provider
+    oauth_mode = (
+        os.environ.get("GROK2API_REG_OAUTH_MODE")
+        or os.environ.get("GROK2API_OAUTH_MODE")
+        or ""
+    ).strip().lower()
+    if oauth_mode in {"auto", "device", "protocol", "playwright", "browser"}:
+        out["oauth_mode"] = oauth_mode
+    consent_action = (
+        os.environ.get("GROK2API_OAUTH_CONSENT_ACTION_ID")
+        or os.environ.get("XAI_OAUTH_CONSENT_ACTION_ID")
+        or os.environ.get("GROK2API_SUBMIT_OAUTH2_CONSENT_ACTION")
+        or ""
+    ).strip()
+    if consent_action:
+        out["oauth_consent_action_id"] = consent_action
     local_solver_url = (
         os.environ.get("GROK2API_LOCAL_SOLVER_URL")
         or os.environ.get("LOCAL_SOLVER_URL")
@@ -2267,6 +2285,18 @@ def _normalize_registration_config(
         )
         provider_raw = "local" if has_local or not has_yes else "yescaptcha"
     cfg["captcha_provider"] = provider_raw
+    oauth_raw = _pick_str("oauth_mode", 32).lower()
+    if oauth_raw not in {"auto", "device", "protocol", "playwright", "browser"}:
+        oauth_raw = "auto"
+    cfg["oauth_mode"] = oauth_raw
+    consent_raw = _pick_str("oauth_consent_action_id", 96).strip().lower()
+    consent_raw = consent_raw.strip("\"'\t ")
+    if consent_raw.startswith("0x"):
+        consent_raw = consent_raw[2:]
+    consent_raw = consent_raw.strip("\"'\t ")
+    if not re.fullmatch(r"[a-f0-9]{40,44}", consent_raw or ""):
+        consent_raw = ""
+    cfg["oauth_consent_action_id"] = consent_raw
     # Local is always inline; YesCaptcha must not carry local URL.
     if provider_raw == "local":
         cfg["local_solver_url"] = "http://127.0.0.1:5072"
@@ -2380,6 +2410,8 @@ def get_registration_config(*, include_secrets: bool = True) -> dict[str, Any]:
         "proxy": bool(cfg.get("proxy")),
     }
     public["captcha_provider"] = provider
+    public["oauth_mode"] = str(cfg.get("oauth_mode") or "auto").strip().lower() or "auto"
+    public["oauth_consent_action_id"] = str(cfg.get("oauth_consent_action_id") or "").strip()
     public["mail_provider"] = mail_provider
     public["proxy_strategy"] = str(cfg.get("proxy_strategy") or "round_robin")
     try:
@@ -2744,6 +2776,16 @@ def apply_registration_config_to_runtime(cfg: dict[str, Any] | None = None) -> N
         probe_delay = 30
     probe_delay = max(0, min(600, probe_delay))
     _set_env("GROK2API_REG_PROBE_DELAY_SEC", str(probe_delay))
+    oauth_mode = str(cfg.get("oauth_mode") or "auto").strip().lower()
+    if oauth_mode not in {"auto", "device", "protocol", "playwright", "browser"}:
+        oauth_mode = "auto"
+    _set_env("GROK2API_REG_OAUTH_MODE", oauth_mode)
+    _set_env("GROK2API_OAUTH_MODE", oauth_mode)
+    consent_action = str(cfg.get("oauth_consent_action_id") or "").strip()
+    # Empty clears override so live extract / code default can take effect.
+    _set_env("GROK2API_OAUTH_CONSENT_ACTION_ID", consent_action)
+    _set_env("XAI_OAUTH_CONSENT_ACTION_ID", consent_action)
+    _set_env("GROK2API_SUBMIT_OAUTH2_CONSENT_ACTION", consent_action)
     _set_env("GROK2API_CAPTCHA_PROVIDER", provider)
     _set_env("CAPTCHA_PROVIDER", provider)
     if provider == "local":

@@ -48,7 +48,65 @@ CREATE_SESSION_RPC = "https://accounts.x.ai/auth_mgmt.AuthManagement/CreateSessi
 CREATE_COOKIE_SETTER_RPC = "https://accounts.x.ai/auth_mgmt.AuthManagement/CreateCookieSetterLink"
 ACCOUNTS_ORIGIN = "https://accounts.x.ai"
 # Observed Next.js server action for the consent Allow button (may change on deploy).
+# Prefer runtime override via env / registration_config / function arg so deploys
+# do not require a code change:
+#   GROK2API_OAUTH_CONSENT_ACTION_ID
+#   XAI_OAUTH_CONSENT_ACTION_ID
 SUBMIT_OAUTH2_CONSENT_ACTION = "4005315a1d7e426de592990bb54bb37471f39dd6d2"
+
+
+def normalize_consent_action_id(value: Any = None) -> str:
+    """Return a hex Next.js server-action id, or empty if unset/invalid."""
+    raw = str(value or "").strip().lower()
+    if not raw:
+        return ""
+    # Allow optional 0x / quotes from copy-paste.
+    raw = raw.strip("\"'\t ")
+    if raw.startswith("0x"):
+        raw = raw[2:]
+    raw = raw.strip("\"'\t ")
+    if re.fullmatch(r"[a-f0-9]{40,44}", raw):
+        return raw
+    return ""
+
+
+def resolve_consent_action_id(
+    override: Any = None,
+    *,
+    page_html: str = "",
+) -> str:
+    """Resolve consent server-action id.
+
+    Priority:
+      1) named live extract: createServerReference(... submitOAuth2Consent)
+      2) explicit override / env (GROK2API_OAUTH_CONSENT_ACTION_ID, XAI_OAUTH_CONSENT_ACTION_ID)
+      3) generic createServerReference id on the page (legacy fallback)
+      4) hardcoded SUBMIT_OAUTH2_CONSENT_ACTION
+    """
+    import os
+
+    html = page_html or ""
+    named = re.search(
+        r'createServerReference\)\("([a-f0-9]{40,44})"[^)]*submitOAuth2Consent',
+        html,
+    )
+    if named:
+        return named.group(1)
+
+    configured = normalize_consent_action_id(override)
+    if not configured:
+        configured = normalize_consent_action_id(
+            os.environ.get("GROK2API_OAUTH_CONSENT_ACTION_ID")
+            or os.environ.get("XAI_OAUTH_CONSENT_ACTION_ID")
+            or os.environ.get("GROK2API_SUBMIT_OAUTH2_CONSENT_ACTION")
+        )
+    if configured:
+        return configured
+
+    generic = re.search(r'createServerReference\)\("([a-f0-9]{40,44})"', html)
+    if generic:
+        return generic.group(1)
+    return SUBMIT_OAUTH2_CONSENT_ACTION
 
 
 def _enc_msg(field_no: int, raw: bytes) -> bytes:
@@ -189,10 +247,12 @@ class ProtocolOAuthClient:
         impersonate: str = "chrome131",
         debug: bool = False,
         turnstile_premium: bool = True,
+        consent_action_id: str = "",
     ):
         self.debug = debug
         self.turnstile_premium = turnstile_premium
         self._yescaptcha_key = (yescaptcha_key or "").strip()
+        self._consent_action_id = normalize_consent_action_id(consent_action_id)
         self.solver: Optional[YesCaptchaSolver] = None
         if self._yescaptcha_key:
             self.solver = YesCaptchaSolver(self._yescaptcha_key, debug=debug)
@@ -636,13 +696,10 @@ class ProtocolOAuthClient:
             """POST Next.js submitOAuth2Consent server action; return authorization code."""
             import json as _json
 
-            action_id = SUBMIT_OAUTH2_CONSENT_ACTION
-            # Prefer live action id from page chunks if present.
-            m = re.search(r'createServerReference\)\("([a-f0-9]{40,44})"[^)]*submitOAuth2Consent', page_html)
-            if not m:
-                m = re.search(r'createServerReference\)\("([a-f0-9]{40,44})"', page_html)
-            if m:
-                action_id = m.group(1)
+            action_id = resolve_consent_action_id(
+                self._consent_action_id,
+                page_html=page_html or "",
+            )
 
             # Router state tree for consent page (URL-encoded JSON).
             from urllib.parse import quote as _quote
@@ -814,17 +871,23 @@ def login_with_protocol(
     redirect_port: int = 56121,
     session_cookies: Optional[Dict[str, str]] = None,
     auth_client: Any = None,
+    consent_action_id: str = "",
 ) -> OAuthLoginResult:
     """Convenience wrapper: protocol OAuth + optional CLIProxyAPI Build export.
 
     If *auth_client* (XConsoleAuthClient) is provided after signup, its live
     curl_cffi session is reused so accounts.x.ai cookies stay attached.
+
+    *consent_action_id* overrides the Next.js submitOAuth2Consent server-action
+    id when page-live extraction fails. Env fallbacks:
+    GROK2API_OAUTH_CONSENT_ACTION_ID / XAI_OAUTH_CONSENT_ACTION_ID.
     """
     client = ProtocolOAuthClient(
         yescaptcha_key=yescaptcha_key,
         proxy=proxy,
         debug=debug,
         turnstile_premium=turnstile_premium,
+        consent_action_id=consent_action_id,
     )
     if auth_client is not None:
         try:

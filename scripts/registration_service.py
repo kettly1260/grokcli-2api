@@ -240,6 +240,8 @@ async def start_job(
         k: body.get(k)
         for k in (
             "captcha_provider",
+            "oauth_mode",
+            "oauth_consent_action_id",
             "local_solver_url",
             "yescaptcha_key",
             "proxy",

@@ -429,6 +429,30 @@
         <option value="yescaptcha">YesCaptcha</option>
       </select>
     </div>
+    <div class="g2a-field">
+      <label for="reg-oauth-mode">OAuth / 取 Token 方式</label>
+      <select id="reg-oauth-mode">
+        <option value="auto">自动（注册默认 Device）</option>
+        <option value="device">Device（SSO 自动批准）</option>
+        <option value="protocol">Protocol（HTTP + consent action）</option>
+        <option value="playwright">Playwright 浏览器自动</option>
+        <option value="browser">系统浏览器人工</option>
+      </select>
+      <div class="g2a-muted" style="margin-top:4px;font-size:12px">
+        与「过盾方式」独立：过盾只解 Turnstile；此处决定注册拿到会话后如何换 access/refresh token。
+        默认「自动」= Device，不依赖 Next.js consent action id。browser 需本机 GUI。
+      </div>
+    </div>
+    <div class="g2a-field" id="reg-oauth-consent-wrap">
+      <label for="reg-oauth-consent-action-id">Protocol consent action id（可选）</label>
+      <input id="reg-oauth-consent-action-id" class="g2a-input" autocomplete="off" spellcheck="false"
+        maxlength="48"
+        placeholder="留空=自动提取；xAI 更新后可粘贴 next-action 十六进制 id" />
+      <div class="g2a-muted" style="margin-top:4px;font-size:12px">
+        仅 Protocol 路径使用。优先从 consent 页 live 提取；提取失败时使用此处填写值。
+        也可设环境变量 GROK2API_OAUTH_CONSENT_ACTION_ID。无需改代码。
+      </div>
+    </div>
     <div class="g2a-field" id="reg-yescaptcha-wrap" style="display:none">
       <label>YesCaptcha Key</label>
       <input id="reg-yescaptcha-key" placeholder="仅 YesCaptcha 模式需要" />

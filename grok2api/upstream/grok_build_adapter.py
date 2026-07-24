@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import secrets
 import sys
 import threading
@@ -439,10 +440,24 @@ def _snapshot_reg_config(
     concurrency: int,
     stagger_ms: int,
     mail_provider: str | None = None,
+    oauth_mode: str | None = None,
+    oauth_consent_action_id: str | None = None,
 ) -> dict[str, Any]:
     """Config snapshot kept with the in-memory/Redis batch while it is running."""
+    mode = (oauth_mode or "auto").strip().lower() or "auto"
+    if mode not in {"auto", "device", "protocol", "playwright", "browser"}:
+        mode = "auto"
+    consent = str(oauth_consent_action_id or "").strip().lower()
+    consent = consent.strip("\"'\t ")
+    if consent.startswith("0x"):
+        consent = consent[2:]
+    consent = consent.strip("\"'\t ")
+    if not re.fullmatch(r"[a-f0-9]{40,44}", consent or ""):
+        consent = ""
     return {
         "captcha_provider": captcha_provider,
+        "oauth_mode": mode,
+        "oauth_consent_action_id": consent,
         "yescaptcha_key": yescaptcha_key if captcha_provider == "yescaptcha" else "",
         "proxy": proxy or "",
         "moemail_api_key": moemail_api_key or "",
@@ -1635,6 +1650,8 @@ def _prepare_registration_session(
     batch_index: int | None = None,
     batch_total: int | None = None,
     start_delay: float = 0.0,
+    oauth_mode: str | None = None,
+    oauth_consent_action_id: str | None = None,
 ) -> dict[str, Any]:
     """Create mailbox + session record. Does NOT start the registration worker."""
     if start_delay > 0:
@@ -1657,6 +1674,16 @@ def _prepare_registration_session(
     password = f"Aa{os.urandom(5).hex()}9!xZ"
     sid = f"gba_{uuid.uuid4().hex[:16]}"
 
+    mode = (oauth_mode or "auto").strip().lower() or "auto"
+    if mode not in {"auto", "device", "protocol", "playwright", "browser"}:
+        mode = "auto"
+    consent = str(oauth_consent_action_id or "").strip().lower()
+    consent = consent.strip("\"'\t ")
+    if consent.startswith("0x"):
+        consent = consent[2:]
+    consent = consent.strip("\"'\t ")
+    if not re.fullmatch(r"[a-f0-9]{40,44}", consent or ""):
+        consent = ""
     sess = {
         "id": sid,
         "status": "queued",
@@ -1667,6 +1694,8 @@ def _prepare_registration_session(
         "message": f"queued; email={email}",
         "sso": None,
         "oauth": None,
+        "oauth_mode": mode,
+        "oauth_consent_action_id": consent,
         "auth_json": None,
         "error": None,
         "yescaptcha_key": yescaptcha_key,
@@ -1702,6 +1731,8 @@ def _start_one_registration(
     batch_index: int | None = None,
     batch_total: int | None = None,
     start_delay: float = 0.0,
+    oauth_mode: str | None = None,
+    oauth_consent_action_id: str | None = None,
 ) -> dict[str, Any]:
     """Create one session and spawn its worker thread (single-job path)."""
     prepared = _prepare_registration_session(
@@ -1717,6 +1748,8 @@ def _start_one_registration(
         batch_index=batch_index,
         batch_total=batch_total,
         start_delay=start_delay,
+        oauth_mode=oauth_mode,
+        oauth_consent_action_id=oauth_consent_action_id,
     )
     if not prepared.get("ok"):
         return prepared
@@ -1781,6 +1814,8 @@ def start_registration(
     concurrency: int | None = None,
     stagger_ms: int | None = None,
     probe_delay_sec: float | int | None = None,
+    oauth_mode: str | None = None,
+    oauth_consent_action_id: str | None = None,
 ) -> dict[str, Any]:
     """Start one or many registration sessions (multi-thread).
 
@@ -1823,6 +1858,32 @@ def start_registration(
         globals()["CAPTCHA_PROVIDER"] = provider
     except Exception:
         pass
+
+    oauth_mode_norm = (
+        oauth_mode
+        or os.environ.get("GROK2API_REG_OAUTH_MODE")
+        or os.environ.get("GROK2API_OAUTH_MODE")
+        or "auto"
+    )
+    oauth_mode_norm = str(oauth_mode_norm or "auto").strip().lower() or "auto"
+    if oauth_mode_norm not in {"auto", "device", "protocol", "playwright", "browser"}:
+        oauth_mode_norm = "auto"
+
+    consent_norm = str(
+        oauth_consent_action_id
+        or os.environ.get("GROK2API_OAUTH_CONSENT_ACTION_ID")
+        or os.environ.get("XAI_OAUTH_CONSENT_ACTION_ID")
+        or ""
+    ).strip().lower()
+    consent_norm = consent_norm.strip("\"'\t ")
+    if consent_norm.startswith("0x"):
+        consent_norm = consent_norm[2:]
+    consent_norm = consent_norm.strip("\"'\t ")
+    if not re.fullmatch(r"[a-f0-9]{40,44}", consent_norm or ""):
+        consent_norm = ""
+    if consent_norm:
+        os.environ["GROK2API_OAUTH_CONSENT_ACTION_ID"] = consent_norm
+        os.environ["XAI_OAUTH_CONSENT_ACTION_ID"] = consent_norm
 
     if provider == "local":
         # Always inline in main container; ignore any external/custom URL.
@@ -1945,6 +2006,8 @@ def start_registration(
             domain=domain,
             expiry_ms=expiry_ms,
             mail_provider=mail_prov,
+            oauth_mode=oauth_mode_norm,
+            oauth_consent_action_id=consent_norm,
         )
 
     batch_id = f"batch_{uuid.uuid4().hex[:12]}"
@@ -1962,6 +2025,8 @@ def start_registration(
         concurrency=workers,
         stagger_ms=stagger,
         mail_provider=mail_prov,
+        oauth_mode=oauth_mode_norm,
+        oauth_consent_action_id=consent_norm,
     )
     reg_cfg["proxy_strategy"] = proxy_strat
     reg_cfg["proxy_pool_count"] = len(proxy_pool)
@@ -2029,6 +2094,8 @@ def start_registration(
         domain=domain,
         expiry_ms=expiry_ms,
         mail_provider=mail_prov,
+        oauth_mode=oauth_mode_norm,
+        oauth_consent_action_id=consent_norm,
     )
     if not started.get("ok"):
         return started
@@ -2076,6 +2143,8 @@ def _spawn_batch_runner(
     domain: str | None,
     expiry_ms: int | None,
     mail_provider: str | None = None,
+    oauth_mode: str | None = None,
+    oauth_consent_action_id: str | None = None,
 ) -> dict[str, Any]:
     """Start the ThreadPool spawner for a batch (also used by resume/reclaim)."""
     bid = str(batch_id or "").strip()
@@ -2084,6 +2153,15 @@ def _spawn_batch_runner(
     batch = _load_reg_batch(bid)
     if not batch:
         return {"ok": False, "error": "registration batch not found"}
+    batch_reg_config = (
+        batch.get("reg_config") if isinstance(batch.get("reg_config"), dict) else {}
+    )
+    runner_oauth_mode = oauth_mode or str(
+        batch_reg_config.get("oauth_mode") or "auto"
+    )
+    runner_consent_action_id = oauth_consent_action_id or str(
+        batch_reg_config.get("oauth_consent_action_id") or ""
+    )
 
     if remaining <= 0:
         with _lock:
@@ -2216,6 +2294,8 @@ def _spawn_batch_runner(
             concurrency=workers,
             stagger_ms=stagger,
             mail_provider=mail_provider,
+            oauth_mode=runner_oauth_mode,
+            oauth_consent_action_id=runner_consent_action_id,
         )
         b["reg_config"]["proxy_strategy"] = proxy_strat
         b["reg_config"]["proxy_pool_count"] = len(proxy_pool)
@@ -2370,6 +2450,8 @@ def _spawn_batch_runner(
                 batch_index=i,
                 batch_total=int((_load_reg_batch(bid) or {}).get("count") or remaining),
                 start_delay=delay,
+                oauth_mode=runner_oauth_mode,
+                oauth_consent_action_id=runner_consent_action_id,
             )
             if not prepared.get("ok"):
                 return prepared
@@ -3633,22 +3715,85 @@ def _run_registration(
                 "visible to CreateSession."
             )
 
-        # Required path: SSO/session JWT -> sso_to_auth_json device flow -> auth.json
+        # SSO/session JWT -> token (oauth_mode: auto/device/protocol/playwright/browser)
+        oauth_mode = (
+            str(sess.get("oauth_mode") or "")
+            or str((sess.get("reg_config") or {}).get("oauth_mode") or "")
+            or os.environ.get("GROK2API_REG_OAUTH_MODE")
+            or os.environ.get("GROK2API_OAUTH_MODE")
+            or "auto"
+        )
+        oauth_mode = oauth_mode.strip().lower() or "auto"
+        if oauth_mode not in {"auto", "device", "protocol", "playwright", "browser"}:
+            oauth_mode = "auto"
+        # Registration auto ≡ device (SSO auto-approve), not CLI protocol-first.
+        effective_mode = "device" if oauth_mode in {"", "auto"} else oauth_mode
         update(
             "importing",
-            f"SSO obtained; converting via sso_to_auth_json [{ADAPTER_BUILD}]",
+            f"SSO obtained; converting via oauth_mode={effective_mode} "
+            f"(cfg={oauth_mode}) [{ADAPTER_BUILD}]",
         )
         import scripts.sso_to_auth_json as sso_import
 
-        token = sso_import.sso_to_token(sso)
-        if not token or not token.get("access_token"):
-            _note_reg_pressure("device-flow conversion failed", pause_sec=10)
-            raise RuntimeError(
-                "SSO obtained but sso_to_auth_json conversion failed "
-                "(device verify/approve/token poll; often xAI device-flow "
-                "rate_limited/slow_down under concurrent registration). "
-                f"adapter_build={ADAPTER_BUILD}; sso_prefix={sso[:24]!r}"
-            )
+        token = None
+        oauth_path = effective_mode
+        if effective_mode == "device":
+            token = sso_import.sso_to_token(sso)
+            oauth_path = "device"
+            if not token or not token.get("access_token"):
+                _note_reg_pressure("device-flow conversion failed", pause_sec=10)
+                raise RuntimeError(
+                    "SSO obtained but sso_to_auth_json conversion failed "
+                    "(device verify/approve/token poll; often xAI device-flow "
+                    "rate_limited/slow_down under concurrent registration). "
+                    f"adapter_build={ADAPTER_BUILD}; sso_prefix={sso[:24]!r}"
+                )
+        elif effective_mode in {"protocol", "playwright", "browser"}:
+            from xconsole_client.xai_oauth import complete_build_oauth
+
+            proxy_for_oauth = str(sess.get("proxy") or proxy or "").strip()
+            yes_key = str(
+                sess.get("yescaptcha_key")
+                or yescaptcha_key
+                or os.environ.get("GROK2API_YESCAPTCHA_KEY")
+                or os.environ.get("YESCAPTCHA_API_KEY")
+                or ""
+            ).strip()
+            try:
+                consent_action_id = str(
+                    sess.get("oauth_consent_action_id")
+                    or (sess.get("reg_config") or {}).get("oauth_consent_action_id")
+                    or os.environ.get("GROK2API_OAUTH_CONSENT_ACTION_ID")
+                    or os.environ.get("XAI_OAUTH_CONSENT_ACTION_ID")
+                    or ""
+                ).strip()
+                result = complete_build_oauth(
+                    email,
+                    password,
+                    mode=effective_mode,
+                    session_cookies=session_cookies if isinstance(session_cookies, dict) else None,
+                    sso_cookie=sso,
+                    proxy=proxy_for_oauth,
+                    yescaptcha_key=yes_key if yes_key and yes_key != "local" else None,
+                    interactive_fallback=(effective_mode == "browser"),
+                    auth_client=client,
+                    debug=False,
+                    consent_action_id=consent_action_id or None,
+                )
+            except Exception as oauth_err:  # noqa: BLE001
+                raise RuntimeError(
+                    f"SSO obtained but complete_build_oauth(mode={effective_mode}) failed: "
+                    f"{oauth_err}; adapter_build={ADAPTER_BUILD}; sso_prefix={sso[:24]!r}"
+                ) from oauth_err
+            token = dict(getattr(result, "token", None) or {})
+            oauth_path = effective_mode
+            if not token or not token.get("access_token"):
+                raise RuntimeError(
+                    f"SSO obtained but {effective_mode} OAuth returned no access_token; "
+                    f"adapter_build={ADAPTER_BUILD}; sso_prefix={sso[:24]!r}"
+                )
+        else:
+            raise RuntimeError(f"unsupported oauth_mode: {oauth_mode}")
         _key, entry = sso_import.token_to_auth_entry(token, email=email)
         # Keep the raw SSO cookie with the account so export/re-import works
         # after process restart (registration sessions are ephemeral).
@@ -3776,7 +3921,8 @@ def _run_registration(
         sess["imported_account_ids"] = imported_ids
         sess["imported_accounts"] = imported_accounts
         sess["oauth"] = {
-            "path": "sso_to_auth_json",
+            "path": oauth_path,
+            "mode": oauth_mode,
             "access_token": (token.get("access_token") or "")[:20] + "...",
             "refresh_token": bool(token.get("refresh_token")),
             "email": email,
@@ -4455,6 +4601,8 @@ def resume_registration_batch(
         domain=mail_dom,
         expiry_ms=cfg.get("expiry_ms"),
         mail_provider=mail_provider,
+        oauth_mode=str(cfg.get("oauth_mode") or "auto"),
+        oauth_consent_action_id=str(cfg.get("oauth_consent_action_id") or ""),
     )
     out = {
         "ok": bool(spawned.get("ok")),

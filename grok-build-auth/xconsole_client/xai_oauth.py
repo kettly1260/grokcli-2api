@@ -447,6 +447,40 @@ def _start_pkce_callback_server(
     return server, sink, auth_url, redirect_uri, state, verifier
 
 
+def _finalize_oauth_token(
+    token: dict,
+    *,
+    client_id: str = DEFAULT_CLIENT_ID,
+    proxy: str = "",
+    output_dir: Optional[str | Path] = None,
+    cliproxyapi_auth_dir: Optional[str | Path] = None,
+    cliproxyapi_base_url: str = CLIPROXYAPI_GROK_BASE_URL,
+    cliproxyapi_disabled: bool = False,
+    redirect_uri: str = "",
+) -> OAuthLoginResult:
+    """Shared finalize for authorization-code and device-code token dicts."""
+    userinfo = fetch_userinfo(str(token.get("access_token") or ""), proxy=proxy)
+    path = save_oauth_record(token, userinfo=userinfo, client_id=client_id, output_dir=output_dir)
+    cliproxy_path: Optional[Path] = None
+    if cliproxyapi_auth_dir:
+        cliproxy_path = save_cliproxyapi_auth_record(
+            token,
+            userinfo=userinfo,
+            auth_dir=cliproxyapi_auth_dir,
+            redirect_uri=redirect_uri,
+            disabled=cliproxyapi_disabled,
+            base_url=cliproxyapi_base_url,
+        )
+    return OAuthLoginResult(
+        token=token,
+        userinfo=userinfo,
+        id_token_payload=parse_jwt_payload(str(token.get("id_token") or "")),
+        path=path,
+        cliproxyapi_path=cliproxy_path,
+        redirect_uri=redirect_uri,
+    )
+
+
 def _finalize_oauth_code(
     *,
     code: str,
@@ -466,24 +500,14 @@ def _finalize_oauth_code(
         client_id=client_id,
         proxy=proxy,
     )
-    userinfo = fetch_userinfo(str(token.get("access_token") or ""), proxy=proxy)
-    path = save_oauth_record(token, userinfo=userinfo, client_id=client_id, output_dir=output_dir)
-    cliproxy_path: Optional[Path] = None
-    if cliproxyapi_auth_dir:
-        cliproxy_path = save_cliproxyapi_auth_record(
-            token,
-            userinfo=userinfo,
-            auth_dir=cliproxyapi_auth_dir,
-            redirect_uri=redirect_uri,
-            disabled=cliproxyapi_disabled,
-            base_url=cliproxyapi_base_url,
-        )
-    return OAuthLoginResult(
-        token=token,
-        userinfo=userinfo,
-        id_token_payload=parse_jwt_payload(str(token.get("id_token") or "")),
-        path=path,
-        cliproxyapi_path=cliproxy_path,
+    return _finalize_oauth_token(
+        token,
+        client_id=client_id,
+        proxy=proxy,
+        output_dir=output_dir,
+        cliproxyapi_auth_dir=cliproxyapi_auth_dir,
+        cliproxyapi_base_url=cliproxyapi_base_url,
+        cliproxyapi_disabled=cliproxyapi_disabled,
         redirect_uri=redirect_uri,
     )
 
@@ -756,6 +780,7 @@ def complete_build_oauth(
     email: str,
     password: str,
     *,
+    mode: str = "auto",
     cliproxyapi_auth_dir: Optional[str | Path] = None,
     cliproxyapi_base_url: str = CLIPROXYAPI_GROK_BASE_URL,
     headless: bool = True,
@@ -768,37 +793,60 @@ def complete_build_oauth(
     debug: bool = False,
     session_cookies: Optional[Dict[str, str]] = None,
     auth_client: Any = None,
+    sso_cookie: Optional[str] = None,
+    output_dir: Optional[str | Path] = None,
+    consent_action_id: Optional[str] = None,
 ) -> OAuthLoginResult:
     """Obtain Grok Build/CLI OAuth tokens after protocol signup.
 
-    Preference order:
-      1) Pure HTTP protocol (reuse signup cookies, else CreateSession+YesCaptcha)
-      2) Playwright auto-login (if protocol=False or protocol fails)
-      3) Interactive system-browser fallback (if interactive_fallback=True)
+    mode:
+      auto       -- protocol -> playwright -> (optional) browser  [default CLI path]
+      device     -- SSO cookie auto-approve device flow
+      protocol   -- pure HTTP authorization-code + consent
+      playwright -- browser automation
+      browser    -- system browser interactive
+
+    ``protocol=False`` is legacy: when mode=auto, skip the protocol stage.
+    Device is never part of auto in phase 1.
     """
+    mode_norm = (mode or "auto").strip().lower() or "auto"
+    if mode_norm not in {"auto", "protocol", "device", "playwright", "browser"}:
+        raise ValueError(f"unsupported oauth mode: {mode!r}")
+
     key = (yescaptcha_key or os.environ.get("YESCAPTCHA_API_KEY") or "").strip()
     errors: list[str] = []
+    sso = (sso_cookie or (session_cookies or {}).get("sso") or "").strip()
 
-    if protocol:
-        try:
-            from .oauth_protocol import login_with_protocol
-            return login_with_protocol(
-                email,
-                password,
-                yescaptcha_key=key,
-                proxy=proxy,
-                debug=debug,
-                cliproxyapi_auth_dir=str(cliproxyapi_auth_dir) if cliproxyapi_auth_dir else None,
-                cliproxyapi_base_url=cliproxyapi_base_url,
-                redirect_port=port or 56121,
-                session_cookies=session_cookies,
-                auth_client=auth_client,
-            )
-        except Exception as exc:
-            errors.append(f"protocol OAuth failed: {exc}")
-            print(f"Protocol OAuth failed ({exc})")
+    def run_device() -> OAuthLoginResult:
+        if not sso:
+            raise RuntimeError("device mode requires sso cookie")
+        from .device_oauth import login_with_device
+        return login_with_device(
+            sso_cookie=sso,
+            email=email or "",
+            proxy=proxy,
+            output_dir=output_dir,
+            cliproxyapi_auth_dir=cliproxyapi_auth_dir,
+            cliproxyapi_base_url=cliproxyapi_base_url,
+        )
 
-    try:
+    def run_protocol() -> OAuthLoginResult:
+        from .oauth_protocol import login_with_protocol
+        return login_with_protocol(
+            email,
+            password,
+            yescaptcha_key=key,
+            proxy=proxy,
+            debug=debug,
+            cliproxyapi_auth_dir=str(cliproxyapi_auth_dir) if cliproxyapi_auth_dir else None,
+            cliproxyapi_base_url=cliproxyapi_base_url,
+            redirect_port=port or 56121,
+            session_cookies=session_cookies,
+            auth_client=auth_client,
+            consent_action_id=(consent_action_id or ""),
+        )
+
+    def run_playwright() -> OAuthLoginResult:
         return login_with_playwright(
             email,
             password,
@@ -810,11 +858,8 @@ def complete_build_oauth(
             cliproxyapi_base_url=cliproxyapi_base_url,
             session_cookies=session_cookies,
         )
-    except Exception as auto_err:
-        errors.append(f"playwright OAuth failed: {auto_err}")
-        if not interactive_fallback:
-            raise RuntimeError("; ".join(errors)) from auto_err
-        print(f"Playwright OAuth failed ({auto_err}); falling back to interactive browser login...")
+
+    def run_browser() -> OAuthLoginResult:
         return login_with_browser(
             timeout=max(timeout, 300.0),
             port=port,
@@ -822,6 +867,32 @@ def complete_build_oauth(
             cliproxyapi_auth_dir=cliproxyapi_auth_dir,
             cliproxyapi_base_url=cliproxyapi_base_url,
         )
+
+    if mode_norm == "device":
+        return run_device()
+    if mode_norm == "protocol":
+        return run_protocol()
+    if mode_norm == "playwright":
+        return run_playwright()
+    if mode_norm == "browser":
+        return run_browser()
+
+    # mode == auto  (CLI / complete_build_oauth semantic; device not in chain)
+    if protocol:
+        try:
+            return run_protocol()
+        except Exception as exc:
+            errors.append(f"protocol OAuth failed: {exc}")
+            print(f"Protocol OAuth failed ({exc})")
+
+    try:
+        return run_playwright()
+    except Exception as auto_err:
+        errors.append(f"playwright OAuth failed: {auto_err}")
+        if not interactive_fallback:
+            raise RuntimeError("; ".join(errors)) from auto_err
+        print(f"Playwright OAuth failed ({auto_err}); falling back to interactive browser login...")
+        return run_browser()
 
 
 def default_cliproxyapi_auth_dir() -> Path:
